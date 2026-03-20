@@ -25,6 +25,7 @@ tar = "0.4"
 walkdir = "2"
 cidr = { version = "0.3", default-features = false }
 colored = "3"
+local-ip-address = "0.6"
 
 [dependencies.brotli]
 version = "8"

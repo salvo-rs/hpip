@@ -98,6 +98,27 @@ async fn result_main() -> Result<(), Error> {
             }
         );
 
+        let scheme = if opts.tls_data.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        if opts.bind_address.is_unspecified() {
+            if let Ok(ifas) = local_ip_address::list_afinet_netifas() {
+                for (_name, ip) in &ifas {
+                    match ip {
+                        IpAddr::V4(v4) => println!("  {}://{}:{}", scheme, v4, port),
+                        IpAddr::V6(v6) => println!("  {}://[{}]:{}", scheme, v6, port),
+                    }
+                }
+            }
+        } else {
+            match opts.bind_address {
+                IpAddr::V4(v4) => println!("  {}://{}:{}", scheme, v4, port),
+                IpAddr::V6(v6) => println!("  {}://[{}]:{}", scheme, v6, port),
+            }
+        }
+
         if let Some(band) = opts.request_bandwidth {
             println!("Requests limited to {}B/s.", band);
         }
