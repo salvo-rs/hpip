@@ -58,7 +58,6 @@ fn assets() -> Vec<(&'static str, String)> {
     fs::create_dir_all(format!("{}/{}", outd, "assets")).unwrap();
     for (key, file) in [
         ("manage", "assets/manage.js"),
-        ("manage_mobile", "assets/manage_mobile.js"),
         ("manage_desktop", "assets/manage_desktop.js"),
         ("upload", "assets/upload.js"),
         ("upload_css", "assets/upload.css"),
@@ -84,7 +83,6 @@ fn htmls() {
     for html in [
         "error.html",
         "directory_listing.html",
-        "directory_listing_mobile.html",
     ] {
         println!("cargo:rerun-if-changed=assets/{}", html);
 

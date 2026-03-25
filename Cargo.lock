@@ -1009,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "hpip"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "blake3",
@@ -3501,9 +3501,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "7.4.0"
+version = "8.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc12baa6db2b15a140161ce53d72209dacea594230798c24774139b54ecaa980"
+checksum = "7756d0206d058333667493c4014f545f4b9603c4330ccd6d9b3f86dcab59f7d9"
 dependencies = [
  "crc32fast",
  "flate2",

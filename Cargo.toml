@@ -1,9 +1,9 @@
 [package]
 name = "hpip"
 description = "Host These Things Please - a modern async HTTP file server"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/salvo-rs/hpip"
 homepage = "https://github.com/salvo-rs/hpip"
 build = "build.rs"
@@ -31,7 +31,7 @@ local-ip-address = "0.6"
 version = "8"
 
 [dependencies.zip]
-version = "7"
+version = "8.4.0"
 default-features = false
 features = ["deflate-flate2"]
 
