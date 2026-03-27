@@ -43,3 +43,29 @@ jobs:
       - name: Run tests
         timeout-minutes: 20
         run: cargo test --no-fail-fast -- --nocapture
+
+  build:
+    name: Build release - ${{ matrix.target }}
+    runs-on: macos-latest
+    needs: [test]
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hpip-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/hpip

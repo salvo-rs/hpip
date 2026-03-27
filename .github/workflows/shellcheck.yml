@@ -1,0 +1,37 @@
+name: ShellCheck
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "**.sh"
+      - ".github/workflows/shellcheck.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "**.sh"
+      - ".github/workflows/shellcheck.yml"
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Run ShellCheck
+        run: |
+          shopt -s globstar nullglob
+          files=(**/*.sh)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No shell scripts found"
+            exit 0
+          fi
+          shellcheck "${files[@]}"
