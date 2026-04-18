@@ -37,4 +37,3 @@ include!(concat!(env!("OUT_DIR"), "/error.html.rs"));
 
 // The HTML page to use as template for a requested directory's listing.
 include!(concat!(env!("OUT_DIR"), "/directory_listing.html.rs"));
-

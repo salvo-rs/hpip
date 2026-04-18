@@ -303,22 +303,21 @@ fn write_tar_body_to_vec(path: &Path) -> IoResult<Vec<u8>> {
         };
 
         #[cfg(unix)]
-        if !entry.file_type().is_dir() {
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.nlink() > 1 {
-                    match links.entry((metadata.dev(), metadata.ino())) {
-                        BTreeMapEntry::Occupied(previous) => {
-                            let mut header = TarHeader::new_gnu();
-                            header.set_metadata(&metadata);
-                            header.set_size(0);
-                            header.set_entry_type(TarEntryType::Link);
-                            tar.append_link(&mut header, relative_path, previous.get())?;
-                            continue;
-                        }
-                        BTreeMapEntry::Vacant(v) => {
-                            v.insert(relative_path.to_path_buf());
-                        }
-                    }
+        if !entry.file_type().is_dir()
+            && let Ok(metadata) = entry.metadata()
+            && metadata.nlink() > 1
+        {
+            match links.entry((metadata.dev(), metadata.ino())) {
+                BTreeMapEntry::Occupied(previous) => {
+                    let mut header = TarHeader::new_gnu();
+                    header.set_metadata(&metadata);
+                    header.set_size(0);
+                    header.set_entry_type(TarEntryType::Link);
+                    tar.append_link(&mut header, relative_path, previous.get())?;
+                    continue;
+                }
+                BTreeMapEntry::Vacant(v) => {
+                    v.insert(relative_path.to_path_buf());
                 }
             }
         }

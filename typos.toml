@@ -13,6 +13,7 @@ AttributeIDSupressMenu = "AttributeIDSupressMenu"
 teh = "teh"
 Hashi = "Hashi"
 consts = "consts"
+passin = "passin"
 
 [files]
-extend-exclude = ["**/*.js", "**/*.css", "**/*.html", "examples/*/static/**/*.*"]
+extend-exclude = ["**/*.js", "**/*.css", "**/*.html", "examples/*/static/**/*.*", "assets/encoding_blacklist"]

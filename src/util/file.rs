@@ -116,7 +116,7 @@ pub fn file_length<P: AsRef<Path> + ?Sized>(meta: &Metadata, _: &P) -> u64 {
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-pub fn file_length<P: AsRef<Path> + ?Sized>(meta: &Metadata, path: &P) -> u64 {
+pub fn file_length<P: AsRef<Path> + ?Sized>(meta: &Metadata, _path: &P) -> u64 {
     use std::os::unix::fs::FileTypeExt;
     if meta.file_type().is_block_device() || meta.file_type().is_char_device() {
         // For block devices, try ioctl to get size; fallback to meta.len()

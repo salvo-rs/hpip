@@ -956,7 +956,6 @@ fn handle_dir_listing(
     }
 }
 
-
 fn try_encode_generated_response(
     req: &mut Request,
     config: &AppConfig,

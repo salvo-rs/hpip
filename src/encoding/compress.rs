@@ -4,7 +4,7 @@ use std::path::Path;
 
 use brotli::enc::BrotliCompress as brotli_compress;
 use brotli::enc::backward_references::BrotliEncoderParams;
-use flate2::Compression as Flate2Compression;
+use flate2::Compression;
 use flate2::write::{DeflateEncoder, GzEncoder};
 
 use crate::config::EncodingType;
@@ -115,7 +115,7 @@ pub fn file_hash(p: &Path) -> Result<blake3::Hash, io::Error> {
 
 // Gzip
 fn encode_str_gzip(dt: &str) -> Option<Vec<u8>> {
-    let mut cmp = GzEncoder::new(Vec::new(), Flate2Compression::default());
+    let mut cmp = GzEncoder::new(Vec::new(), Compression::default());
     cmp.write_all(dt.as_bytes())
         .ok()
         .and_then(|_| cmp.finish().ok())
@@ -124,7 +124,7 @@ fn encode_str_gzip(dt: &str) -> Option<Vec<u8>> {
 fn encode_file_gzip(inf: File, outf: File) -> bool {
     let mut cmp = GzEncoder::new(
         BufWriter::with_capacity(1024 * 1024, outf),
-        Flate2Compression::default(),
+        Compression::default(),
     );
     io::copy(&mut BufReader::with_capacity(1024 * 1024, inf), &mut cmp)
         .and_then(|_| cmp.finish())
@@ -133,7 +133,7 @@ fn encode_file_gzip(inf: File, outf: File) -> bool {
 
 // Deflate
 fn encode_str_deflate(dt: &str) -> Option<Vec<u8>> {
-    let mut cmp = DeflateEncoder::new(Vec::new(), Flate2Compression::default());
+    let mut cmp = DeflateEncoder::new(Vec::new(), Compression::default());
     cmp.write_all(dt.as_bytes())
         .ok()
         .and_then(|_| cmp.finish().ok())
@@ -142,7 +142,7 @@ fn encode_str_deflate(dt: &str) -> Option<Vec<u8>> {
 fn encode_file_deflate(inf: File, outf: File) -> bool {
     let mut cmp = DeflateEncoder::new(
         BufWriter::with_capacity(1024 * 1024, outf),
-        Flate2Compression::default(),
+        Compression::default(),
     );
     io::copy(&mut BufReader::with_capacity(1024 * 1024, inf), &mut cmp)
         .and_then(|_| cmp.finish())

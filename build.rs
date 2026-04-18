@@ -80,10 +80,7 @@ fn assets() -> Vec<(&'static str, String)> {
 
 fn htmls() {
     let assets = assets();
-    for html in [
-        "error.html",
-        "directory_listing.html",
-    ] {
+    for html in ["error.html", "directory_listing.html"] {
         println!("cargo:rerun-if-changed=assets/{}", html);
 
         let with_assets = assets
