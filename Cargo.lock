@@ -944,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "hpip"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "base64",
  "blake3",

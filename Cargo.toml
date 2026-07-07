@@ -1,8 +1,9 @@
 [package]
 name = "hpip"
 description = "Host These Things Please - a modern async HTTP file server"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.96"
 license = "Apache-2.0"
 repository = "https://github.com/salvo-rs/hpip"
 homepage = "https://github.com/salvo-rs/hpip"
