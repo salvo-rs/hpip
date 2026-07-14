@@ -2039,9 +2039,9 @@ checksum = "a50f4cf475b65d88e057964e0e9bb1f0aa9bbb2036dc65c64596b42932536984"
 
 [[package]]
 name = "salvo"
-version = "0.92.0"
+version = "0.94.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18c769247c3d1f0334876337eb5044e8954d7546ee8814adef31eb9b6343a569"
+checksum = "e58d7158d996e7005dc9b67b0fe01bc070d500e644156ea74badc4826bb18d42"
 dependencies = [
  "salvo-proxy",
  "salvo_core",
@@ -2049,16 +2049,15 @@ dependencies = [
 
 [[package]]
 name = "salvo-proxy"
-version = "0.92.0"
+version = "0.94.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12106182d3a59907a07f8cab1502de7a96e5acd5b899b66397975ac01e3f9c48"
+checksum = "4cb66547bc10e639f9dc62c57913d6a136b5bd2cbe96f88a7a0306d0eecff503"
 dependencies = [
  "fastrand",
  "futures-util",
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "local-ip-address",
  "percent-encoding",
  "reqwest",
  "salvo_core",
@@ -2068,9 +2067,9 @@ dependencies = [
 
 [[package]]
 name = "salvo-serde-util"
-version = "0.92.0"
+version = "0.94.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9158501312da84612279015f3c7793e40c80b8fd6628823fba9bf1bcaad197e6"
+checksum = "92fa0afee41d6feb8983ee997d0827ecdb67a74ab00f3e932b6308b467630a3f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2079,9 +2078,9 @@ dependencies = [
 
 [[package]]
 name = "salvo_core"
-version = "0.92.0"
+version = "0.94.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1193415bc0b50b041bf5b3a1e2d066332d9be4bb6a31b6775e6b3afddb3d6926"
+checksum = "31dfe3c744ac1585cfa730d24b17710248ae96e8fcef9ac0df600c5e712ab709"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2131,14 +2130,13 @@ dependencies = [
 
 [[package]]
 name = "salvo_macros"
-version = "0.92.0"
+version = "0.94.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e48a1b12532532f2193aaf0fec67a8f31542fb2b5f46108328297629011697f"
+checksum = "42e4f904389a10df1a8ec0dfa84313c357cf35860b8f1d827493c8bac773a2e8"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "regex",
  "salvo-serde-util",
  "syn",
 ]
