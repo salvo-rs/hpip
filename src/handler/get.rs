@@ -14,7 +14,7 @@ use crate::util::*;
 
 #[handler]
 pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let config = depot.obtain::<Arc<AppConfig>>().unwrap().clone();
+    let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
 
     if let Some(resp) = crate::hoops::auth::check_auth(req, &config) {
         *res = resp;
@@ -592,7 +592,7 @@ fn handle_get_file_range(
     let mut buf = vec![0u8; content_len as usize];
     if f.read_exact(&mut buf).is_err() {
         // Read what we can
-        buf.truncate(0);
+        buf.clear();
         f.seek(SeekFrom::Start(from)).ok();
         let mut temp = Vec::new();
         f.take(content_len).read_to_end(&mut temp).ok();

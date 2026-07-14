@@ -22,7 +22,7 @@ impl LoggingHoop {
 
         ctrl.call_next(req, depot, res).await;
 
-        if let Ok(config) = depot.obtain::<Arc<AppConfig>>() {
+        if let Ok(config) = depot.get_typed::<Arc<AppConfig>>() {
             let status = res.status_code.unwrap_or(StatusCode::OK);
             if config.log.0 {
                 log_msg(
