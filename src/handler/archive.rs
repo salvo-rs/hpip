@@ -81,7 +81,7 @@ impl std::fmt::Display for ArchiveType {
 /// Handle POST requests for archive downloads (form-based)
 #[handler]
 pub async fn handle_post_archive(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let config = depot.obtain::<Arc<AppConfig>>().unwrap().clone();
+    let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
 
     if !config.archives {
         res.status_code(StatusCode::METHOD_NOT_ALLOWED);

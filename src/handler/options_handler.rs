@@ -7,7 +7,7 @@ use crate::util::USER_AGENT;
 
 #[handler]
 pub async fn handle_options(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let config = depot.obtain::<Arc<AppConfig>>().unwrap().clone();
+    let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
 
     if let Some(resp) = crate::hoops::auth::check_auth(req, &config) {
         *res = resp;

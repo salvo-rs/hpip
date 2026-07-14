@@ -203,7 +203,7 @@ impl InjectConfig {
         res: &mut Response,
         ctrl: &mut FlowCtrl,
     ) {
-        depot.inject(self.config.clone());
+        depot.insert_typed(self.config.clone());
         ctrl.call_next(req, depot, res).await;
     }
 }

@@ -32,7 +32,7 @@ fn default_xml_emitter_config() -> XmlEmitterConfig {
 
 #[handler]
 pub async fn handle_propfind(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let config = depot.obtain::<Arc<AppConfig>>().unwrap().clone();
+    let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
 
     if let Some(resp) = crate::hoops::auth::check_auth(req, &config) {
         *res = resp;
@@ -752,7 +752,7 @@ struct ProppatchActionables {
 
 #[handler]
 pub async fn handle_proppatch(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let config = depot.obtain::<Arc<AppConfig>>().unwrap().clone();
+    let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
 
     if let Some(resp) = crate::hoops::auth::check_auth(req, &config) {
         *res = resp;
@@ -1005,7 +1005,7 @@ fn write_proppatch_output(
 
 #[handler]
 pub async fn handle_mkcol(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let config = depot.obtain::<Arc<AppConfig>>().unwrap().clone();
+    let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
 
     if let Some(resp) = crate::hoops::auth::check_auth(req, &config) {
         *res = resp;
@@ -1095,7 +1095,7 @@ pub async fn handle_copy(req: &mut Request, depot: &mut Depot, res: &mut Respons
 
 #[handler]
 pub async fn handle_move(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let config = depot.obtain::<Arc<AppConfig>>().unwrap().clone();
+    let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
     let url_path_raw = req.uri().path().to_string();
     let segments: Vec<&str> = url_path_raw.split('/').filter(|s| !s.is_empty()).collect();
     let (req_p, ..) = resolve_path(
@@ -1129,7 +1129,7 @@ pub async fn handle_move(req: &mut Request, depot: &mut Depot, res: &mut Respons
 }
 
 async fn handle_copy_move(req: &mut Request, depot: &mut Depot, res: &mut Response, is_move: bool) {
-    let config = depot.obtain::<Arc<AppConfig>>().unwrap().clone();
+    let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
 
     if let Some(resp) = crate::hoops::auth::check_auth(req, &config) {
         *res = resp;
