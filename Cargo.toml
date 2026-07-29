@@ -10,7 +10,7 @@ homepage = "https://github.com/salvo-rs/hpip"
 build = "build.rs"
 
 [dependencies]
-salvo = { version = "0.94", features = ["rustls"] }
+salvo = { version = "0.95", features = ["rustls"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
