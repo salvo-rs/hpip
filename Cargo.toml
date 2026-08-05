@@ -46,7 +46,7 @@ windows-sys = { version = "0.61", features = [
 libc = "0.2"
 
 [build-dependencies]
-base64 = "0.22"
+base64 = "0.23"
 
 [[bin]]
 name = "hpip"
