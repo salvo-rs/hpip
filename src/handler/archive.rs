@@ -1,6 +1,6 @@
 #[cfg(unix)]
 use std::collections::btree_map::{BTreeMap, Entry as BTreeMapEntry};
-use std::io::{self, ErrorKind as IoErrorKind, Result as IoResult};
+use std::io::{self, Result as IoResult, Write};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -217,63 +217,66 @@ fn serve_archive(req: &Request, res: &mut Response, config: &AppConfig, archive_
 
     let allow_encoding = config.encoded_temp_dir.is_some();
 
-    // Generate archive in memory
-    let archive_data = match archive_type {
-        ArchiveType::Tar => write_tar_body_to_vec(&req_p),
-        ArchiveType::Zip => write_zip_body_to_vec(&req_p, allow_encoding),
-    };
+    res.status_code(StatusCode::OK);
+    res.headers_mut().insert(
+        salvo::http::header::CONTENT_TYPE,
+        archive_type.default_mime().parse().unwrap(),
+    );
+    res.headers_mut().insert(
+        salvo::http::header::CONTENT_DISPOSITION,
+        format!("attachment; filename=\"{}\"", attachment)
+            .parse()
+            .unwrap(),
+    );
+    res.headers_mut()
+        .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
 
-    match archive_data {
-        Ok(data) => {
-            log_msg(
-                config.log,
-                &format!(
-                    "{} was served {} archive for {}",
-                    remote,
-                    archive_type,
-                    req_p.display()
-                ),
-            );
-            res.status_code(StatusCode::OK);
-            res.headers_mut().insert(
-                salvo::http::header::CONTENT_TYPE,
-                archive_type.default_mime().parse().unwrap(),
-            );
-            res.headers_mut().insert(
-                salvo::http::header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{}\"", attachment)
-                    .parse()
-                    .unwrap(),
-            );
-            res.headers_mut()
-                .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-            res.write_body(data).ok();
-        }
-        Err(e) => {
-            log_msg(
-                config.log,
-                &format!("{} archive error for {}: {}", remote, req_p.display(), e),
-            );
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        }
+    let sender = res.channel();
+    let runtime = tokio::runtime::Handle::current();
+    if config
+        .spawn_blocking(move || {
+            let mut writer = ArchiveWriter { sender, runtime };
+            let result = match archive_type {
+                ArchiveType::Tar => write_tar_body(&req_p, &mut writer),
+                ArchiveType::Zip => write_zip_body(&req_p, allow_encoding, &mut writer),
+            };
+            if let Err(error) = result {
+                writer.sender.send_error(error);
+            }
+        })
+        .is_none()
+    {
+        res.body(salvo::http::ResBody::None);
+        res.status_code(StatusCode::SERVICE_UNAVAILABLE);
     }
 }
 
-fn write_tar_body_to_vec(path: &Path) -> IoResult<Vec<u8>> {
-    let buf = Vec::with_capacity(128 * 1024);
-    let mut tar = TarBuilder::new(buf);
-    tar.follow_symlinks(false);
+/// Bridge synchronous archive writers to a backpressured response channel.
+/// A failed send stops traversal when the client disconnects.
+struct ArchiveWriter {
+    sender: salvo::http::body::BodySender,
+    runtime: tokio::runtime::Handle,
+}
 
-    fn ignorable(err: io::Error) -> IoResult<()> {
-        match err.kind() {
-            IoErrorKind::ConnectionRefused
-            | IoErrorKind::ConnectionReset
-            | IoErrorKind::ConnectionAborted
-            | IoErrorKind::BrokenPipe
-            | IoErrorKind::WriteZero => Err(err),
-            _ => Ok(()),
+impl Write for ArchiveWriter {
+    fn write(&mut self, bytes: &[u8]) -> IoResult<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
         }
+        let count = bytes.len().min(64 * 1024);
+        self.runtime
+            .block_on(self.sender.send_data(bytes[..count].to_vec()))?;
+        Ok(count)
     }
+
+    fn flush(&mut self) -> IoResult<()> {
+        Ok(())
+    }
+}
+
+fn write_tar_body<W: Write>(path: &Path, output: W) -> IoResult<W> {
+    let mut tar = TarBuilder::new(output);
+    tar.follow_symlinks(false);
 
     #[cfg(unix)]
     let mut links = BTreeMap::<(u64, u64), PathBuf>::new();
@@ -282,6 +285,7 @@ fn write_tar_body_to_vec(path: &Path) -> IoResult<Vec<u8>> {
         .follow_links(false)
         .follow_root_links(false)
         .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || !is_internal_name(entry.file_name()))
         .flatten()
     {
         if entry.depth() == 0 && entry.file_type().is_dir() {
@@ -322,21 +326,20 @@ fn write_tar_body_to_vec(path: &Path) -> IoResult<Vec<u8>> {
             }
         }
 
-        tar.append_path_with_name(entry.path(), relative_path)
-            .or_else(ignorable)?;
+        tar.append_path_with_name(entry.path(), relative_path)?;
     }
 
     tar.into_inner()
 }
 
-fn write_zip_body_to_vec(path: &Path, allow_encoding: bool) -> IoResult<Vec<u8>> {
-    let buf = Vec::with_capacity(128 * 1024);
-    let mut zip = ZipWriter::new_stream(buf);
+fn write_zip_body<W: Write>(path: &Path, allow_encoding: bool, output: W) -> IoResult<W> {
+    let mut zip = ZipWriter::new_stream(output);
 
     for entry in WalkDir::new(path)
         .follow_links(false)
         .follow_root_links(false)
         .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || !is_internal_name(entry.file_name()))
         .flatten()
     {
         if entry.depth() == 0 && entry.file_type().is_dir() {
@@ -443,4 +446,51 @@ fn write_zip_body_to_vec(path: &Path, allow_encoding: bool) -> IoResult<Vec<u8>>
 
     let stream_writer = zip.finish()?;
     Ok(stream_writer.into_inner())
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use salvo::test::{ResponseExt, TestClient};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn archives_stream_valid_tar_and_zip_contents() {
+        let dir = crate::test_support::TestDir::new();
+        let data = vec![17; 256 * 1024 + 3];
+        std::fs::write(dir.path().join("data.bin"), &data).unwrap();
+        std::fs::write(dir.path().join(".HPIP-UPLOAD-secret"), b"private").unwrap();
+        std::fs::create_dir(dir.path().join(".hpip-internal-secret")).unwrap();
+        std::fs::write(dir.path().join(".hpip-internal-secret/key"), b"private").unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &["-A"],
+        )));
+        for mime in ["application/x-tar", "application/zip"] {
+            let mut response = TestClient::get("http://localhost/")
+                .add_header("Accept", mime, true)
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::OK));
+            assert!(response.body.is_channel());
+            let bytes = response.take_bytes(None).await.unwrap();
+            let mut contents = Vec::new();
+            if mime.ends_with("zip") {
+                let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+                assert_eq!(archive.len(), 1);
+                let mut file = archive.by_name("data.bin").unwrap();
+                std::io::Read::read_to_end(&mut file, &mut contents).unwrap();
+            } else {
+                let mut archive = tar::Archive::new(bytes.as_ref());
+                for file in archive.entries().unwrap() {
+                    let mut file = file.unwrap();
+                    assert!(!file.path().unwrap().to_string_lossy().contains("secret"));
+                    if file.path().unwrap() == Path::new("data.bin") {
+                        std::io::Read::read_to_end(&mut file, &mut contents).unwrap();
+                    }
+                }
+            }
+            assert_eq!(contents, data);
+        }
+    }
 }

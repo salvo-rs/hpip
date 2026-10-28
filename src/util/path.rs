@@ -216,6 +216,12 @@ pub fn resolve_path(
     (cur, sk, err)
 }
 
+/// Names reserved for incomplete uploads and private instance state.
+pub fn is_internal_name(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    name.starts_with(".hpip-upload-") || name.starts_with(".hpip-internal-")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

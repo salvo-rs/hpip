@@ -211,6 +211,7 @@ async fn result_main() -> Result<(), Error> {
         let _ = task.await;
     }
 
+    config.drain_blocking_jobs().await;
     config.clean_temp_dirs(&opts.temp_directory, opts.generate_tls);
     result.map_err(|e| Error(format!("Serving requests: {e}")))
 }
