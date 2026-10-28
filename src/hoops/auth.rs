@@ -4,42 +4,82 @@ use salvo::prelude::*;
 
 use crate::config::{AppConfig, log_msg};
 use crate::util::USER_AGENT;
+use crate::util::path::decoded_url_path;
 
 /// Check authentication. Returns Some(Response) if auth fails, None if auth passes.
 /// Takes config directly to avoid borrow conflicts with depot.
 pub fn check_auth(req: &Request, config: &Arc<AppConfig>) -> Option<Response> {
+    check_auth_path(req, config, req.uri().path())
+}
+
+/// Check a URL using the same decoded components as filesystem resolution.
+pub fn check_auth_path(req: &Request, config: &AppConfig, url_path: &str) -> Option<Response> {
+    let Some(path) = decoded_url_path(url_path) else {
+        let mut response = Response::new();
+        response.status_code(StatusCode::BAD_REQUEST);
+        response.render(Text::Plain("Invalid resource path.\n"));
+        return Some(response);
+    };
+    check_decoded_auth(req, config, &path)
+}
+
+type Credentials = (String, Option<String>);
+
+/// A decoded resource name is never percent-decoded a second time.
+pub fn check_decoded_auth(req: &Request, config: &AppConfig, path: &str) -> Option<Response> {
     if config.global_auth_data.is_none() && config.path_auth_data.is_empty() {
         return None;
     }
 
-    let mut auth = config.global_auth_data.as_ref();
-
-    if !config.path_auth_data.is_empty() {
-        let mut path = req.uri().path();
-        if path.starts_with('/') {
-            path = &path[1..];
-        }
-        if path.ends_with('/') {
-            path = &path[..path.len() - 1];
-        }
-
-        let mut search_path = path;
-        while !search_path.is_empty() {
-            if let Some(pad) = config.path_auth_data.get(search_path) {
-                auth = pad.as_ref();
-                break;
-            }
-            search_path = &search_path[..search_path.rfind('/').unwrap_or(0)];
-        }
+    let mut required = Vec::new();
+    if let Some(auth) = auth_for_path(config, path) {
+        required.push(auth);
     }
-
-    let auth = auth?;
+    // Resolve existing ancestors as well: a new file under a directory alias
+    // must not bypass the real directory's policy.
+    if let Some(actual_path) = canonical_auth_path(config, path)
+        && let Some(auth) = auth_for_path(config, &actual_path)
+        && !required.contains(&auth)
+    {
+        required.push(auth);
+    }
+    if required.is_empty() {
+        return None;
+    }
 
     let remote = req.remote_addr().to_string();
     let method = req.method().to_string();
     let url = req.uri().to_string();
 
-    // Check Authorization header
+    if let Some(credentials) = supplied_credentials(req) {
+        if required.iter().all(|expected| **expected == credentials) {
+            log_msg(
+                config.log,
+                &format!("{} correctly authorised to {} {}", remote, method, url),
+            );
+            return None;
+        }
+        log_msg(
+            config.log,
+            &format!(
+                "{} requested to {} {} with invalid credentials",
+                remote, method, url
+            ),
+        );
+        return Some(unauthorized_response("Supplied credentials invalid.\n"));
+    }
+
+    log_msg(
+        config.log,
+        &format!(
+            "{} requested to {} {} without authorisation",
+            remote, method, url
+        ),
+    );
+    Some(unauthorized_response("Credentials required.\n"))
+}
+
+fn supplied_credentials(req: &Request) -> Option<Credentials> {
     if let Some(auth_header) = req.headers().get(salvo::http::header::AUTHORIZATION)
         && let Ok(auth_str) = auth_header.to_str()
         && auth_str.starts_with("Basic ")
@@ -61,47 +101,58 @@ pub fn check_auth(req: &Request, config: &Arc<AppConfig>) -> Option<Response> {
             (cred_str.clone(), None)
         };
 
-        if auth.0 == username && auth.1 == password {
-            log_msg(
-                config.log,
-                &format!("{} correctly authorised to {} {}", remote, method, url),
-            );
-            return None;
-        } else {
-            log_msg(
-                config.log,
-                &format!(
-                    "{} requested to {} {} with invalid credentials",
-                    remote, method, url
-                ),
-            );
-            let mut resp = Response::new();
-            resp.status_code(StatusCode::UNAUTHORIZED);
-            resp.headers_mut()
-                .insert("WWW-Authenticate", "Basic realm=\"hpip\"".parse().unwrap());
-            resp.headers_mut()
-                .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-            resp.render(Text::Plain("Supplied credentials invalid.\n"));
-            return Some(resp);
-        }
+        return Some((username, password));
     }
+    None
+}
 
-    log_msg(
-        config.log,
-        &format!(
-            "{} requested to {} {} without authorisation",
-            remote, method, url
-        ),
-    );
-
+fn unauthorized_response(message: &'static str) -> Response {
     let mut resp = Response::new();
     resp.status_code(StatusCode::UNAUTHORIZED);
     resp.headers_mut()
         .insert("WWW-Authenticate", "Basic realm=\"hpip\"".parse().unwrap());
     resp.headers_mut()
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-    resp.render(Text::Plain("Credentials required.\n"));
-    Some(resp)
+    resp.render(Text::Plain(message));
+    resp
+}
+
+fn auth_for_path<'a>(config: &'a AppConfig, path: &str) -> Option<&'a Credentials> {
+    config
+        .path_auth_data
+        .iter()
+        .filter(|(rule, _)| path_rule_matches(path, rule))
+        .max_by_key(|(rule, _)| rule.len())
+        .map_or(config.global_auth_data.as_ref(), |(_, auth)| auth.as_ref())
+}
+
+fn path_rule_matches(path: &str, rule: &str) -> bool {
+    #[cfg(windows)]
+    let (path, rule) = (path.to_lowercase(), rule.to_lowercase());
+    path == rule
+        || path
+            .strip_prefix(&*rule)
+            .is_some_and(|tail| tail.starts_with('/'))
+}
+
+fn canonical_auth_path(config: &AppConfig, path: &str) -> Option<String> {
+    let mut current = config.hosted_directory.1.join(path);
+    let mut suffix = Vec::new();
+    let canonical = loop {
+        match current.canonicalize() {
+            Ok(canonical) => break canonical,
+            Err(_) => {
+                suffix.push(current.file_name()?.to_owned());
+                current = current.parent()?.to_path_buf();
+            }
+        }
+    };
+    let root = config.hosted_directory.1.canonicalize().ok()?;
+    let mut relative = canonical.strip_prefix(root).ok()?.to_path_buf();
+    for component in suffix.into_iter().rev() {
+        relative.push(component);
+    }
+    Some(relative.to_string_lossy().replace('\\', "/"))
 }
 
 fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
@@ -125,4 +176,87 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use salvo::test::{ResponseExt, TestClient};
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    #[tokio::test]
+    async fn encoded_paths_require_the_same_credentials() {
+        let dir = TestDir::new();
+        std::fs::create_dir(dir.path().join("private")).unwrap();
+        std::fs::write(dir.path().join("private/file.txt"), "protected").unwrap();
+        let service = Service::new(crate::build_router(config(
+            dir.path(),
+            &["--path-auth", "private=user:pass"],
+        )));
+        for path in [
+            "/private/file.txt",
+            "/%70rivate/file.txt",
+            "//private//file.txt",
+        ] {
+            let response = TestClient::get(format!("http://localhost{path}"))
+                .send(&service)
+                .await;
+            assert_eq!(
+                response.status_code,
+                Some(StatusCode::UNAUTHORIZED),
+                "{path}"
+            );
+        }
+        let mut response = TestClient::get("http://localhost/%70rivate/file.txt")
+            .basic_auth("user", Some("pass"))
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+        assert_eq!(response.take_string().await.unwrap(), "protected");
+    }
+
+    #[test]
+    fn rules_match_component_boundaries() {
+        assert!(path_rule_matches("private/file.txt", "private"));
+        assert!(path_rule_matches("private", "private"));
+        assert!(!path_rule_matches("private-other/file.txt", "private"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_case_aliases_cannot_bypass_rules() {
+        let dir = TestDir::new();
+        std::fs::create_dir(dir.path().join("Private")).unwrap();
+        std::fs::write(dir.path().join("Private/file.txt"), "protected").unwrap();
+        let service = Service::new(crate::build_router(config(
+            dir.path(),
+            &["--path-auth", "Private=user:pass"],
+        )));
+        let response = TestClient::get("http://localhost/private/file.txt")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filesystem_aliases_inherit_target_protection() {
+        let dir = TestDir::new();
+        std::fs::create_dir(dir.path().join("private")).unwrap();
+        std::fs::write(dir.path().join("private/file.txt"), "protected").unwrap();
+        std::os::unix::fs::symlink("private", dir.path().join("alias")).unwrap();
+        let service = Service::new(crate::build_router(config(
+            dir.path(),
+            &["--path-auth", "private=user:pass"],
+        )));
+        let response = TestClient::get("http://localhost/alias/file.txt")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+        let response = TestClient::put("http://localhost/alias/new.txt")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+    }
 }
