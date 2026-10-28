@@ -10,66 +10,8 @@ use salvo::prelude::*;
 use tokio::io::AsyncWriteExt;
 
 use crate::config::AppConfig;
+use crate::util::write_conditions::{MUTATION_LOCK, WriteConditions};
 use crate::util::*;
-
-// Serialize the precondition check and publication of PUTs in this process.
-static UPLOAD_COMMIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-#[derive(Default, Clone)]
-struct WriteConditions {
-    if_match: Option<String>,
-    if_none_match: Option<String>,
-}
-
-impl WriteConditions {
-    fn from_request(req: &Request) -> Result<Self, StatusCode> {
-        let header = |name| {
-            req.headers()
-                .get(name)
-                .map(|value| {
-                    value
-                        .to_str()
-                        .map(str::to_owned)
-                        .map_err(|_| StatusCode::BAD_REQUEST)
-                })
-                .transpose()
-        };
-        Ok(Self {
-            if_match: header("if-match")?,
-            if_none_match: header("if-none-match")?,
-        })
-    }
-
-    fn allows(&self, current: Option<&str>) -> bool {
-        let matches = |value: &str, weak: bool| {
-            if value.trim() == "*" {
-                return current.is_some();
-            }
-            value.split(',').any(|candidate| {
-                let candidate = candidate.trim();
-                let candidate = if weak {
-                    candidate.strip_prefix("W/").unwrap_or(candidate)
-                } else {
-                    candidate
-                };
-                current.is_some_and(|etag| candidate == format!("\"{etag}\""))
-            })
-        };
-        self.if_match
-            .as_deref()
-            .is_none_or(|value| matches(value, false))
-            && self
-                .if_none_match
-                .as_deref()
-                .is_none_or(|value| !matches(value, true))
-    }
-
-    fn create_only(&self) -> bool {
-        self.if_none_match
-            .as_deref()
-            .is_some_and(|value| value.trim() == "*")
-    }
-}
 
 #[derive(Debug)]
 enum UploadError {
@@ -474,14 +416,13 @@ async fn write_request_file(
             .map_err(std::io::Error::other)??;
     }
     file.sync_all().await?;
-    let _commit_lock = UPLOAD_COMMIT_LOCK.lock().await;
+    let _commit_lock = MUTATION_LOCK.lock().await;
     let metadata = match tokio::fs::metadata(destination).await {
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let current_etag = metadata.as_ref().map(file_etag);
-    if !conditions.allows(current_etag.as_deref()) {
+    if !conditions.allows_metadata(metadata.as_ref())? {
         return Err(UploadError::PreconditionFailed);
     }
     if let Some(metadata) = metadata.as_ref() {
