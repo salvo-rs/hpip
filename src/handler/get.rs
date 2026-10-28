@@ -63,7 +63,7 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
         && let Some(rp) = INDEX_EXTENSIONS
             .iter()
             .map(|ext| req_p.with_extension(ext))
-            .find(|rp| rp.exists())
+            .find(|rp| rp.is_file())
     {
         symlink |= is_symlink(&rp);
         let logical = crate::util::path::decoded_url_path(&url_path_raw).unwrap();
@@ -1021,6 +1021,27 @@ mod selected_resource_tests {
 
     use super::*;
     use crate::test_support::{TestDir, config};
+
+    #[tokio::test]
+    async fn extension_candidates_cannot_turn_into_unprotected_directory_indexes() {
+        let dir = TestDir::new();
+        std::fs::create_dir(dir.path().join("asset.html")).unwrap();
+        std::fs::write(dir.path().join("asset.html/index.html"), "protected index").unwrap();
+        let service = Service::new(crate::build_router(config(
+            dir.path(),
+            &["-x", "--path-auth", "asset.html/index.html=user:pass"],
+        )));
+        let response = TestClient::get("http://localhost/asset.html/index.html")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+        for path in ["/asset/", "/asset"] {
+            let response = TestClient::get(format!("http://localhost{path}"))
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::NOT_FOUND), "{path}");
+        }
+    }
 
     #[tokio::test]
     async fn implicit_file_selection_preserves_the_selected_files_authentication() {
