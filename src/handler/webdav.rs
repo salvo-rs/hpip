@@ -1385,20 +1385,32 @@ fn copy_move_work(req: &mut Request, config: &Arc<AppConfig>, res: &mut Response
         return;
     }
 
-    let depth = req
-        .headers()
-        .get("Depth")
-        .and_then(|v| v.to_str().ok())
-        .and_then(Depth::parse)
-        .unwrap_or(Depth::Infinity);
-
-    let overwrite = req
-        .headers()
-        .get("Overwrite")
-        .and_then(|v| v.to_str().ok())
-        .and_then(Overwrite::parse)
-        .unwrap_or_default()
-        .0;
+    let (depth, overwrite) = match (
+        control_header(req, "Depth", Depth::Infinity, Depth::parse),
+        control_header(req, "Overwrite", Overwrite::default(), Overwrite::parse),
+    ) {
+        (Ok(depth), Ok(overwrite)) => (depth, overwrite.0),
+        _ => {
+            set_error(
+                res,
+                StatusCode::BAD_REQUEST,
+                "400 Bad Request",
+                "Invalid or repeated Depth/Overwrite header.",
+            );
+            return;
+        }
+    };
+    if req_p.is_dir()
+        && ((is_move && depth != Depth::Infinity) || (!is_move && depth == Depth::One))
+    {
+        set_error(
+            res,
+            StatusCode::BAD_REQUEST,
+            "400 Bad Request",
+            "MOVE requires Depth: infinity; COPY requires Depth: 0 or infinity.",
+        );
+        return;
+    }
 
     let remote = req.remote_addr().to_string();
     log_msg(
@@ -1487,15 +1499,6 @@ fn copy_move_work(req: &mut Request, config: &Arc<AppConfig>, res: &mut Response
     }
 
     if is_move {
-        if depth != Depth::Infinity {
-            set_error(
-                res,
-                StatusCode::BAD_REQUEST,
-                "400 Bad Request",
-                "MOVE requires Depth: infinity.",
-            );
-            return;
-        }
         // A failed rename leaves the complete source in place. In particular,
         // never emulate cross-device MOVE by deleting a partially copied tree.
         let result = if overwrite {
@@ -1507,15 +1510,6 @@ fn copy_move_work(req: &mut Request, config: &Arc<AppConfig>, res: &mut Response
         return;
     }
 
-    if !req_p.is_file() && depth == Depth::One {
-        set_error(
-            res,
-            StatusCode::BAD_REQUEST,
-            "400 Bad Request",
-            "COPY requires Depth: 0 or infinity.",
-        );
-        return;
-    }
     if !overwrite {
         copy_response(
             res,
@@ -1558,6 +1552,22 @@ fn copy_move_work(req: &mut Request, config: &Arc<AppConfig>, res: &mut Response
             }
         }
     }
+}
+
+fn control_header<T>(
+    req: &Request,
+    name: &str,
+    default: T,
+    parse: fn(&str) -> Option<T>,
+) -> Result<T, ()> {
+    let mut values = req.headers().get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(default);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    value.to_str().ok().and_then(parse).ok_or(())
 }
 
 fn local_destination_path(req: &Request, destination: &str) -> Option<String> {
@@ -2254,5 +2264,123 @@ mod mutation_precondition_tests {
             .await;
         assert_eq!(response.status_code, Some(StatusCode::PRECONDITION_FAILED));
         assert_eq!(fs::read(source).unwrap(), b"original");
+    }
+}
+
+#[cfg(test)]
+mod control_header_tests {
+    use salvo::test::RequestBuilder;
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    #[tokio::test]
+    async fn valid_depth_values_are_ignored_for_non_collection_resources() {
+        let directory = TestDir::new();
+        let service = Service::new(crate::build_router(config(directory.path(), &["-w", "-d"])));
+        for method in ["COPY", "MOVE"] {
+            for depth in ["0", "1"] {
+                fs::write(directory.path().join("source"), b"fixture").unwrap();
+                let target = format!("/target-{method}-{depth}");
+                let response =
+                    RequestBuilder::new("http://localhost/source", method.parse().unwrap())
+                        .add_header("Destination", target.clone(), true)
+                        .add_header("Depth", depth, true)
+                        .send(&service)
+                        .await;
+                assert_eq!(response.status_code, Some(StatusCode::CREATED));
+                assert_eq!(
+                    fs::read(directory.path().join(&target[1..])).unwrap(),
+                    b"fixture"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_headers_never_remove_or_replace_a_destination() {
+        for method in ["COPY", "MOVE"] {
+            let directory = TestDir::new();
+            fs::create_dir_all(directory.path().join("source/nested")).unwrap();
+            fs::write(directory.path().join("source/nested/file"), b"source").unwrap();
+            fs::create_dir(directory.path().join("destination")).unwrap();
+            let service =
+                Service::new(crate::build_router(config(directory.path(), &["-w", "-d"])));
+            for (name, value) in [
+                ("Overwrite", "false"),
+                ("Overwrite", "T, F"),
+                ("Overwrite", ""),
+                ("Depth", "garbage"),
+                ("Depth", ""),
+                ("Depth", "1"),
+            ] {
+                let response = RequestBuilder::new(
+                    "http://localhost/source",
+                    salvo::http::Method::from_bytes(method.as_bytes()).unwrap(),
+                )
+                .add_header("Destination", "/destination", true)
+                .add_header(name, value, true)
+                .send(&service)
+                .await;
+                assert_eq!(
+                    response.status_code,
+                    Some(StatusCode::BAD_REQUEST),
+                    "{method} {name}:{value}"
+                );
+                assert_eq!(
+                    fs::read(directory.path().join("source/nested/file")).unwrap(),
+                    b"source"
+                );
+                assert!(directory.path().join("destination").is_dir());
+                assert_eq!(
+                    fs::read_dir(directory.path().join("destination"))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            }
+            for name in ["Overwrite", "Depth"] {
+                let value = if name == "Overwrite" { "T" } else { "infinity" };
+                let response = RequestBuilder::new(
+                    "http://localhost/source",
+                    salvo::http::Method::from_bytes(method.as_bytes()).unwrap(),
+                )
+                .add_header("Destination", "/destination", true)
+                .add_header(name, value, true)
+                .add_header(name, value, false)
+                .send(&service)
+                .await;
+                assert_eq!(
+                    response.status_code,
+                    Some(StatusCode::BAD_REQUEST),
+                    "{method}: repeated {name}"
+                );
+                assert!(directory.path().join("destination").is_dir());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_control_headers_keep_the_documented_defaults() {
+        for method in ["COPY", "MOVE"] {
+            let directory = TestDir::new();
+            fs::create_dir_all(directory.path().join("source/nested")).unwrap();
+            fs::write(directory.path().join("source/nested/file"), b"source").unwrap();
+            let service =
+                Service::new(crate::build_router(config(directory.path(), &["-w", "-d"])));
+            let response = RequestBuilder::new(
+                "http://localhost/source",
+                salvo::http::Method::from_bytes(method.as_bytes()).unwrap(),
+            )
+            .add_header("Destination", "/destination", true)
+            .send(&service)
+            .await;
+            assert_eq!(response.status_code, Some(StatusCode::CREATED));
+            assert_eq!(
+                fs::read(directory.path().join("destination/nested/file")).unwrap(),
+                b"source"
+            );
+            assert_eq!(directory.path().join("source").exists(), method == "COPY");
+        }
     }
 }
