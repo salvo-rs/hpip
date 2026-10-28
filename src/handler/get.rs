@@ -35,14 +35,17 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
     }
 
     let url_path_raw = req.uri().path().to_string();
-    let url_path_str = percent_encoding::percent_decode_str(&url_path_raw)
+    let decoded_path = percent_encoding::percent_decode_str(&url_path_raw)
         .decode_utf8()
-        .map(|s| s.to_string())
-        .unwrap_or_default();
+        .map(|s| s.to_string());
+    let Ok(url_path_str) = decoded_path else {
+        handle_invalid_url(req, res, &config);
+        return;
+    };
 
-    let segments: Vec<&str> = url_path_str.split('/').filter(|s| !s.is_empty()).collect();
+    let segments: Vec<&str> = url_path_raw.split('/').filter(|s| !s.is_empty()).collect();
 
-    let (mut req_p, symlink, url_err) = resolve_path(
+    let (mut req_p, mut symlink, url_err) = resolve_path(
         &config.hosted_directory.1,
         &segments,
         config.follow_symlinks,
@@ -62,6 +65,17 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
             .map(|ext| req_p.with_extension(ext))
             .find(|rp| rp.exists())
     {
+        symlink |= is_symlink(&rp);
+        let logical = crate::util::path::decoded_url_path(&url_path_raw).unwrap();
+        let logical = Path::new(&logical).with_extension(rp.extension().unwrap_or_default());
+        if let Some(response) = crate::hoops::auth::check_decoded_auth(
+            req,
+            &config,
+            &logical.to_string_lossy().replace('\\', "/"),
+        ) {
+            *res = response;
+            return;
+        }
         req_p = rp;
     }
 
@@ -667,11 +681,13 @@ fn handle_get_dir(
         let mut idx = req_p.join("index");
         for ext in INDEX_EXTENSIONS {
             idx.set_extension(ext);
-            if idx.exists()
-                && (!config.follow_symlinks
-                    || !config.sandbox_symlinks
-                    || is_descendant_of(req_p, &config.hosted_directory.1))
-            {
+            if idx.exists() && !config.is_symlink_denied(is_symlink(&idx), &idx) {
+                let index_url = format!("{}/index.{}", url_path_raw.trim_end_matches('/'), ext);
+                if let Some(response) = crate::hoops::auth::check_auth_path(req, config, &index_url)
+                {
+                    *res = response;
+                    return;
+                }
                 // Check if URL ends with slash
                 if url_path_raw.ends_with('/') {
                     // Serve index file directly
@@ -1263,5 +1279,69 @@ mod range_tests {
         assert_eq!(response.status_code, Some(StatusCode::NOT_FOUND));
         assert!(response.body.is_channel());
         assert_eq!(response.take_bytes(None).await.unwrap().as_ref(), data);
+    }
+}
+
+#[cfg(test)]
+mod selected_resource_tests {
+    #[cfg(unix)]
+    use salvo::test::ResponseExt;
+    use salvo::test::TestClient;
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    #[tokio::test]
+    async fn implicit_file_selection_preserves_the_selected_files_authentication() {
+        let dir = TestDir::new();
+        std::fs::write(dir.path().join("index.html"), "index contents").unwrap();
+        std::fs::write(dir.path().join("asset.html"), "asset contents").unwrap();
+        let service = Service::new(crate::build_router(config(
+            dir.path(),
+            &[
+                "-x",
+                "--path-auth",
+                "index.html=user:pass",
+                "--path-auth",
+                "asset.html=user:pass",
+            ],
+        )));
+        for path in ["/", "/asset"] {
+            let response = TestClient::get(format!("http://localhost{path}"))
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+            let response = TestClient::get(format!("http://localhost{path}"))
+                .basic_auth("user", Some("pass"))
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::OK));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_indexes_and_extension_candidates_obey_symlink_policy() {
+        let fixture = TestDir::new();
+        let hosted = fixture.path().join("served");
+        std::fs::create_dir(&hosted).unwrap();
+        std::fs::write(fixture.path().join("outside.txt"), "outside").unwrap();
+        for name in ["index.html", "asset.html"] {
+            std::os::unix::fs::symlink("../outside.txt", hosted.join(name)).unwrap();
+        }
+        for flags in [&["-l", "-x"][..], &["-l", "-x", "-s"], &["-l", "-x", "-r"]] {
+            let service = Service::new(crate::build_router(config(&hosted, flags)));
+            for path in ["/", "/asset"] {
+                let mut response = TestClient::get(format!("http://localhost{path}"))
+                    .send(&service)
+                    .await;
+                if flags.len() == 2 {
+                    assert_eq!(response.status_code, Some(StatusCode::OK));
+                    assert_eq!(response.take_string().await.unwrap(), "outside");
+                } else {
+                    assert_eq!(response.status_code, Some(StatusCode::NOT_FOUND));
+                }
+            }
+        }
     }
 }

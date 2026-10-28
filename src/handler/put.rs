@@ -109,12 +109,12 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
         return;
     }
 
-    let url_path_str = percent_encoding::percent_decode_str(req.uri().path())
+    let url_path_raw = req.uri().path().to_string();
+    let decoded_path = percent_encoding::percent_decode_str(&url_path_raw)
         .decode_utf8()
-        .map(|s| s.to_string())
-        .unwrap_or_default();
+        .map(|s| s.to_string());
 
-    let segments: Vec<&str> = url_path_str.split('/').filter(|s| !s.is_empty()).collect();
+    let segments: Vec<&str> = url_path_raw.split('/').filter(|s| !s.is_empty()).collect();
 
     let (req_p, symlink, url_err) = resolve_path(
         &config.hosted_directory.1,
@@ -122,7 +122,7 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
         config.follow_symlinks,
     );
 
-    if url_err {
+    if url_err || decoded_path.is_err() {
         res.status_code(StatusCode::BAD_REQUEST);
         res.render(Text::Html(error_html(
             "400 Bad Request",
@@ -131,6 +131,7 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
         )));
         return;
     }
+    let url_path_str = decoded_path.unwrap();
 
     if req_p.is_dir() {
         res.status_code(StatusCode::METHOD_NOT_ALLOWED);

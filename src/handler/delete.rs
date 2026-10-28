@@ -31,17 +31,17 @@ pub async fn handle_delete(req: &mut Request, depot: &mut Depot, res: &mut Respo
         return;
     }
 
-    let url_path_str = percent_encoding::percent_decode_str(req.uri().path())
+    let url_path_raw = req.uri().path().to_string();
+    let decoded_path = percent_encoding::percent_decode_str(&url_path_raw)
         .decode_utf8()
-        .map(|s| s.to_string())
-        .unwrap_or_default();
+        .map(|s| s.to_string());
 
-    let segments: Vec<&str> = url_path_str.split('/').filter(|s| !s.is_empty()).collect();
+    let segments: Vec<&str> = url_path_raw.split('/').filter(|s| !s.is_empty()).collect();
 
     // Don't follow symlinks for delete, just resolve to get the actual entry
     let (req_p, symlink, url_err) = resolve_path(&config.hosted_directory.1, &segments, false);
 
-    if url_err {
+    if url_err || decoded_path.is_err() {
         res.status_code(StatusCode::BAD_REQUEST);
         res.render(Text::Html(error_html(
             "400 Bad Request",
@@ -50,6 +50,7 @@ pub async fn handle_delete(req: &mut Request, depot: &mut Depot, res: &mut Respo
         )));
         return;
     }
+    let url_path_str = decoded_path.unwrap();
 
     if !req_p.exists() || config.is_symlink_denied(symlink, &req_p) {
         res.status_code(StatusCode::NOT_FOUND);
@@ -67,6 +68,13 @@ pub async fn handle_delete(req: &mut Request, depot: &mut Depot, res: &mut Respo
         .metadata()
         .map(|m| is_actually_file(&m.file_type(), &req_p))
         .unwrap_or(false);
+
+    if !is_file
+        && let Some(response) = crate::hoops::auth::check_tree_auth(req, &config, req.uri().path())
+    {
+        *res = response;
+        return;
+    }
 
     let result = if is_file {
         tokio::fs::remove_file(&req_p_clone).await

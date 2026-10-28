@@ -36,6 +36,7 @@ pub fn decode_path_component(component: &str) -> Option<Cow<'_, str>> {
         || matches!(decoded.as_ref(), "." | "..")
         || decoded.contains(['/', '\\', ':', '\0'])
         || decoded.to_ascii_lowercase().starts_with(".hpip-upload-")
+        || decoded.to_ascii_lowercase().starts_with(".hpip-internal-")
     {
         return None;
     }
@@ -227,6 +228,61 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn literal_percent_names_address_the_same_file_for_all_representations() {
+        use salvo::prelude::*;
+        use salvo::test::{ResponseExt, TestClient};
+
+        use crate::test_support::{TestDir, config};
+
+        let fixture = TestDir::new();
+        fs::write(fixture.path().join("a%20b.txt"), "percent").unwrap();
+        fs::write(fixture.path().join("a b.txt"), "space").unwrap();
+        let service = Service::new(crate::build_router(config(fixture.path(), &["-w", "-e"])));
+        let url = "http://localhost/a%2520b.txt";
+        let mut response = TestClient::get(url).send(&service).await;
+        assert_eq!(response.take_string().await.unwrap(), "percent");
+        let mut response = TestClient::get(url)
+            .add_header("Accept", "application/json", true)
+            .send(&service)
+            .await;
+        let metadata: serde_json::Value =
+            serde_json::from_str(&response.take_string().await.unwrap()).unwrap();
+        assert_eq!(metadata["files"][0]["name"], "a%20b.txt");
+        let response = TestClient::put(url).text("updated").send(&service).await;
+        assert_eq!(response.status_code, Some(StatusCode::NO_CONTENT));
+        assert_eq!(
+            fs::read_to_string(fixture.path().join("a%20b.txt")).unwrap(),
+            "updated"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.path().join("a b.txt")).unwrap(),
+            "space"
+        );
+        let response = TestClient::delete(url).send(&service).await;
+        assert_eq!(response.status_code, Some(StatusCode::NO_CONTENT));
+        assert!(!fixture.path().join("a%20b.txt").exists());
+        assert!(fixture.path().join("a b.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn malformed_utf8_is_rejected_without_rendering_the_root_directory() {
+        use salvo::prelude::*;
+        use salvo::test::TestClient;
+
+        use crate::test_support::{TestDir, config};
+
+        let fixture = TestDir::new();
+        let service = Service::new(crate::build_router(config(fixture.path(), &["-w"])));
+        for method in ["GET", "PUT", "DELETE"] {
+            let mut request = TestClient::get("http://localhost/").build();
+            *request.method_mut() = method.parse().unwrap();
+            *request.uri_mut() = "/%ff".parse().unwrap();
+            let response = service.handle(request).await;
+            assert_eq!(response.status_code, Some(StatusCode::BAD_REQUEST));
+        }
+    }
+
+    #[tokio::test]
     async fn all_filesystem_methods_reject_parent_components() {
         use salvo::prelude::*;
         use salvo::test::TestClient;
@@ -277,6 +333,8 @@ mod tests {
             "%zz",
             ".hpip-upload-123",
             ".HPIP-UPLOAD-456",
+            ".hpip-internal-123",
+            ".HPIP-INTERNAL-456",
         ] {
             let (resolved, _, invalid) = resolve_path(&root, &[segment], true);
             assert!(invalid, "accepted invalid component {segment}");

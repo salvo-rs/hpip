@@ -145,6 +145,17 @@ Uploads stream to a private staging file and become visible at their destination
 |--------|-------------|
 | `--request-bandwidth <BYTES/S>` | Only 0 (unlimited) is supported; nonzero limits are rejected |
 
+## Collection Authorization
+
+Directory archives, recursive WebDAV operations, and directory deletion require
+the request's credentials to satisfy every protected descendant, including
+protected targets reached through directory aliases. If descendants use
+different credentials, operate on those resources individually or configure a
+consistent collection policy. The server rejects an operation before producing
+archive bytes or changing collection members when authorization fails. When
+per-path rules are configured, authorization traversal rejects unreadable trees,
+link cycles, more than 100,000 members, or nesting beyond 256 levels.
+
 ## Environment Variables
 
 | Variable | Description |
