@@ -321,8 +321,8 @@ fn build_router(config: Arc<AppConfig>) -> Router {
 
     let mut router = Router::new()
         .hoop(inject)
-        .hoop(hoops::additional_headers::AdditionalHeadersHoop)
-        .hoop(hoops::logging::LoggingHoop);
+        .hoop(hoops::logging::LoggingHoop)
+        .hoop(hoops::additional_headers::AdditionalHeadersHoop);
 
     // Add DAV header for WebDAV mode
     if webdav_level >= options::WebDavLevel::MkColMoveOnly {
