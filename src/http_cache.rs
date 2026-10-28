@@ -4,7 +4,7 @@ use salvo::prelude::*;
 pub fn not_modified(
     req: &Request,
     res: &mut Response,
-    etag: &str,
+    etag: Option<&str>,
     modified: DateTime<Utc>,
 ) -> bool {
     let matches = if let Some(value) = req.headers().get("if-none-match") {
@@ -12,8 +12,10 @@ pub fn not_modified(
             value.split(',').any(|tag| {
                 let tag = tag.trim();
                 tag == "*"
-                    || tag.strip_prefix("W/").unwrap_or(tag)
-                        == etag.strip_prefix("W/").unwrap_or(etag)
+                    || etag.is_some_and(|etag| {
+                        tag.strip_prefix("W/").unwrap_or(tag)
+                            == etag.strip_prefix("W/").unwrap_or(etag)
+                    })
             })
         })
     } else {
@@ -25,7 +27,9 @@ pub fn not_modified(
     };
     if matches {
         res.status_code(StatusCode::NOT_MODIFIED);
-        res.headers_mut().insert("etag", etag.parse().unwrap());
+        if let Some(etag) = etag {
+            res.headers_mut().insert("etag", etag.parse().unwrap());
+        }
         res.headers_mut().insert(
             "last-modified",
             modified

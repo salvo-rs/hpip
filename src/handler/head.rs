@@ -5,11 +5,14 @@ use salvo::prelude::*;
 use crate::config::AppConfig;
 use crate::util::*;
 
+/// A cold compression decision needs body reads; HEAD omits those representation fields.
+pub(crate) struct UnresolvedFileEncoding;
+
 /// Inspect a resource without reading its body or producing an archive.
 #[handler]
 pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let config = depot.get_typed::<Arc<AppConfig>>().unwrap();
-    if let Some(response) = crate::hoops::auth::check_auth(req, config) {
+    let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
+    if let Some(response) = crate::hoops::auth::check_auth(req, &config) {
         *res = response;
         res.body(salvo::http::ResBody::None);
         return;
@@ -48,7 +51,7 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
         && let Some(kind) = crate::handler::archive::try_get_accept_archive(req)
     {
         if let Some(response) =
-            crate::hoops::auth::check_tree_auth_async(req, config, req.uri().path()).await
+            crate::hoops::auth::check_tree_auth_async(req, &config, req.uri().path()).await
         {
             *res = response;
             res.body(salvo::http::ResBody::None);
@@ -78,7 +81,7 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
             .with_extension(candidate.extension().unwrap_or_default());
         if let Some(response) = crate::hoops::auth::check_decoded_auth(
             req,
-            config,
+            &config,
             &logical.to_string_lossy().replace('\\', "/"),
         ) {
             *res = response;
@@ -107,7 +110,7 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
                 req.uri().path().trim_end_matches('/'),
                 index.extension().and_then(|ext| ext.to_str()).unwrap_or("")
             );
-            if let Some(response) = crate::hoops::auth::check_auth_path(req, config, &index_url) {
+            if let Some(response) = crate::hoops::auth::check_auth_path(req, &config, &index_url) {
                 *res = response;
                 res.body(salvo::http::ResBody::None);
                 return;
@@ -136,10 +139,33 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
         res.status_code(StatusCode::NOT_FOUND);
         return;
     };
+    let etag = file_etag(&metadata);
+    let mut response_etag = Some(format!("\"{etag}\""));
+    let mut length = Some(file_length(&metadata, &path));
+    if let Some(encoding) =
+        super::get::file_encoding_candidate(req, &config, &path, length.unwrap())
+    {
+        match super::get::cached_file_encoding(&config, &path, &etag, encoding) {
+            Some(Some(encoded)) => {
+                let coding = crate::encoding::encoding_name(encoding);
+                response_etag = Some(format!("\"{etag}-{coding}\""));
+                length = Some(encoded.length);
+                res.headers_mut()
+                    .insert("content-encoding", coding.parse().unwrap());
+            }
+            Some(None) => {}
+            None => {
+                // Neither claim identity nor create an encoding just to answer HEAD.
+                response_etag = None;
+                length = None;
+                depot.insert_typed(UnresolvedFileEncoding);
+            }
+        }
+    }
     if crate::http_cache::not_modified(
         req,
         res,
-        &format!("\"{}\"", file_etag(&metadata)),
+        response_etag.as_deref(),
         file_time_modified(&metadata),
     ) {
         return;
@@ -151,14 +177,13 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
             .parse()
             .unwrap(),
     );
-    res.headers_mut().insert(
-        "content-length",
-        file_length(&metadata, &path).to_string().parse().unwrap(),
-    );
-    res.headers_mut().insert(
-        "etag",
-        format!("\"{}\"", file_etag(&metadata)).parse().unwrap(),
-    );
+    if let Some(length) = length {
+        res.headers_mut()
+            .insert("content-length", length.to_string().parse().unwrap());
+    }
+    if let Some(etag) = response_etag {
+        res.headers_mut().insert("etag", etag.parse().unwrap());
+    }
     res.headers_mut().insert(
         "last-modified",
         file_time_modified(&metadata)
@@ -178,6 +203,102 @@ mod tests {
     use salvo::test::{ResponseExt, TestClient};
 
     use super::*;
+
+    #[tokio::test]
+    async fn head_uses_cached_coding_and_omits_unknown_representation_fields() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::write(dir.path().join("file.txt"), "compressible\n".repeat(2000)).unwrap();
+        let config = crate::test_support::config(dir.path(), &[]);
+        let service = Service::new(crate::build_router(config.clone()));
+        let mut cold = TestClient::head("http://localhost/file.txt")
+            .add_header("Accept-Encoding", "gzip,identity;q=0", true)
+            .send(&service)
+            .await;
+        assert_eq!(cold.status_code, Some(StatusCode::OK));
+        for header in ["content-length", "content-encoding", "etag"] {
+            assert!(!cold.headers().contains_key(header), "{header}");
+        }
+        assert!(cold.take_bytes(None).await.unwrap().is_empty());
+        assert!(config.cache_fs_files.read().unwrap().is_empty());
+        let get = TestClient::get("http://localhost/file.txt")
+            .add_header("Accept-Encoding", "gzip,identity;q=0", true)
+            .send(&service)
+            .await;
+        assert_eq!(get.status_code, Some(StatusCode::OK));
+        assert_eq!(get.headers()["content-encoding"], "gzip");
+        // Cached GET and HEAD do not need a worker, even when all workers are busy.
+        let _workers = config
+            .blocking_jobs
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        for method in ["GET", "HEAD"] {
+            let request = if method == "GET" {
+                TestClient::get("http://localhost/file.txt")
+            } else {
+                TestClient::head("http://localhost/file.txt")
+            };
+            let response = request
+                .add_header("Accept-Encoding", "gzip,identity;q=0", true)
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::OK));
+            for header in ["content-length", "content-encoding", "etag"] {
+                assert_eq!(
+                    response.headers().get(header),
+                    get.headers().get(header),
+                    "{method} {header}"
+                );
+            }
+        }
+        let response = TestClient::head("http://localhost/file.txt")
+            .add_header("Accept-Encoding", "gzip,identity;q=0", true)
+            .add_header(
+                "If-None-Match",
+                get.headers()["etag"].to_str().unwrap(),
+                true,
+            )
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::NOT_MODIFIED));
+        assert_eq!(response.headers().get("etag"), get.headers().get("etag"));
+    }
+
+    #[tokio::test]
+    async fn head_preserves_identity_rejections_for_ineligible_and_negative_codings() {
+        let dir = crate::test_support::TestDir::new();
+        for name in ["file.txt", "file.png"] {
+            std::fs::write(dir.path().join(name), "compressible\n".repeat(2000)).unwrap();
+        }
+        std::fs::write(dir.path().join("small.txt"), "small").unwrap();
+        for (flags, path) in [
+            (vec!["-e"], "file.txt"),
+            (vec![], "file.png"),
+            (vec![], "small.txt"),
+            (vec!["--encoded-filesystem", "1"], "file.txt"),
+        ] {
+            let config = crate::test_support::config(dir.path(), &flags);
+            let service = Service::new(crate::build_router(config));
+            // A GET records the compression-budget rejection as a negative entry.
+            if flags.contains(&"--encoded-filesystem") {
+                let get = TestClient::get(format!("http://localhost/{path}"))
+                    .add_header("Accept-Encoding", "gzip,identity;q=0", true)
+                    .send(&service)
+                    .await;
+                assert_eq!(get.status_code, Some(StatusCode::NOT_ACCEPTABLE));
+            }
+            let response = TestClient::head(format!("http://localhost/{path}"))
+                .add_header("Accept-Encoding", "gzip,identity;q=0", true)
+                .send(&service)
+                .await;
+            assert_eq!(
+                response.status_code,
+                Some(StatusCode::NOT_ACCEPTABLE),
+                "{flags:?} {path}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn head_authorizes_selected_files_before_metadata_or_redirects() {

@@ -27,6 +27,9 @@ impl AdditionalHeadersHoop {
         if matches!(req.method().as_str(), "GET" | "HEAD")
             && res.status_code.is_some_and(|s| s.is_success())
             && !res.headers().contains_key("content-encoding")
+            && depot
+                .get_typed::<crate::handler::head::UnresolvedFileEncoding>()
+                .is_err()
             && let Some(accept) = req
                 .headers()
                 .get("accept-encoding")

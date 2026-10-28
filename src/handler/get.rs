@@ -273,7 +273,7 @@ async fn serve_open_file(
     {
         let tag = format!("\"{etag}\"");
         if crate::http_cache::range_matches(req, &tag, modified) {
-            if crate::http_cache::not_modified(req, res, &tag, modified) {
+            if crate::http_cache::not_modified(req, res, Some(&tag), modified) {
                 return;
             }
             handle_get_file_range(req, res, config, req_p, file, metadata, &range).await;
@@ -292,23 +292,12 @@ async fn serve_open_file(
     );
 
     // Check if we should try encoding
-    if config.encoded_temp_dir.is_some()
-        && flen > MIN_ENCODING_SIZE
-        && flen < MAX_ENCODING_SIZE
-        && req_p
-            .extension()
-            .map(|s| !extension_is_blacklisted(s))
-            .unwrap_or(true)
-        && let Some(accept_enc) = req
-            .headers()
-            .get(salvo::http::header::ACCEPT_ENCODING)
-            .and_then(|v| v.to_str().ok())
-        && let Some(encoding) = response_encoding(accept_enc)
+    if let Some(encoding) = file_encoding_candidate(req, config, req_p, flen)
         && let Some(encoded) =
             encoded_file_job(config, &file, req_p, &etag, encoding, &remote).await
     {
         let response_etag = format!("\"{}-{}\"", etag, encoding_name(encoding));
-        if !is_404 && crate::http_cache::not_modified(req, res, &response_etag, modified) {
+        if !is_404 && crate::http_cache::not_modified(req, res, Some(&response_etag), modified) {
             return;
         }
         res.status_code(if is_404 {
@@ -347,7 +336,9 @@ async fn serve_open_file(
     }
 
     // Serve file without encoding
-    if !is_404 && crate::http_cache::not_modified(req, res, &format!("\"{}\"", etag), modified) {
+    if !is_404
+        && crate::http_cache::not_modified(req, res, Some(&format!("\"{}\"", etag)), modified)
+    {
         return;
     }
     if file.seek(std::io::SeekFrom::Start(0)).await.is_err() {
@@ -387,6 +378,50 @@ async fn serve_open_file(
     stream_file(res, file, flen);
 }
 
+pub(super) fn file_encoding_candidate(
+    req: &Request,
+    config: &AppConfig,
+    path: &Path,
+    length: u64,
+) -> Option<EncodingType> {
+    if config.encoded_temp_dir.is_none()
+        || length <= MIN_ENCODING_SIZE
+        || length >= MAX_ENCODING_SIZE
+        || path.extension().is_some_and(extension_is_blacklisted)
+    {
+        return None;
+    }
+    response_encoding(req.headers().get("accept-encoding")?.to_str().ok()?)
+}
+
+/// None means the coding requires reading the source to determine its gain.
+/// Some(None) is a current negative cache entry; Some(Some(_)) pins an encoded file.
+pub(super) fn cached_file_encoding(
+    config: &AppConfig,
+    path: &Path,
+    etag: &str,
+    encoding: EncodingType,
+) -> Option<Option<EncodedFile>> {
+    let hash = *config
+        .cache_fs_files
+        .read()
+        .ok()?
+        .get(&format!("{}:{etag}", path.display()))?;
+    let cache = config.cache_fs.read().ok()?;
+    let ((path, present, _), atime) = cache.get(&(hash, encoding))?;
+    if *present {
+        let encoded = EncodedFile::open(path)?;
+        atime.store(precise_time_ns(), AtomicOrdering::Relaxed);
+        Some(Some(encoded))
+    } else if precise_time_ns().saturating_sub(atime.load(AtomicOrdering::Relaxed))
+        <= crate::config::NEGATIVE_CACHE_TTL_NS
+    {
+        Some(None)
+    } else {
+        None
+    }
+}
+
 async fn encoded_file_job(
     config: &Arc<AppConfig>,
     source: &tokio::fs::File,
@@ -395,6 +430,9 @@ async fn encoded_file_job(
     encoding: EncodingType,
     remote: &str,
 ) -> Option<EncodedFile> {
+    if let Some(cached) = cached_file_encoding(config, path, etag, encoding) {
+        return cached;
+    }
     let mut source = source.try_clone().await.ok()?.into_std().await;
     let work_config = config.clone();
     let path = path.to_path_buf();
@@ -530,9 +568,9 @@ fn try_encoded_file(
 }
 
 /// Opening before releasing the job keeps the representation alive across eviction.
-struct EncodedFile {
+pub(super) struct EncodedFile {
     file: std::fs::File,
-    length: u64,
+    pub(super) length: u64,
 }
 
 impl EncodedFile {
