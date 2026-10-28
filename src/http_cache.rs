@@ -139,6 +139,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ranges_do_not_replace_the_selected_encoding_or_its_preconditions() {
+        use std::io::Read;
+
+        let dir = crate::test_support::TestDir::new();
+        let contents = "range coding fixture\n".repeat(2000);
+        std::fs::write(dir.path().join("file.txt"), &contents).unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &[],
+        )));
+        let initial = TestClient::get("http://localhost/file.txt")
+            .add_header("Accept-Encoding", "gzip", true)
+            .send(&service)
+            .await;
+        let tag = initial.headers()["etag"].to_str().unwrap().to_owned();
+        for encoding in ["gzip", "gzip,identity;q=0"] {
+            for condition in [None, Some(("If-Match", tag.as_str()))] {
+                let mut request = TestClient::get("http://localhost/file.txt")
+                    .add_header("Accept-Encoding", encoding, true)
+                    .add_header("Range", "bytes=0-9", true);
+                if let Some((name, value)) = condition {
+                    request = request.add_header(name, value, true);
+                }
+                let mut response = request.send(&service).await;
+                assert_eq!(response.status_code, Some(StatusCode::OK));
+                assert_eq!(response.headers()["content-encoding"], "gzip");
+                assert_eq!(response.headers()["etag"], tag);
+                assert!(!response.headers().contains_key("content-range"));
+                let bytes = response.take_bytes(None).await.unwrap();
+                let mut decoded = String::new();
+                flate2::read::GzDecoder::new(bytes.as_ref())
+                    .read_to_string(&mut decoded)
+                    .unwrap();
+                assert_eq!(decoded, contents);
+            }
+            let response = TestClient::get("http://localhost/file.txt")
+                .add_header("Accept-Encoding", encoding, true)
+                .add_header("Range", "bytes=0-9", true)
+                .add_header("If-None-Match", &tag, true)
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::NOT_MODIFIED));
+            assert_eq!(response.headers()["etag"], tag);
+        }
+        let mut identity = TestClient::get("http://localhost/file.txt")
+            .add_header("Accept-Encoding", "identity", true)
+            .add_header("Range", "bytes=0-9", true)
+            .send(&service)
+            .await;
+        assert_eq!(identity.status_code, Some(StatusCode::PARTIAL_CONTENT));
+        assert_eq!(identity.take_string().await.unwrap(), &contents[..10]);
+    }
+
+    #[tokio::test]
     async fn quoted_commas_never_turn_an_opaque_tag_into_a_wildcard() {
         let dir = crate::test_support::TestDir::new();
         let path = dir.path().join("file.txt");
