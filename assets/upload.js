@@ -109,21 +109,20 @@ window.addEventListener("DOMContentLoaded", function() {
     });
 
     let start = 0;
-    let update = -1000;
     request.upload.addEventListener("loadstart", function(e) {
       start = e.timeStamp;
     });
     let prog = function(e) {
       if(e.lengthComputable) {
-        progress_progress.value = event.loaded;
-        progress_progress.max   = event.total;
+        progress_progress.value = e.loaded;
+        progress_progress.max   = e.total;
 
         let elapsed = (e.timeStamp - start) / 1000; // s
         if(elapsed > 0.1) {
-          let speed = event.loaded / elapsed;
-          progress_progress_desc.innerText = human_readable_size(event.loaded) + "/" + human_readable_size(event.total);
+          let speed = e.loaded / elapsed;
+          progress_progress_desc.innerText = human_readable_size(e.loaded) + "/" + human_readable_size(e.total);
           progress_speed_text.data         = human_readable_size(speed);
-          progress_time.innerText          = hms(elapsed) + "/" + hms(event.total / speed);
+          progress_time.innerText          = hms(elapsed) + "/" + hms(e.total / speed);
         }
       } else {
         progress_progress.removeAttribute("value");
