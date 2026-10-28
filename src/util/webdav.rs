@@ -5,8 +5,6 @@ use std::{fmt, fs};
 use walkdir::WalkDir;
 use xml::name::Name as XmlName;
 
-use super::file::is_actually_file;
-
 macro_rules! xml_name {
     ($ns:expr, $ln:expr) => {
         XmlName {
@@ -131,22 +129,39 @@ pub fn client_microsoft(user_agent: Option<&str>) -> bool {
 
 /// Copy a directory recursively from `from` to `to`.
 pub fn copy_dir(from: &Path, to: &Path) -> IoResult<Vec<(IoError, String)>> {
-    fs::create_dir(to)?;
-
     // Disallow copying a directory into itself
-    if from
-        .canonicalize()
-        .and_then(|fc| to.canonicalize().map(|tc| (fc, tc)))
-        .map(|(fc, tc)| tc.starts_with(fc))?
-    {
-        fs::remove_dir(to)?;
+    let source = from.canonicalize()?;
+    let target = to
+        .parent()
+        .ok_or_else(|| IoError::other("destination has no parent"))?
+        .canonicalize()?
+        .join(
+            to.file_name()
+                .ok_or_else(|| IoError::other("destination has no name"))?,
+        );
+    if target.starts_with(&source) {
         return Err(IoError::other(
             "cannot copy to a path prefixed by the source path",
         ));
     }
+    fs::create_dir(to)?;
 
     let mut errors = Vec::new();
-    for entry in WalkDir::new(from).min_depth(1).into_iter().flatten() {
+    for entry in WalkDir::new(from).min_depth(1) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                let path = error
+                    .path()
+                    .unwrap_or(from)
+                    .strip_prefix(from)
+                    .unwrap_or(from)
+                    .to_string_lossy()
+                    .into_owned();
+                errors.push((error.into(), path));
+                continue;
+            }
+        };
         let source_metadata = match entry.metadata() {
             Ok(md) => md,
             Err(err) => {
@@ -161,23 +176,88 @@ pub fn copy_dir(from: &Path, to: &Path) -> IoResult<Vec<(IoError, String)>> {
             .expect("strip_prefix failed");
         let target_path = to.join(relative_path);
 
-        if !is_actually_file(&source_metadata.file_type(), entry.path()) {
+        if source_metadata.file_type().is_symlink() {
+            if let Err(error) = copy_symlink(entry.path(), &target_path) {
+                errors.push((error, relative_path.to_string_lossy().into_owned()));
+            }
+        } else if source_metadata.is_dir() {
             if let Err(e) = fs::create_dir(&target_path) {
                 errors.push((e, relative_path.to_string_lossy().into_owned()));
             }
             if let Err(e) = fs::set_permissions(&target_path, source_metadata.permissions()) {
                 errors.push((e, relative_path.to_string_lossy().into_owned()));
             }
-        } else if let Err(e) = fs::copy(entry.path(), &target_path) {
-            errors.push((e, relative_path.to_string_lossy().into_owned()));
+        } else if source_metadata.is_file() {
+            if let Err(error) = fs::copy(entry.path(), &target_path) {
+                errors.push((error, relative_path.to_string_lossy().into_owned()));
+            }
+        } else {
+            errors.push((
+                IoError::new(std::io::ErrorKind::Unsupported, "cannot copy special file"),
+                relative_path.to_string_lossy().into_owned(),
+            ));
         }
     }
 
     Ok(errors)
 }
 
+#[cfg(unix)]
+fn copy_symlink(from: &Path, to: &Path) -> IoResult<()> {
+    std::os::unix::fs::symlink(fs::read_link(from)?, to)
+}
+
+#[cfg(windows)]
+fn copy_symlink(from: &Path, to: &Path) -> IoResult<()> {
+    use std::os::windows::fs::{FileTypeExt, symlink_dir, symlink_file};
+    let target = fs::read_link(from)?;
+    if fs::symlink_metadata(from)?.file_type().is_symlink_dir() {
+        symlink_dir(target, to)
+    } else {
+        symlink_file(target, to)
+    }
+}
+
 /// Parse a Win32 time string to ms since epoch
 pub fn win32time(t: &str) -> Option<u64> {
     let tm = chrono::DateTime::parse_from_str(t, "%a, %d %b %Y %T %Z").ok()?;
     Some(tm.timestamp_millis() as u64)
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+    use crate::test_support::TestDir;
+
+    #[test]
+    fn copies_nested_content_and_rejects_descendant_destination_without_side_effects() {
+        let directory = TestDir::new();
+        let from = directory.path().join("source");
+        let to = directory.path().join("copy");
+        fs::create_dir_all(from.join("nested")).unwrap();
+        fs::write(from.join("nested/file"), b"fixture").unwrap();
+        assert!(copy_dir(&from, &to).unwrap().is_empty());
+        assert_eq!(fs::read(to.join("nested/file")).unwrap(), b"fixture");
+        assert!(copy_dir(&from, &from.join("child")).is_err());
+        assert!(!from.join("child").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_directory_and_dangling_symbolic_links() {
+        let directory = TestDir::new();
+        let from = directory.path().join("source");
+        let to = directory.path().join("copy");
+        fs::create_dir_all(from.join("nested")).unwrap();
+        fs::write(from.join("nested/file"), b"fixture").unwrap();
+        std::os::unix::fs::symlink("nested", from.join("link")).unwrap();
+        std::os::unix::fs::symlink("missing", from.join("dangling")).unwrap();
+        assert!(copy_dir(&from, &to).unwrap().is_empty());
+        assert_eq!(fs::read_link(to.join("link")).unwrap(), Path::new("nested"));
+        assert_eq!(
+            fs::read_link(to.join("dangling")).unwrap(),
+            Path::new("missing")
+        );
+        assert_eq!(fs::read(to.join("link/file")).unwrap(), b"fixture");
+    }
 }

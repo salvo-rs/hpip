@@ -1111,37 +1111,7 @@ pub async fn handle_copy(req: &mut Request, depot: &mut Depot, res: &mut Respons
 
 #[handler]
 pub async fn handle_move(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
-    let url_path_raw = req.uri().path().to_string();
-    let segments: Vec<&str> = url_path_raw.split('/').filter(|s| !s.is_empty()).collect();
-    let (req_p, ..) = resolve_path(
-        &config.hosted_directory.1,
-        &segments,
-        config.follow_symlinks,
-    );
-
-    let req_p_clone = req_p.clone();
-    let is_file = req_p
-        .metadata()
-        .map(|m| is_actually_file(&m.file_type(), &req_p))
-        .unwrap_or(true);
-
     handle_copy_move(req, depot, res, true).await;
-
-    // If copy_move succeeded (Created or NoContent), remove source
-    if res.status_code == Some(StatusCode::CREATED)
-        || res.status_code == Some(StatusCode::NO_CONTENT)
-    {
-        let removal = if is_file {
-            fs::remove_file(&req_p_clone)
-        } else {
-            fs::remove_dir_all(&req_p_clone)
-        };
-        if removal.is_err() {
-            res.status_code(StatusCode::LOCKED);
-            res.body(salvo::http::ResBody::None);
-        }
-    }
 }
 
 async fn handle_copy_move(req: &mut Request, depot: &mut Depot, res: &mut Response, is_move: bool) {
@@ -1299,16 +1269,30 @@ async fn handle_copy_move(req: &mut Request, depot: &mut Depot, res: &mut Respon
             res.status_code(StatusCode::PRECONDITION_FAILED);
             return;
         }
-        if !is_actually_file(&dest_p.metadata().unwrap().file_type(), &dest_p)
-            && fs::remove_dir(&dest_p).is_err()
-        {
+        if !is_move && dest_p.is_dir() && fs::remove_dir(&dest_p).is_err() {
             res.status_code(StatusCode::LOCKED);
             return;
         }
         overwritten = true;
     }
 
-    let source_file = is_actually_file(&req_p.metadata().unwrap().file_type(), &req_p);
+    if is_move {
+        if depth != Depth::Infinity {
+            set_error(
+                res,
+                StatusCode::BAD_REQUEST,
+                "400 Bad Request",
+                "MOVE requires Depth: infinity.",
+            );
+            return;
+        }
+        // A failed rename leaves the complete source in place. In particular,
+        // never emulate cross-device MOVE by deleting a partially copied tree.
+        copy_response(res, tokio::fs::rename(&req_p, &dest_p).await, overwritten);
+        return;
+    }
+
+    let source_file = req_p.is_file();
     if source_file {
         copy_response(res, fs::copy(&req_p, &dest_p).map(|_| ()), overwritten);
     } else {
@@ -1407,4 +1391,45 @@ fn set_error(res: &mut Response, status: StatusCode, title: &str, msg: &str) {
     res.headers_mut()
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
     res.render(Text::Html(body));
+}
+
+#[cfg(test)]
+mod move_tests {
+    use salvo::test::RequestBuilder;
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    #[tokio::test]
+    async fn moves_complete_directory_and_keeps_source_on_failure() {
+        let directory = TestDir::new();
+        fs::create_dir_all(directory.path().join("source/nested")).unwrap();
+        fs::write(directory.path().join("source/nested/file"), b"fixture").unwrap();
+        let service = Service::new(crate::build_router(config(directory.path(), &["-w", "-d"])));
+        let response = RequestBuilder::new(
+            "http://localhost/source",
+            salvo::http::Method::from_bytes(b"MOVE").unwrap(),
+        )
+        .add_header("Destination", "/destination", true)
+        .send(&service)
+        .await;
+        assert_eq!(response.status_code, Some(StatusCode::CREATED));
+        assert!(!directory.path().join("source").exists());
+        assert_eq!(
+            fs::read(directory.path().join("destination/nested/file")).unwrap(),
+            b"fixture"
+        );
+        let response = RequestBuilder::new(
+            "http://localhost/destination",
+            salvo::http::Method::from_bytes(b"MOVE").unwrap(),
+        )
+        .add_header("Destination", "/destination/child", true)
+        .send(&service)
+        .await;
+        assert!(!response.status_code.unwrap().is_success());
+        assert_eq!(
+            fs::read(directory.path().join("destination/nested/file")).unwrap(),
+            b"fixture"
+        );
+    }
 }
