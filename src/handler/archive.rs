@@ -285,6 +285,7 @@ fn write_tar_body<W: Write>(path: &Path, output: W) -> IoResult<W> {
         .follow_links(false)
         .follow_root_links(false)
         .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || !is_internal_name(entry.file_name()))
         .flatten()
     {
         if entry.depth() == 0 && entry.file_type().is_dir() {
@@ -338,6 +339,7 @@ fn write_zip_body<W: Write>(path: &Path, allow_encoding: bool, output: W) -> IoR
         .follow_links(false)
         .follow_root_links(false)
         .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || !is_internal_name(entry.file_name()))
         .flatten()
     {
         if entry.depth() == 0 && entry.file_type().is_dir() {
@@ -457,6 +459,9 @@ mod streaming_tests {
         let dir = crate::test_support::TestDir::new();
         let data = vec![17; 256 * 1024 + 3];
         std::fs::write(dir.path().join("data.bin"), &data).unwrap();
+        std::fs::write(dir.path().join(".HPIP-UPLOAD-secret"), b"private").unwrap();
+        std::fs::create_dir(dir.path().join(".hpip-internal-secret")).unwrap();
+        std::fs::write(dir.path().join(".hpip-internal-secret/key"), b"private").unwrap();
         let service = Service::new(crate::build_router(crate::test_support::config(
             dir.path(),
             &["-A"],
@@ -472,12 +477,14 @@ mod streaming_tests {
             let mut contents = Vec::new();
             if mime.ends_with("zip") {
                 let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+                assert_eq!(archive.len(), 1);
                 let mut file = archive.by_name("data.bin").unwrap();
                 std::io::Read::read_to_end(&mut file, &mut contents).unwrap();
             } else {
                 let mut archive = tar::Archive::new(bytes.as_ref());
                 for file in archive.entries().unwrap() {
                     let mut file = file.unwrap();
+                    assert!(!file.path().unwrap().to_string_lossy().contains("secret"));
                     if file.path().unwrap() == Path::new("data.bin") {
                         std::io::Read::read_to_end(&mut file, &mut contents).unwrap();
                     }

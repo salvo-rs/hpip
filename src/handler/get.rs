@@ -799,46 +799,23 @@ fn handle_dir_listing(
 
     let list_f = |out: &mut Vec<u8>| {
         let mut list: Vec<_> = rd
-            .filter_map(|p| p.ok())
-            .filter(|f| {
-                let fp = f.path();
-                let symlink = is_symlink(&fp);
-                !config.is_symlink_denied(symlink, &fp)
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = entry.file_name();
+                if is_internal_name(&name) || config.is_symlink_denied(is_symlink(&path), &path) {
+                    return None;
+                }
+                // Each entry is inspected once, never inside the sort comparator.
+                let metadata = path.metadata().ok()?;
+                let is_file = is_actually_file(&metadata.file_type(), &path);
+                let name = name.to_string_lossy().into_owned();
+                Some((is_file, name.to_lowercase(), name, path, metadata))
             })
             .collect();
+        list.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
 
-        list.sort_by(|lhs, rhs| {
-            let lhs_is_file = is_actually_file(
-                &lhs.file_type()
-                    .unwrap_or(lhs.metadata().unwrap().file_type()),
-                lhs.path(),
-            );
-            let rhs_is_file = is_actually_file(
-                &rhs.file_type()
-                    .unwrap_or(rhs.metadata().unwrap().file_type()),
-                rhs.path(),
-            );
-            (
-                lhs_is_file,
-                lhs.file_name().to_string_lossy().to_lowercase(),
-            )
-                .cmp(&(
-                    rhs_is_file,
-                    rhs.file_name().to_string_lossy().to_lowercase(),
-                ))
-        });
-
-        for f in list {
-            let path = f.path();
-            let is_file = path
-                .metadata()
-                .map(|m| is_actually_file(&m.file_type(), &path))
-                .unwrap_or(false);
-            let fmeta = match f.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let fname = f.file_name().to_string_lossy().to_string();
+        for (is_file, _, fname, path, fmeta) in list {
             let len = file_length(&fmeta, &path);
             let modified = file_time_modified(&fmeta);
 
@@ -1160,5 +1137,24 @@ mod range_tests {
             .await;
         assert_eq!(response.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
         drop(permits);
+    }
+
+    #[tokio::test]
+    async fn listing_sorts_snapshots_and_hides_private_staging_names() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::create_dir(dir.path().join("Zdirectory")).unwrap();
+        std::fs::write(dir.path().join("afile.txt"), b"visible").unwrap();
+        std::fs::write(dir.path().join(".HPIP-UPLOAD-secret"), b"private").unwrap();
+        std::fs::create_dir(dir.path().join(".hpip-internal-secret")).unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &[],
+        )));
+        let mut response = TestClient::get("http://localhost/").send(&service).await;
+        let body = response.take_string().await.unwrap();
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+        assert!(body.find("Zdirectory").unwrap() < body.find("afile.txt").unwrap());
+        assert!(!body.contains(".HPIP-UPLOAD-secret"));
+        assert!(!body.contains(".hpip-internal-secret"));
     }
 }
