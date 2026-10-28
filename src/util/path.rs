@@ -36,6 +36,7 @@ pub fn decode_path_component(component: &str) -> Option<Cow<'_, str>> {
         || matches!(decoded.as_ref(), "." | "..")
         || decoded.contains(['/', '\\', ':', '\0'])
         || decoded.to_ascii_lowercase().starts_with(".hpip-upload-")
+        || decoded.to_ascii_lowercase().starts_with(".hpip-internal-")
     {
         return None;
     }
@@ -271,6 +272,8 @@ mod tests {
             "%zz",
             ".hpip-upload-123",
             ".HPIP-UPLOAD-456",
+            ".hpip-internal-123",
+            ".HPIP-INTERNAL-456",
         ] {
             let (resolved, _, invalid) = resolve_path(&root, &[segment], true);
             assert!(invalid, "accepted invalid component {segment}");
