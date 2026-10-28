@@ -8,6 +8,9 @@ mod port;
 mod tls;
 pub mod util;
 
+#[cfg(test)]
+mod test_support;
+
 use std::hash::{BuildHasher, RandomState};
 use std::mem;
 use std::net::IpAddr;

@@ -207,8 +207,17 @@ pub struct Options {
 
 impl Options {
     pub fn parse() -> Result<Options, Error> {
-        let cli = Cli::parse();
+        Self::from_cli(Cli::parse())
+    }
 
+    #[cfg(test)]
+    pub(crate) fn parse_test(root: &std::path::Path, flags: &[&str]) -> Result<Options, Error> {
+        let mut args = vec![OsString::from("hpip"), root.as_os_str().to_owned()];
+        args.extend(flags.iter().map(OsString::from));
+        Self::from_cli(Cli::try_parse_from(args).map_err(|e| Error(e.to_string()))?)
+    }
+
+    fn from_cli(cli: Cli) -> Result<Options, Error> {
         let dir = &cli.dir;
         let dir_pb = std::fs::canonicalize(dir)
             .map_err(|_| Error(format!("Directory to host \"{}\" not found", dir)))?;
