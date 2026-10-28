@@ -208,17 +208,3 @@ fn handle_get_raw_fs_dir(
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
     res.render(Text::Json(serde_json::to_string(&data).unwrap_or_default()));
 }
-
-/// Check if the Accept header requests JSON (for RFSAPI)
-pub fn wants_rfsapi(req: &Request) -> bool {
-    req.headers()
-        .get(salvo::http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(|accept| {
-            accept.split(',').any(|part| {
-                let mime = part.trim().split(';').next().unwrap_or("").trim();
-                mime == "application/json"
-            })
-        })
-        .unwrap_or(false)
-}

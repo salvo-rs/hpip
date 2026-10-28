@@ -4,6 +4,7 @@ pub mod get;
 pub mod head;
 pub mod options_handler;
 pub mod put;
+mod representation;
 pub mod rfsapi;
 pub mod trace;
 pub mod webdav;
