@@ -127,6 +127,17 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
             });
             res.headers_mut()
                 .insert("content-type", "text/html; charset=utf-8".parse().unwrap());
+            if config.generate_listings
+                && let Some(encoding) = crate::encoding::request_accept_encoding(req)
+                    .and_then(|accept| crate::encoding::response_encoding(&accept))
+            {
+                // Generated GET listings always use the selected coding; no
+                // directory traversal or compression work is needed for HEAD.
+                res.headers_mut().insert(
+                    "content-encoding",
+                    crate::encoding::encoding_name(encoding).parse().unwrap(),
+                );
+            }
             return;
         }
     }
@@ -244,6 +255,50 @@ mod tests {
     use salvo::test::{ResponseExt, TestClient};
 
     use super::*;
+
+    #[tokio::test]
+    async fn directory_head_selects_the_get_coding_without_a_listing_job_or_body() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::write(dir.path().join("file.txt"), "fixture").unwrap();
+        let config = crate::test_support::config(dir.path(), &[]);
+        let service = Service::new(crate::build_router(config.clone()));
+        for (accept, status, coding) in [
+            ("gzip,identity;q=0", StatusCode::OK, Some("gzip")),
+            ("identity", StatusCode::OK, None),
+            ("*;q=0", StatusCode::NOT_ACCEPTABLE, None),
+        ] {
+            let get = TestClient::get("http://localhost/")
+                .add_header("Accept-Encoding", accept, true)
+                .send(&service)
+                .await;
+            assert_eq!(get.status_code, Some(status), "GET {accept}");
+            assert_eq!(
+                get.headers()
+                    .get("content-encoding")
+                    .and_then(|v| v.to_str().ok()),
+                coding
+            );
+            let _permits = config
+                .blocking_jobs
+                .clone()
+                .acquire_many_owned(4)
+                .await
+                .unwrap();
+            let mut head = TestClient::head("http://localhost/")
+                .add_header("Accept-Encoding", accept, true)
+                .send(&service)
+                .await;
+            assert_eq!(head.status_code, get.status_code, "HEAD {accept}");
+            assert_eq!(
+                head.headers().get("content-encoding"),
+                get.headers().get("content-encoding")
+            );
+            if status.is_success() {
+                assert!(!head.headers().contains_key("content-length"));
+                assert!(head.take_bytes(None).await.unwrap().is_empty());
+            }
+        }
+    }
 
     #[tokio::test]
     async fn directory_indexes_share_file_negotiation_preconditions_and_ranges() {
