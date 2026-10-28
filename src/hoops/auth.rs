@@ -60,6 +60,7 @@ pub fn check_tree_auth(req: &Request, config: &AppConfig, url_path: &str) -> Opt
         .follow_links(config.follow_symlinks)
         .max_depth(256)
         .into_iter()
+        .filter_entry(|entry| !crate::util::path::is_internal_name(entry.file_name()))
         .enumerate()
     {
         let Ok(entry) = entry else {
@@ -260,6 +261,37 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
 #[cfg(test)]
 mod tests {
     use salvo::test::{ResponseExt, TestClient};
+
+    #[tokio::test]
+    async fn internal_names_are_hidden_from_json_and_webdav_collections() {
+        let dir = TestDir::new();
+        std::fs::create_dir(dir.path().join(".HPIP-INTERNAL-state")).unwrap();
+        std::fs::write(dir.path().join(".hpip-upload-staging"), "incomplete").unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "visible").unwrap();
+        let service = Service::new(crate::build_router(config(dir.path(), &["-d"])));
+        let mut response = TestClient::get("http://localhost/")
+            .add_header("Accept", "application/json", true)
+            .send(&service)
+            .await;
+        let json = response.take_string().await.unwrap();
+        assert!(json.contains("visible.txt"));
+        assert!(!json.to_ascii_lowercase().contains(".hpip-"));
+        for body in [
+            "",
+            "<D:propfind xmlns:D=\"DAV:\"><D:prop><D:getcontentlength/></D:prop></D:propfind>",
+        ] {
+            let mut request = TestClient::get("http://localhost/")
+                .add_header("Depth", "1", true)
+                .text(body)
+                .build();
+            *request.method_mut() = "PROPFIND".parse().unwrap();
+            let mut response = service.handle(request).await;
+            assert_eq!(response.status_code, Some(StatusCode::MULTI_STATUS));
+            let xml = response.take_string().await.unwrap();
+            assert!(xml.contains("visible.txt"));
+            assert!(!xml.to_ascii_lowercase().contains(".hpip-"));
+        }
+    }
 
     #[tokio::test]
     async fn collection_operations_require_all_descendant_policies() {
