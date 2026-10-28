@@ -156,20 +156,37 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
 
     let remote = req.remote_addr().to_string();
 
-    // Ensure parent directories exist
-    if let Some(parent) = req_p.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-
-    // Write file
-    let result = write_request_file(
-        &req_p,
-        req.take_body(),
-        &conditions,
-        config.upload_limit,
-        mtime,
-    )
-    .await;
+    // Reject failed conditions before creating any parent directory. Publication
+    // still rechecks them after the request body has been staged completely.
+    let prepare_path = req_p.clone();
+    let prepare_conditions = conditions.clone();
+    let Some(preparation) = config.spawn_blocking(move || {
+        let _guard = MUTATION_LOCK.blocking_lock();
+        if !prepare_conditions.allows_path(&prepare_path)? {
+            return Err(UploadError::PreconditionFailed);
+        }
+        if let Some(parent) = prepare_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Ok(())
+    }) else {
+        res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+        return;
+    };
+    let result = match preparation.await {
+        Ok(Ok(())) => {
+            write_request_file(
+                &req_p,
+                req.take_body(),
+                &conditions,
+                config.upload_limit,
+                mtime,
+            )
+            .await
+        }
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(UploadError::Io(std::io::Error::other(error))),
+    };
     match result {
         Ok((existent, uploaded_bytes)) => {
             crate::config::log_msg(
@@ -652,6 +669,64 @@ mod conditional_upload_tests {
         conditions.if_none_match = Some("W/\"tag\"".into());
         assert!(!conditions.allows(Some("tag")));
         assert!(!conditions.allows(None));
+    }
+}
+
+#[cfg(test)]
+mod parent_precondition_tests {
+    use salvo::test::TestClient;
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    #[tokio::test]
+    async fn failed_versions_never_create_parent_directories() {
+        let fixture = TestDir::new();
+        let service = Service::new(crate::build_router(config(fixture.path(), &["-w"])));
+        for tag in ["\"stale\"", "*"] {
+            let response = TestClient::put("http://localhost/missing/nested/file")
+                .add_header("If-Match", tag, true)
+                .body("upload")
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::PRECONDITION_FAILED));
+            assert!(!fixture.path().join("missing").exists());
+        }
+        let response = TestClient::put("http://localhost/missing/nested/file")
+            .add_header("If-None-Match", "*", true)
+            .body("first")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::CREATED));
+        let response = TestClient::put("http://localhost/missing/nested/file")
+            .add_header("If-None-Match", "*", true)
+            .body("second")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::PRECONDITION_FAILED));
+        assert_eq!(
+            std::fs::read(fixture.path().join("missing/nested/file")).unwrap(),
+            b"first"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_preparation_has_no_filesystem_side_effects() {
+        let fixture = TestDir::new();
+        let config = config(fixture.path(), &["-w"]);
+        let _permits = config
+            .blocking_jobs
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let service = Service::new(crate::build_router(config));
+        let response = TestClient::put("http://localhost/missing/nested/file")
+            .body("upload")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!fixture.path().join("missing").exists());
     }
 }
 
