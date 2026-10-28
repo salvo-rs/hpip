@@ -37,7 +37,7 @@ pub fn check_auth(req: &Request, config: &Arc<AppConfig>) -> Option<Response> {
 
     let remote = req.remote_addr().to_string();
     let method = req.method().to_string();
-    let url = req.uri().to_string();
+    let url = req.uri().path().to_string();
 
     // Check Authorization header
     if let Some(auth_header) = req.headers().get(salvo::http::header::AUTHORIZATION)
