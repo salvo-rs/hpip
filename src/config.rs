@@ -112,6 +112,10 @@ impl AppConfig {
             .map(String::from)
             .collect::<Vec<_>>();
 
+        if opts.archives {
+            allowed_methods.push("POST".into());
+        }
+
         if opts.allow_writes {
             allowed_methods.push("PUT".into());
             allowed_methods.push("DELETE".into());
@@ -119,25 +123,12 @@ impl AppConfig {
 
         if opts.webdav == WebDavLevel::All {
             allowed_methods.push("PROPFIND".into());
-            allowed_methods.push("PROPPATCH".into());
+            if opts.allow_writes {
+                allowed_methods.extend(["PROPPATCH", "MKCOL", "COPY", "MOVE"].map(String::from));
+            }
+        } else if opts.webdav == WebDavLevel::MkColMoveOnly && opts.allow_writes {
             allowed_methods.push("MKCOL".into());
-            allowed_methods.push("COPY".into());
             allowed_methods.push("MOVE".into());
-        } else if opts.webdav == WebDavLevel::MkColMoveOnly {
-            allowed_methods.push("MKCOL".into());
-            allowed_methods.push("MOVE".into());
-        }
-
-        // If WebDAV but not writes, only PROPFIND is read-only
-        if opts.webdav == WebDavLevel::All && !opts.allow_writes {
-            // Remove write-only WebDAV methods; PROPFIND is read-only
-            allowed_methods.retain(|m| {
-                !matches!(
-                    m.as_str(),
-                    "PROPPATCH" | "MKCOL" | "COPY" | "MOVE" | "PUT" | "DELETE"
-                )
-            });
-            allowed_methods.push("PROPFIND".into());
         }
 
         AppConfig {
