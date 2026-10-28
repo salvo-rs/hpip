@@ -38,7 +38,7 @@ pub enum WebDavLevel {
     All,
 }
 
-/// Host These Things Please - a modern async HTTP file server
+/// An asynchronous HTTP file server with WebDAV, TLS, and authentication
 #[derive(Parser, Debug)]
 #[command(name = "hpip", version, about)]
 struct Cli {
