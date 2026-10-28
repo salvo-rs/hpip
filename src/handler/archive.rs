@@ -8,7 +8,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::str;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use salvo::prelude::*;
 use tar::Builder as TarBuilder;
@@ -219,8 +219,14 @@ async fn serve_archive(
     let sender = res.channel();
     let runtime = tokio::runtime::Handle::current();
     if config
-        .spawn_blocking(move || {
-            let mut writer = ArchiveWriter { sender, runtime };
+        .spawn_archive(move || {
+            let mut writer = ArchiveWriter {
+                sender,
+                runtime,
+                started: Instant::now(),
+                stall_timeout: Duration::from_secs(30),
+                total_timeout: Duration::from_secs(15 * 60),
+            };
             let result = match archive_type {
                 ArchiveType::Tar => write_tar_body(&req_p, &mut writer),
                 ArchiveType::Zip => write_zip_body(&req_p, allow_encoding, &mut writer),
@@ -241,6 +247,9 @@ async fn serve_archive(
 struct ArchiveWriter {
     sender: salvo::http::body::BodySender,
     runtime: tokio::runtime::Handle,
+    started: Instant,
+    stall_timeout: Duration,
+    total_timeout: Duration,
 }
 
 impl Write for ArchiveWriter {
@@ -249,8 +258,19 @@ impl Write for ArchiveWriter {
             return Ok(0);
         }
         let count = bytes.len().min(64 * 1024);
-        self.runtime
-            .block_on(self.sender.send_data(bytes[..count].to_vec()))?;
+        let remaining = self.total_timeout.saturating_sub(self.started.elapsed());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "archive output deadline exceeded",
+            ));
+        }
+        let timeout = self.stall_timeout.min(remaining);
+        self.runtime.block_on(async {
+            tokio::time::timeout(timeout, self.sender.send_data(bytes[..count].to_vec()))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "archive output stalled"))?
+        })?;
         Ok(count)
     }
 
@@ -438,6 +458,81 @@ mod streaming_tests {
     use salvo::test::{ResponseExt, TestClient};
 
     use super::*;
+
+    #[tokio::test]
+    async fn slow_archives_do_not_starve_short_metadata_work_and_disconnect_releases_slots() {
+        let directory = crate::test_support::TestDir::new();
+        std::fs::write(
+            directory.path().join("large.bin"),
+            vec![42; 4 * 1024 * 1024],
+        )
+        .unwrap();
+        let config = crate::test_support::config(directory.path(), &["-A"]);
+        let service = Service::new(crate::build_router(config.clone()));
+        let mut responses = Vec::new();
+        for _ in 0..4 {
+            let response = TestClient::get("http://localhost/")
+                .add_header("Accept", "application/x-tar", true)
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::OK));
+            responses.push(response);
+        }
+        assert_eq!(config.archive_jobs.available_permits(), 0);
+        let directory_response = TestClient::get("http://localhost/").send(&service).await;
+        assert_eq!(directory_response.status_code, Some(StatusCode::OK));
+        let rejected = TestClient::get("http://localhost/")
+            .add_header("Accept", "application/x-tar", true)
+            .send(&service)
+            .await;
+        assert_eq!(rejected.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+        drop(responses);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while config.archive_jobs.available_permits() != 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_archive_output_times_out_and_expired_deadlines_prevent_sending() {
+        let mut response = Response::new();
+        let sender = response.channel();
+        let runtime = tokio::runtime::Handle::current();
+        let job = tokio::task::spawn_blocking(move || {
+            let mut writer = ArchiveWriter {
+                sender,
+                runtime,
+                started: Instant::now(),
+                stall_timeout: Duration::from_millis(20),
+                total_timeout: Duration::from_secs(1),
+            };
+            writer.write_all(&vec![17; 1024 * 1024]).unwrap_err().kind()
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), job)
+                .await
+                .unwrap()
+                .unwrap(),
+            io::ErrorKind::TimedOut
+        );
+        drop(response);
+
+        let mut response = Response::new();
+        let mut writer = ArchiveWriter {
+            sender: response.channel(),
+            runtime: tokio::runtime::Handle::current(),
+            started: Instant::now() - Duration::from_secs(2),
+            stall_timeout: Duration::from_secs(1),
+            total_timeout: Duration::from_secs(1),
+        };
+        assert_eq!(
+            writer.write(b"expired").unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
 
     #[tokio::test]
     async fn archives_stream_valid_tar_and_zip_contents() {

@@ -49,6 +49,7 @@ pub struct AppConfig {
     pub request_bandwidth: Option<NonZeroU64>,
 
     pub blocking_jobs: std::sync::Arc<tokio::sync::Semaphore>,
+    pub archive_jobs: std::sync::Arc<tokio::sync::Semaphore>,
     accepting_blocking_jobs: AtomicBool,
     pub encoding_gates: [Mutex<()>; 64],
     pub cache_gen: RwLock<CacheT<Vec<u8>>>,
@@ -168,6 +169,7 @@ impl AppConfig {
                 "encoded",
             ),
             blocking_jobs: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+            archive_jobs: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             accepting_blocking_jobs: AtomicBool::new(true),
             encoding_gates: std::array::from_fn(|_| Mutex::new(())),
             cache_gen: Default::default(),
@@ -195,10 +197,31 @@ impl AppConfig {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
+        self.spawn_in_pool(&self.blocking_jobs, work)
+    }
+
+    /// Long response streams must not consume the short metadata/mutation pool.
+    pub fn spawn_archive<F, R>(&self, work: F) -> Option<tokio::task::JoinHandle<R>>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.spawn_in_pool(&self.archive_jobs, work)
+    }
+
+    fn spawn_in_pool<F, R>(
+        &self,
+        pool: &std::sync::Arc<tokio::sync::Semaphore>,
+        work: F,
+    ) -> Option<tokio::task::JoinHandle<R>>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
         if !self.accepting_blocking_jobs.load(AtomicOrdering::SeqCst) {
             return None;
         }
-        let permit = self.blocking_jobs.clone().try_acquire_owned().ok()?;
+        let permit = pool.clone().try_acquire_owned().ok()?;
         if !self.accepting_blocking_jobs.load(AtomicOrdering::SeqCst) {
             return None;
         }
@@ -213,6 +236,7 @@ impl AppConfig {
         self.accepting_blocking_jobs
             .store(false, AtomicOrdering::SeqCst);
         let _all_jobs = self.blocking_jobs.clone().acquire_many_owned(4).await;
+        let _all_archives = self.archive_jobs.clone().acquire_many_owned(4).await;
     }
 
     pub fn remember_hash(&self, key: String, hash: blake3::Hash) {
@@ -701,5 +725,32 @@ mod cache_budget_tests {
         job.await.unwrap();
         drain.await.unwrap();
         assert!(config.spawn_blocking(|| ()).is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_also_drains_archive_jobs_and_closes_both_pools() {
+        let directory = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(directory.path(), &[]);
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let job = config
+            .spawn_archive(move || {
+                started.send(()).unwrap();
+                wait_release.recv().unwrap();
+            })
+            .unwrap();
+        ready.await.unwrap();
+        let drain_config = config.clone();
+        let drain = tokio::spawn(async move { drain_config.drain_blocking_jobs().await });
+        while config.accepting_blocking_jobs.load(AtomicOrdering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        assert!(config.spawn_blocking(|| ()).is_none());
+        assert!(config.spawn_archive(|| ()).is_none());
+        assert!(!drain.is_finished());
+        release.send(()).unwrap();
+        job.await.unwrap();
+        drain.await.unwrap();
+        assert!(config.spawn_archive(|| ()).is_none());
     }
 }

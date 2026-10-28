@@ -211,6 +211,11 @@ JSON directory metadata and WebDAV PROPFIND snapshots use the bounded worker
 pool. Each directory snapshot is limited to 10,000 entries and each serialized
 metadata response to 16 MiB; exceeding either budget returns HTTP 507.
 
+Archive streams have a separate four-job limit, so slow downloads do not consume
+the metadata and mutation worker pool. Each output send must complete within 30
+seconds, and output generation has a 15-minute deadline. A stalled, expired, or
+disconnected stream stops generation and releases its archive slot.
+
 Symlinks are followed by default. Use `-s` to block them or `-r` to restrict their
 targets to the hosted directory. These options do not establish an operating
 system sandbox against another process changing the filesystem concurrently.
