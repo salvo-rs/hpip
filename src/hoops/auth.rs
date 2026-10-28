@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use salvo::prelude::*;
@@ -193,12 +194,24 @@ fn auth_for_path<'a>(config: &'a AppConfig, path: &str) -> Option<&'a Credential
 }
 
 fn path_rule_matches(path: &str, rule: &str) -> bool {
-    #[cfg(windows)]
-    let (path, rule) = (path.to_lowercase(), rule.to_lowercase());
+    let path = policy_key(path);
+    let rule = policy_key(rule);
+    let prefix: &str = &rule;
     path == rule
         || path
-            .strip_prefix(&*rule)
+            .strip_prefix(prefix)
             .is_some_and(|tail| tail.starts_with('/'))
+}
+
+fn policy_key(path: &str) -> Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        Cow::Owned(path.to_lowercase())
+    }
+    #[cfg(not(windows))]
+    {
+        Cow::Borrowed(path)
+    }
 }
 
 fn canonical_auth_path(config: &AppConfig, path: &str) -> Option<String> {
