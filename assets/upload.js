@@ -6,6 +6,9 @@ window.addEventListener("DOMContentLoaded", function() {
   let body = document.getElementsByTagName("body")[0];
   let file_upload_text = null;
   let remaining_files = 0;
+  let pending_discovery = 0;
+  let had_error = false;
+  let had_upload = false;
   let url = document.location.pathname;
   if(!url.endsWith("/"))
     url += "/";
@@ -34,6 +37,7 @@ window.addEventListener("DOMContentLoaded", function() {
   });
 
   function process_transfer(transfer) {
+    ++pending_discovery;
     for(let i = transfer.files.length - 1; i >= 0; --i) {
       if(!transfer.items[i].webkitGetAsEntry) {
         let file = transfer.files[i];
@@ -41,6 +45,20 @@ window.addEventListener("DOMContentLoaded", function() {
       } else
         recurse_upload(transfer.items[i].webkitGetAsEntry(), url);
     }
+    --pending_discovery;
+    maybe_reload();
+  }
+
+  function maybe_reload() {
+    if(had_upload && !had_error && !remaining_files && !pending_discovery)
+      window.location.reload();
+  }
+
+  function discovery_error(name, error) {
+    had_error = true;
+    let line = document.createElement("dd");
+    line.innerText = "Unable to read " + name + ": " + (error.message || error);
+    upload_list.appendChild(line);
   }
 
   let file_upload = document.querySelector("input[type=file]");
@@ -56,6 +74,7 @@ window.addEventListener("DOMContentLoaded", function() {
 
   function upload_file(req_url, file) {
     ++remaining_files;
+    had_upload = true;
 
     let filename_line = document.createElement("dt");
     filename_line.innerText = file.name;
@@ -94,18 +113,17 @@ window.addEventListener("DOMContentLoaded", function() {
 
     let request = new XMLHttpRequest();
     request.addEventListener("loadend", function(e) {
+      --remaining_files;
       if(request.status >= 200 && request.status < 300) {
-        if(!--remaining_files)
-          window.location.reload();
-
         filename_line.remove();
         progress_line.remove();
-
-        file_upload_text.data = remaining_files;
       } else {
+        had_error = true;
         progress_line.innerText = request.response;
         file_upload.disabled = true;
       }
+      file_upload_text.data = remaining_files;
+      maybe_reload();
     });
 
     let start = 0;
@@ -139,30 +157,50 @@ window.addEventListener("DOMContentLoaded", function() {
   }
 
   function recurse_upload(entry, base_url) {
-    if(entry.isFile) {
-      if(entry.file)
-        entry.file(function(f) {
-          upload_file(base_url + entry.fullPath.split("/").filter(function(seg) { return seg; }).map(encodeURIComponent).join("/"), f);
-        });
-      else
-        upload_file(base_url + entry.fullPath.split("/").filter(function(seg) { return seg; }).map(encodeURIComponent).join("/"), entry.getFile());
-    } else // https://developer.mozilla.org/en-US/docs/Web/API/DataTransferItem/webkitGetAsEntry#javascript:
-           //   Note: To read all files in a directory, readEntries needs to be
-           //   called repeatedly until it returns an empty array. In
-           //   Chromium-based browsers, the following example will only return a
-           //   max of 100 entries.
-           // This is actually true.
-      all_in_reader(entry.createReader(), function(f) {
-        recurse_upload(f, base_url)
-      });
+    ++pending_discovery;
+    let settled = false;
+    function finish(error) {
+      if(settled)
+        return;
+      settled = true;
+      if(error)
+        discovery_error(entry ? entry.fullPath : "entry", error);
+      --pending_discovery;
+      maybe_reload();
+    }
+    try {
+      if(!entry)
+        throw new Error("No filesystem entry available");
+      if(entry.isFile) {
+        function ready(file) {
+          upload_file(base_url + entry.fullPath.split("/").filter(function(seg) { return seg; }).map(encodeURIComponent).join("/"), file);
+          finish();
+        }
+        if(entry.file)
+          entry.file(ready, finish);
+        else
+          Promise.resolve(entry.getFile()).then(ready, finish);
+      } else
+        all_in_reader(entry.createReader(), function(child) {
+          recurse_upload(child, base_url);
+        }, finish);
+    } catch(error) {
+      finish(error);
+    }
   }
 
-  function all_in_reader(reader, f) {
-    reader.readEntries(function(e) {
-      e.forEach(f);
-      if(e.length)
-        all_in_reader(reader, f);
-    });
+  function all_in_reader(reader, f, finish) {
+    try {
+      reader.readEntries(function(entries) {
+        entries.forEach(f);
+        if(entries.length)
+          all_in_reader(reader, f, finish);
+        else
+          finish();
+      }, finish);
+    } catch(error) {
+      finish(error);
+    }
   }
 
   // Ported from util::HumanReadableSize
