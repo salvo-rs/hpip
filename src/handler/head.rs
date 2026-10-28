@@ -95,15 +95,7 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
         return;
     }
     if path.is_dir() {
-        let index = config
-            .check_indices
-            .then(|| {
-                INDEX_EXTENSIONS
-                    .iter()
-                    .map(|ext| path.join("index").with_extension(ext))
-                    .find(|p| p.is_file() && !config.is_symlink_denied(is_symlink(p), p))
-            })
-            .flatten();
+        let index = super::get::index_file(&config, &path);
         if let Some(index) = index {
             let index_url = format!(
                 "{}/index.{}",
@@ -135,7 +127,11 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
             return;
         }
     }
-    let Ok(metadata) = path.metadata() else {
+    let Ok(source) = tokio::fs::File::open(&path).await else {
+        res.status_code(StatusCode::NOT_FOUND);
+        return;
+    };
+    let Ok(metadata) = source.metadata().await else {
         res.status_code(StatusCode::NOT_FOUND);
         return;
     };
@@ -154,10 +150,6 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
         {
             // A specific strong precondition needs the actual selected coding.
             // Ordinary cold HEAD requests still avoid all encoding work.
-            let Ok(source) = tokio::fs::File::open(&path).await else {
-                res.status_code(StatusCode::NOT_FOUND);
-                return;
-            };
             cached = Some(
                 super::get::encoded_file_job(
                     &config,
@@ -228,6 +220,92 @@ mod tests {
     use salvo::test::{ResponseExt, TestClient};
 
     use super::*;
+
+    #[tokio::test]
+    async fn directory_indexes_share_file_negotiation_preconditions_and_ranges() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::create_dir(dir.path().join("folder")).unwrap();
+        std::fs::write(
+            dir.path().join("folder/index.html"),
+            "index fixture\n".repeat(2000),
+        )
+        .unwrap();
+        let config = crate::test_support::config(dir.path(), &[]);
+        let service = Service::new(crate::build_router(config.clone()));
+        let cold = TestClient::head("http://localhost/folder/")
+            .add_header("Accept-Encoding", "gzip,identity;q=0", true)
+            .send(&service)
+            .await;
+        assert_eq!(cold.status_code, Some(StatusCode::OK));
+        assert!(!cold.headers().contains_key("etag"));
+        assert!(config.cache_fs_files.read().unwrap().is_empty());
+        let direct = TestClient::get("http://localhost/folder/index.html")
+            .add_header("Accept-Encoding", "gzip,identity;q=0", true)
+            .send(&service)
+            .await;
+        let tag = direct.headers()["etag"].to_str().unwrap();
+        for method in ["GET", "HEAD"] {
+            let request = if method == "GET" {
+                TestClient::get("http://localhost/folder/")
+            } else {
+                TestClient::head("http://localhost/folder/")
+            };
+            let response = request
+                .add_header("Accept-Encoding", "gzip,identity;q=0", true)
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::OK));
+            for header in [
+                "content-type",
+                "content-encoding",
+                "content-length",
+                "etag",
+                "last-modified",
+            ] {
+                assert_eq!(
+                    response.headers().get(header),
+                    direct.headers().get(header),
+                    "{method} {header}"
+                );
+            }
+            let request = if method == "GET" {
+                TestClient::get("http://localhost/folder/")
+            } else {
+                TestClient::head("http://localhost/folder/")
+            };
+            let response = request
+                .add_header("Accept-Encoding", "gzip", true)
+                .add_header("If-None-Match", tag, true)
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::NOT_MODIFIED));
+        }
+        let mut range = TestClient::get("http://localhost/folder/")
+            .add_header("Range", "bytes=0-4", true)
+            .send(&service)
+            .await;
+        assert_eq!(range.status_code, Some(StatusCode::PARTIAL_CONTENT));
+        assert_eq!(range.take_string().await.unwrap(), "index");
+        let redirect = TestClient::get("http://localhost/folder")
+            .send(&service)
+            .await;
+        assert_eq!(redirect.status_code, Some(StatusCode::SEE_OTHER));
+        assert_eq!(redirect.headers()["location"], "/folder/");
+        let disabled = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &["-e"],
+        )));
+        for request in [
+            TestClient::get("http://localhost/folder/"),
+            TestClient::head("http://localhost/folder/"),
+        ] {
+            let response = request
+                .add_header("Accept-Encoding", "gzip,identity;q=0", true)
+                .send(&disabled)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::NOT_ACCEPTABLE));
+        }
+    }
 
     #[tokio::test]
     async fn head_uses_cached_coding_and_omits_unknown_representation_fields() {
