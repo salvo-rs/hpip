@@ -345,8 +345,8 @@ fn write_tar_body<W: Write>(path: &Path, output: W) -> IoResult<W> {
         .follow_root_links(false)
         .into_iter()
         .filter_entry(|entry| entry.depth() == 0 || !is_internal_name(entry.file_name()))
-        .flatten()
     {
+        let entry = entry.map_err(io::Error::other)?;
         if entry.depth() == 0 && entry.file_type().is_dir() {
             continue;
         }
@@ -366,21 +366,21 @@ fn write_tar_body<W: Write>(path: &Path, output: W) -> IoResult<W> {
         };
 
         #[cfg(unix)]
-        if !entry.file_type().is_dir()
-            && let Ok(metadata) = entry.metadata()
-            && metadata.nlink() > 1
         {
-            match links.entry((metadata.dev(), metadata.ino())) {
-                BTreeMapEntry::Occupied(previous) => {
-                    let mut header = TarHeader::new_gnu();
-                    header.set_metadata(&metadata);
-                    header.set_size(0);
-                    header.set_entry_type(TarEntryType::Link);
-                    tar.append_link(&mut header, relative_path, previous.get())?;
-                    continue;
-                }
-                BTreeMapEntry::Vacant(v) => {
-                    v.insert(relative_path.to_path_buf());
+            let metadata = entry.metadata().map_err(io::Error::other)?;
+            if !metadata.is_dir() && metadata.nlink() > 1 {
+                match links.entry((metadata.dev(), metadata.ino())) {
+                    BTreeMapEntry::Occupied(previous) => {
+                        let mut header = TarHeader::new_gnu();
+                        header.set_metadata(&metadata);
+                        header.set_size(0);
+                        header.set_entry_type(TarEntryType::Link);
+                        tar.append_link(&mut header, relative_path, previous.get())?;
+                        continue;
+                    }
+                    BTreeMapEntry::Vacant(v) => {
+                        v.insert(relative_path.to_path_buf());
+                    }
                 }
             }
         }
@@ -399,8 +399,8 @@ fn write_zip_body<W: Write>(path: &Path, allow_encoding: bool, output: W) -> IoR
         .follow_root_links(false)
         .into_iter()
         .filter_entry(|entry| entry.depth() == 0 || !is_internal_name(entry.file_name()))
-        .flatten()
     {
+        let entry = entry.map_err(io::Error::other)?;
         if entry.depth() == 0 && entry.file_type().is_dir() {
             continue;
         }
@@ -419,9 +419,7 @@ fn write_zip_body<W: Write>(path: &Path, allow_encoding: bool, output: W) -> IoR
                 .expect("strip_prefix failed")
         };
 
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
+        let metadata = entry.metadata().map_err(io::Error::other)?;
 
         let mut options = ZipFileOptions::default()
             .compression_method(ZipCompressionMethod::Stored)
@@ -464,42 +462,43 @@ fn write_zip_body<W: Write>(path: &Path, allow_encoding: bool, output: W) -> IoR
 
         match metadata.file_type() {
             e if e.is_symlink() => {
-                if let Ok(target) = entry.path().read_link() {
-                    zip.add_symlink_from_path(relative_path, target, options)?;
-                }
+                let target = entry.path().read_link()?;
+                zip.add_symlink_from_path(relative_path, target, options)?;
             }
             e if e.is_dir() => {
                 zip.add_directory_from_path(relative_path, options)?;
             }
             e if e.is_file() => {
-                if let Ok(mut opened) = std::fs::File::open(entry.path()) {
-                    let Ok(opened_metadata) = opened.metadata() else {
-                        continue;
-                    };
+                let mut opened = std::fs::File::open(entry.path())?;
+                let opened_metadata = opened.metadata()?;
 
-                    #[cfg(unix)]
-                    if opened_metadata.dev() != metadata.dev()
-                        || opened_metadata.ino() != metadata.ino()
-                    {
-                        continue;
-                    }
-
-                    if allow_encoding
-                        && opened_metadata.len() > MIN_ENCODING_SIZE
-                        && opened_metadata.len() < MAX_ENCODING_SIZE
-                        && relative_path
-                            .extension()
-                            .map(|s| !extension_is_blacklisted(s))
-                            .unwrap_or(true)
-                    {
-                        options = options.compression_method(ZipCompressionMethod::Deflated);
-                    }
-
-                    zip.start_file_from_path(relative_path, options)?;
-                    io::copy(&mut opened, &mut zip)?;
+                #[cfg(unix)]
+                if opened_metadata.dev() != metadata.dev()
+                    || opened_metadata.ino() != metadata.ino()
+                {
+                    return Err(io::Error::other("archive entry changed while opening"));
                 }
+
+                if allow_encoding
+                    && opened_metadata.len() > MIN_ENCODING_SIZE
+                    && opened_metadata.len() < MAX_ENCODING_SIZE
+                    && relative_path
+                        .extension()
+                        .map(|s| !extension_is_blacklisted(s))
+                        .unwrap_or(true)
+                {
+                    options = options.compression_method(ZipCompressionMethod::Deflated);
+                }
+
+                zip.start_file_from_path(relative_path, options)?;
+                io::copy(&mut opened, &mut zip)?;
             }
-            _ => (),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "unsupported ZIP entry type",
+                ));
+            }
         }
     }
 
@@ -512,6 +511,54 @@ mod streaming_tests {
     use salvo::test::{ResponseExt, TestClient};
 
     use super::*;
+
+    #[test]
+    fn traversal_errors_do_not_finish_valid_empty_archives() {
+        let directory = crate::test_support::TestDir::new();
+        let missing = directory.path().join("removed-before-generation");
+        assert!(write_tar_body(&missing, Vec::new()).is_err());
+        assert!(write_zip_body(&missing, true, Vec::new()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn unreadable_zip_members_abort_the_download_instead_of_disappearing() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let directory = crate::test_support::TestDir::new();
+        std::fs::write(directory.path().join("visible.txt"), b"visible").unwrap();
+        let blocked = directory.path().join("blocked.txt");
+        std::fs::write(&blocked, b"important content").unwrap();
+        let _lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&blocked)
+            .unwrap();
+        assert!(std::fs::File::open(&blocked).is_err());
+        assert!(write_zip_body(directory.path(), true, Vec::new()).is_err());
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            directory.path(),
+            &["-A"],
+        )));
+        let mut response = TestClient::get("http://localhost/")
+            .add_header("Accept", "application/zip", true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+        // Headers may already be sent, but the transfer must not finish as a valid ZIP.
+        assert!(response.take_bytes(None).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_zip_special_files_are_errors_not_omissions() {
+        assert_eq!(
+            write_zip_body(Path::new("/dev/null"), false, Vec::new())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
 
     #[tokio::test]
     async fn slow_archives_do_not_starve_short_metadata_work_and_disconnect_releases_slots() {

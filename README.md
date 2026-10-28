@@ -116,6 +116,11 @@ collections remain unsupported. If a directory replacement and its restoration
 both fail, the original is retained under a private `.hpip-upload-copy-*`
 directory for local administrator recovery; enabled request logs record its path.
 
+Archive downloads abort if a member cannot be read or traversed instead of
+silently omitting it. A filesystem failure after response headers have been sent
+terminates the download; treat an incomplete transfer as a failed archive. ZIP
+downloads also reject unsupported special file types.
+
 ### Security
 
 | Option | Description |
