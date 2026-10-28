@@ -58,6 +58,11 @@ pub fn preconditions(
                 .unwrap(),
         );
         res.headers_mut().remove("content-length");
+        if res.status_code == Some(StatusCode::PRECONDITION_FAILED) {
+            // The default error catcher can create a new, unencoded body.
+            res.headers_mut().remove("content-encoding");
+            res.headers_mut().remove("content-range");
+        }
         res.body(salvo::http::ResBody::None);
     }
     failed || matches
@@ -81,6 +86,45 @@ mod tests {
     use salvo::test::{ResponseExt, TestClient};
 
     use super::*;
+
+    #[tokio::test]
+    async fn conditional_failures_do_not_describe_the_encoded_success_body() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::write(dir.path().join("file.txt"), "gzip fixture\n".repeat(2000)).unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &[],
+        )));
+        let initial = TestClient::get("http://localhost/file.txt")
+            .add_header("Accept-Encoding", "gzip", true)
+            .send(&service)
+            .await;
+        let tag = initial.headers()["etag"].to_str().unwrap().to_owned();
+        for method in ["GET", "HEAD"] {
+            let mut response = salvo::test::RequestBuilder::new(
+                "http://localhost/file.txt",
+                method.parse().unwrap(),
+            )
+            .add_header("Accept-Encoding", "gzip", true)
+            .add_header("If-Match", "\"stale\"", true)
+            .add_header("Range", "bytes=0-5", true)
+            .send(&service)
+            .await;
+            assert_eq!(response.status_code, Some(StatusCode::PRECONDITION_FAILED));
+            assert!(!response.headers().contains_key("content-encoding"));
+            assert!(!response.headers().contains_key("content-range"));
+            if method == "GET" {
+                assert!(response.take_string().await.unwrap().contains("412"));
+            }
+        }
+        let response = TestClient::head("http://localhost/file.txt")
+            .add_header("Accept-Encoding", "gzip", true)
+            .add_header("If-None-Match", tag, true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::NOT_MODIFIED));
+        assert_eq!(response.headers()["content-encoding"], "gzip");
+    }
 
     #[tokio::test]
     async fn coding_negotiation_failures_precede_file_conditions_and_ranges() {
