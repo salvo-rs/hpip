@@ -155,7 +155,7 @@ async fn result_main() -> Result<(), Error> {
         println!();
     }
 
-    let bind_addr = format!("{}:{}", opts.bind_address, port);
+    let bind_addr = std::net::SocketAddr::new(opts.bind_address, port);
 
     // Start the server
     let listener = TcpListener::new(bind_addr);
