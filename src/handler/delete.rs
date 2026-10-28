@@ -70,7 +70,8 @@ pub async fn handle_delete(req: &mut Request, depot: &mut Depot, res: &mut Respo
         .unwrap_or(false);
 
     if !is_file
-        && let Some(response) = crate::hoops::auth::check_tree_auth(req, &config, req.uri().path())
+        && let Some(response) =
+            crate::hoops::auth::check_tree_auth_async(req, &config, req.uri().path()).await
     {
         *res = response;
         return;

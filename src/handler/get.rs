@@ -1,10 +1,10 @@
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
+use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use salvo::prelude::*;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::config::{AppConfig, EncodingType, log_msg};
 use crate::encoding::*;
@@ -30,7 +30,7 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
     if config.archives
         && let Some(archive_type) = crate::handler::archive::try_get_accept_archive(req)
     {
-        crate::handler::archive::serve_archive_from_get(req, res, &config, archive_type);
+        crate::handler::archive::serve_archive_from_get(req, res, &config, archive_type).await;
         return;
     }
 
@@ -95,19 +95,34 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
     let is_file = is_actually_file(&metadata.file_type(), &req_p);
 
     if is_file {
-        // Check for Range header - copy it before passing req mutably
-        let range_header = req
-            .headers()
-            .get(salvo::http::header::RANGE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        if let Some(range_str) = range_header {
-            handle_get_file_range(req, res, &config, &req_p, &range_str);
-            return;
-        }
         handle_get_file(req, res, &config, &req_p, false).await;
     } else {
-        handle_get_dir(req, res, &config, &req_p, &url_path_str, &url_path_raw);
+        let mut work_request = Request::new();
+        *work_request.uri_mut() = req.uri().clone();
+        *work_request.headers_mut() = req.headers().clone();
+        let work_config = config.clone();
+        match config.spawn_blocking(move || {
+            let mut response = Response::new();
+            handle_get_dir(
+                &mut work_request,
+                &mut response,
+                &work_config,
+                &req_p,
+                &url_path_str,
+                &url_path_raw,
+            );
+            response
+        }) {
+            Some(job) => match job.await {
+                Ok(response) => *res = response,
+                Err(_) => {
+                    res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            },
+            None => {
+                res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+            }
+        }
     }
 }
 
@@ -152,7 +167,9 @@ fn handle_nonexistent_get(
         && try_404.metadata().map(|m| !m.is_dir()).unwrap_or(false)
     {
         let mime_type = guess_mime_type(try_404, &config.mime_type_overrides);
-        if let Ok(data) = std::fs::read(try_404) {
+        if let Ok(file) = std::fs::File::open(try_404)
+            && let Ok(metadata) = file.metadata()
+        {
             res.status_code(StatusCode::NOT_FOUND);
             res.headers_mut().insert(
                 salvo::http::header::CONTENT_TYPE,
@@ -160,7 +177,12 @@ fn handle_nonexistent_get(
             );
             res.headers_mut()
                 .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-            res.write_body(data).ok();
+            let length = metadata.len();
+            res.headers_mut().insert(
+                salvo::http::header::CONTENT_LENGTH,
+                length.to_string().parse().unwrap(),
+            );
+            stream_file(res, tokio::fs::File::from_std(file), length);
             return;
         }
     }
@@ -186,14 +208,42 @@ fn handle_nonexistent_get(
 async fn handle_get_file(
     req: &mut Request,
     res: &mut Response,
-    config: &AppConfig,
+    config: &Arc<AppConfig>,
     req_p: &Path,
+    is_404: bool,
+) {
+    let file = match tokio::fs::File::open(req_p).await {
+        Ok(file) => file,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                res.status_code(StatusCode::FORBIDDEN);
+                res.render(Text::Html(error_html(
+                    "403 Forbidden",
+                    format!("Can't access {}.", req_p.display()),
+                    "",
+                )));
+            } else {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            return;
+        }
+    };
+
+    serve_open_file(req, res, config, req_p, file, is_404).await;
+}
+
+async fn serve_open_file(
+    req: &mut Request,
+    res: &mut Response,
+    config: &Arc<AppConfig>,
+    req_p: &Path,
+    mut file: tokio::fs::File,
     is_404: bool,
 ) {
     let mime_type = guess_mime_type(req_p, &config.mime_type_overrides);
     let remote = req.remote_addr().to_string();
 
-    let metadata = match req_p.metadata() {
+    let metadata = match file.metadata().await {
         Ok(m) => m,
         Err(e) => {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -214,35 +264,19 @@ async fn handle_get_file(
     let modified = file_time_modified(&metadata);
     let flen = file_length(&metadata, &req_p);
 
-    // Check If-None-Match / If-Modified-Since for 304
-    if !is_404 {
-        if let Some(inm) = req.headers().get(salvo::http::header::IF_NONE_MATCH)
-            && let Ok(inm_str) = inm.to_str()
-            && inm_str.contains(&etag)
-        {
-            log_msg(config.log, &format!("{} Not Modified", remote));
-            res.status_code(StatusCode::NOT_MODIFIED);
-            res.headers_mut().insert(
-                salvo::http::header::ETAG,
-                format!("\"{}\"", etag).parse().unwrap(),
-            );
-            res.headers_mut()
-                .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-            return;
-        }
-        if let Some(ims) = req.headers().get(salvo::http::header::IF_MODIFIED_SINCE)
-            && let Ok(ims_str) = ims.to_str()
-            && let Ok(since) = chrono::DateTime::parse_from_rfc2822(ims_str)
-            && modified <= since.with_timezone(&chrono::Utc)
-        {
-            log_msg(config.log, &format!("{} Not Modified", remote));
-            res.status_code(StatusCode::NOT_MODIFIED);
-            res.headers_mut().insert(
-                salvo::http::header::ETAG,
-                format!("\"{}\"", etag).parse().unwrap(),
-            );
-            res.headers_mut()
-                .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
+    if !is_404
+        && let Some(range) = req
+            .headers()
+            .get(salvo::http::header::RANGE)
+            .and_then(|header| header.to_str().ok())
+            .map(str::to_owned)
+    {
+        let tag = format!("\"{etag}\"");
+        if crate::http_cache::range_matches(req, &tag, modified) {
+            if crate::http_cache::not_modified(req, res, Some(&tag), modified) {
+                return;
+            }
+            handle_get_file_range(req, res, config, req_p, file, metadata, &range).await;
             return;
         }
     }
@@ -258,20 +292,14 @@ async fn handle_get_file(
     );
 
     // Check if we should try encoding
-    if config.encoded_temp_dir.is_some()
-        && flen > MIN_ENCODING_SIZE
-        && flen < MAX_ENCODING_SIZE
-        && req_p
-            .extension()
-            .map(|s| !extension_is_blacklisted(s))
-            .unwrap_or(true)
-        && let Some(accept_enc) = req
-            .headers()
-            .get(salvo::http::header::ACCEPT_ENCODING)
-            .and_then(|v| v.to_str().ok())
-        && let Some(encoding) = response_encoding(accept_enc)
-        && let Some(encoded_data) = try_encoded_file(config, req_p, &etag, encoding, &remote)
+    if let Some(encoding) = file_encoding_candidate(req, config, req_p, flen)
+        && let Some(encoded) =
+            encoded_file_job(config, &file, req_p, &etag, encoding, &remote).await
     {
+        let response_etag = format!("\"{}-{}\"", etag, encoding_name(encoding));
+        if !is_404 && crate::http_cache::not_modified(req, res, Some(&response_etag), modified) {
+            return;
+        }
         res.status_code(if is_404 {
             StatusCode::NOT_FOUND
         } else {
@@ -285,10 +313,8 @@ async fn handle_get_file(
             salvo::http::header::CONTENT_ENCODING,
             encoding_name(encoding).parse().unwrap(),
         );
-        res.headers_mut().insert(
-            salvo::http::header::ETAG,
-            format!("\"{}\"", etag).parse().unwrap(),
-        );
+        res.headers_mut()
+            .insert(salvo::http::header::ETAG, response_etag.parse().unwrap());
         res.headers_mut().insert(
             salvo::http::header::LAST_MODIFIED,
             modified
@@ -301,27 +327,24 @@ async fn handle_get_file(
             .insert(salvo::http::header::ACCEPT_RANGES, "bytes".parse().unwrap());
         res.headers_mut()
             .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-        res.write_body(encoded_data).ok();
+        res.headers_mut().insert(
+            salvo::http::header::CONTENT_LENGTH,
+            encoded.length.to_string().parse().unwrap(),
+        );
+        stream_file(res, tokio::fs::File::from_std(encoded.file), encoded.length);
         return;
     }
 
     // Serve file without encoding
-    let file_data = match tokio::fs::read(req_p).await {
-        Ok(data) => data,
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                res.status_code(StatusCode::FORBIDDEN);
-                res.render(Text::Html(error_html(
-                    "403 Forbidden",
-                    format!("Can't access {}.", req_p.display()),
-                    "",
-                )));
-            } else {
-                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-            return;
-        }
-    };
+    if !is_404
+        && crate::http_cache::not_modified(req, res, Some(&format!("\"{}\"", etag)), modified)
+    {
+        return;
+    }
+    if file.seek(std::io::SeekFrom::Start(0)).await.is_err() {
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        return;
+    }
 
     res.status_code(if is_404 {
         StatusCode::NOT_FOUND
@@ -352,69 +375,141 @@ async fn handle_get_file(
     );
     res.headers_mut()
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-    res.write_body(file_data).ok();
+    stream_file(res, file, flen);
+}
+
+pub(super) fn file_encoding_candidate(
+    req: &Request,
+    config: &AppConfig,
+    path: &Path,
+    length: u64,
+) -> Option<EncodingType> {
+    if config.encoded_temp_dir.is_none()
+        || length <= MIN_ENCODING_SIZE
+        || length >= MAX_ENCODING_SIZE
+        || path.extension().is_some_and(extension_is_blacklisted)
+    {
+        return None;
+    }
+    response_encoding(req.headers().get("accept-encoding")?.to_str().ok()?)
+}
+
+/// None means the coding requires reading the source to determine its gain.
+/// Some(None) is a current negative cache entry; Some(Some(_)) pins an encoded file.
+pub(super) fn cached_file_encoding(
+    config: &AppConfig,
+    path: &Path,
+    etag: &str,
+    encoding: EncodingType,
+) -> Option<Option<EncodedFile>> {
+    let hash = *config
+        .cache_fs_files
+        .read()
+        .ok()?
+        .get(&format!("{}:{etag}", path.display()))?;
+    let cache = config.cache_fs.read().ok()?;
+    let ((path, present, _), atime) = cache.get(&(hash, encoding))?;
+    if *present {
+        let encoded = EncodedFile::open(path)?;
+        atime.store(precise_time_ns(), AtomicOrdering::Relaxed);
+        Some(Some(encoded))
+    } else if precise_time_ns().saturating_sub(atime.load(AtomicOrdering::Relaxed))
+        <= crate::config::NEGATIVE_CACHE_TTL_NS
+    {
+        Some(None)
+    } else {
+        None
+    }
+}
+
+async fn encoded_file_job(
+    config: &Arc<AppConfig>,
+    source: &tokio::fs::File,
+    path: &Path,
+    etag: &str,
+    encoding: EncodingType,
+    remote: &str,
+) -> Option<EncodedFile> {
+    if let Some(cached) = cached_file_encoding(config, path, etag, encoding) {
+        return cached;
+    }
+    let mut source = source.try_clone().await.ok()?.into_std().await;
+    let work_config = config.clone();
+    let path = path.to_path_buf();
+    let etag = etag.to_owned();
+    let remote = remote.to_owned();
+    config
+        .spawn_blocking(move || {
+            try_encoded_file(&work_config, &mut source, &path, &etag, encoding, &remote)
+        })?
+        .await
+        .ok()
+        .flatten()
 }
 
 fn try_encoded_file(
     config: &AppConfig,
+    source: &mut std::fs::File,
     req_p: &Path,
     etag: &str,
     encoding: EncodingType,
     remote: &str,
-) -> Option<Vec<u8>> {
+) -> Option<EncodedFile> {
+    // Include the path because metadata tags can collide between different files.
+    let index_key = format!("{}:{etag}", req_p.display());
     // Check if we have it cached
     let hash = {
         let cache = config.cache_fs_files.read().ok()?;
-        cache.get(etag).cloned()
+        cache.get(&index_key).cloned()
     };
 
     let hash = match hash {
         Some(h) => h,
         None => {
-            let h = file_hash(req_p).ok()?;
-            config
-                .cache_fs_files
-                .write()
-                .ok()?
-                .insert(etag.to_string(), h);
+            let h = file_hash_reader(source).ok()?;
+            config.remember_hash(index_key, h);
             h
         }
     };
 
     let cache_key = (hash, encoding);
+    // Fixed stripes bound coordination metadata while coalescing identical work.
+    let _generation = config.encoding_gates[hash.as_bytes()[0] as usize % 64]
+        .lock()
+        .ok()?;
 
-    // Check fs cache
-    {
+    let cached_path = {
         let cache = config.cache_fs.read().ok()?;
-        if let Some(((resp_p, true, _), atime)) = cache.get(&cache_key)
-            && let Ok(data) = std::fs::read(resp_p)
-        {
-            atime.store(precise_time_ns(), AtomicOrdering::Relaxed);
-            let orig_len = req_p
-                .metadata()
-                .map(|m| file_length(&m, req_p))
-                .unwrap_or(0);
-            log_msg(
-                config.log,
-                &format!(
-                    "{} encoded as {} for {:.1}% ratio (cached)",
-                    remote,
-                    encoding_name(encoding),
-                    (orig_len as f64) / (data.len() as f64) * 100.0
-                ),
-            );
-            return Some(data);
+        match cache.get(&cache_key) {
+            Some(((path, true, _), atime)) => {
+                atime.store(precise_time_ns(), AtomicOrdering::Relaxed);
+                Some(path.clone())
+            }
+            Some(((_, false, _), atime))
+                if precise_time_ns().saturating_sub(atime.load(AtomicOrdering::Relaxed))
+                    <= crate::config::NEGATIVE_CACHE_TTL_NS =>
+            {
+                return None;
+            }
+            Some(((_, false, _), _)) | None => None,
         }
-        if let Some(((_, false, _), _)) = cache.get(&cache_key) {
-            // Previously determined not worth encoding
-            return None;
-        }
+    };
+    if let Some(path) = cached_path
+        && let Some(encoded) = EncodedFile::open(&path)
+    {
+        return Some(encoded);
     }
 
     // Encode the file
     config.create_temp_dir(&config.encoded_temp_dir);
     let temp_dir = &config.encoded_temp_dir.as_ref()?.1;
-    let mut resp_p = temp_dir.join(cache_key.0.to_hex().as_str());
+    static NEXT_ENCODING: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT_ENCODING.fetch_add(1, AtomicOrdering::Relaxed);
+    let mut resp_p = temp_dir.join(format!(
+        "{}-{}-{sequence}",
+        cache_key.0.to_hex(),
+        std::process::id()
+    ));
 
     let ext_str = req_p.extension().and_then(|e| e.to_str()).unwrap_or("");
     let enc_ext = encoding_extension(encoding);
@@ -424,10 +519,11 @@ fn try_encoded_file(
         resp_p.set_extension(format!("{}.{}", ext_str, enc_ext));
     }
 
-    if encode_file(req_p, &resp_p, encoding) {
-        let resp_meta = resp_p.metadata().ok()?;
+    let pending = PendingEncoding(resp_p.with_extension(format!("{}.partial", enc_ext)));
+    if encode_open_file(source.try_clone().ok()?, &pending.0, encoding) {
+        let resp_meta = pending.0.metadata().ok()?;
         let resp_len = resp_meta.len();
-        let orig_len = req_p
+        let orig_len = source
             .metadata()
             .map(|m| file_length(&m, req_p))
             .unwrap_or(0);
@@ -435,11 +531,7 @@ fn try_encoded_file(
 
         if gain < MIN_ENCODING_GAIN || resp_len > config.encoded_filesystem_limit {
             // Not worth keeping
-            let mut cache = config.cache_fs.write().ok()?;
-            cache.insert(
-                cache_key,
-                ((PathBuf::new(), false, 0), AtomicU64::new(u64::MAX)),
-            );
+            config.cache_negative(cache_key);
             let _ = std::fs::remove_file(&resp_p);
             return None;
         }
@@ -454,17 +546,14 @@ fn try_encoded_file(
             ),
         );
 
-        let data = std::fs::read(&resp_p).ok()?;
-        let mut cache = config.cache_fs.write().ok()?;
-        config
-            .cache_fs_size
-            .fetch_add(resp_len, AtomicOrdering::Relaxed);
-        cache.insert(
-            cache_key,
-            ((resp_p, true, resp_len), AtomicU64::new(precise_time_ns())),
-        );
+        std::fs::rename(&pending.0, &resp_p).ok()?;
+        let encoded = EncodedFile::open(&resp_p)?;
+        if !config.cache_file(cache_key, resp_p.clone(), resp_len) {
+            let _ = std::fs::remove_file(&resp_p);
+            return None;
+        }
 
-        return Some(data);
+        return Some(encoded);
     }
 
     log_msg(
@@ -478,101 +567,49 @@ fn try_encoded_file(
     None
 }
 
-fn handle_get_file_range(
+/// Opening before releasing the job keeps the representation alive across eviction.
+pub(super) struct EncodedFile {
+    file: std::fs::File,
+    pub(super) length: u64,
+}
+
+impl EncodedFile {
+    fn open(path: &Path) -> Option<Self> {
+        let file = std::fs::File::open(path).ok()?;
+        let length = file.metadata().ok()?.len();
+        Some(Self { file, length })
+    }
+}
+
+struct PendingEncoding(PathBuf);
+
+impl Drop for PendingEncoding {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+async fn handle_get_file_range(
     req: &mut Request,
     res: &mut Response,
     config: &AppConfig,
     req_p: &Path,
+    mut file: tokio::fs::File,
+    metadata: std::fs::Metadata,
     range_str: &str,
 ) {
     let remote = req.remote_addr().to_string();
     let mime_type = guess_mime_type(req_p, &config.mime_type_overrides);
-    let metadata = match req_p.metadata() {
-        Ok(m) => m,
-        Err(_) => {
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            return;
-        }
-    };
     let flen = file_length(&metadata, req_p);
     let etag = file_etag(&metadata);
     let modified = file_time_modified(&metadata);
 
-    // Parse "bytes=N-M" range header
-    if !range_str.starts_with("bytes=") {
+    let Some((from, to)) = parse_byte_range(range_str, flen) else {
         res.status_code(StatusCode::RANGE_NOT_SATISFIABLE);
-        res.render(Text::Html(error_html(
-            "416 Range Not Satisfiable",
-            "Custom ranges are unsupported.",
-            "",
-        )));
-        return;
-    }
-
-    let range_spec = &range_str[6..];
-    // Only support single range
-    if range_spec.contains(',') {
-        res.status_code(StatusCode::RANGE_NOT_SATISFIABLE);
-        res.render(Text::Html(error_html(
-            "416 Range Not Satisfiable",
-            "More than one range is unsupported.",
-            "",
-        )));
-        return;
-    }
-
-    let (from, to) = if let Some(pos) = range_spec.find('-') {
-        let from_str = &range_spec[..pos];
-        let to_str = &range_spec[pos + 1..];
-
-        if from_str.is_empty() {
-            // suffix range: -N
-            let n: u64 = match to_str.parse() {
-                Ok(n) => n,
-                Err(_) => {
-                    res.status_code(StatusCode::RANGE_NOT_SATISFIABLE);
-                    return;
-                }
-            };
-            if n > flen {
-                res.status_code(StatusCode::RANGE_NOT_SATISFIABLE);
-                return;
-            }
-            (flen - n, flen - 1)
-        } else if to_str.is_empty() {
-            // open-ended: N-
-            let from: u64 = match from_str.parse() {
-                Ok(n) => n,
-                Err(_) => {
-                    res.status_code(StatusCode::RANGE_NOT_SATISFIABLE);
-                    return;
-                }
-            };
-            if from >= flen {
-                res.status_code(StatusCode::NO_CONTENT);
-                return;
-            }
-            (from, flen - 1)
-        } else {
-            // closed: N-M
-            let from: u64 = match from_str.parse() {
-                Ok(n) => n,
-                Err(_) => {
-                    res.status_code(StatusCode::RANGE_NOT_SATISFIABLE);
-                    return;
-                }
-            };
-            let to: u64 = match to_str.parse() {
-                Ok(n) => n,
-                Err(_) => {
-                    res.status_code(StatusCode::RANGE_NOT_SATISFIABLE);
-                    return;
-                }
-            };
-            (from, to)
-        }
-    } else {
-        res.status_code(StatusCode::RANGE_NOT_SATISFIABLE);
+        res.headers_mut().insert(
+            salvo::http::header::CONTENT_RANGE,
+            format!("bytes */{flen}").parse().unwrap(),
+        );
         return;
     };
 
@@ -588,28 +625,10 @@ fn handle_get_file_range(
         ),
     );
 
-    let content_len = to + 1 - from;
-    let mut f = match File::open(req_p) {
-        Ok(f) => f,
-        Err(_) => {
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            return;
-        }
-    };
-
-    if f.seek(SeekFrom::Start(from)).is_err() {
+    let content_len = to - from + 1;
+    if file.seek(std::io::SeekFrom::Start(from)).await.is_err() {
         res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
         return;
-    }
-
-    let mut buf = vec![0u8; content_len as usize];
-    if f.read_exact(&mut buf).is_err() {
-        // Read what we can
-        buf.clear();
-        f.seek(SeekFrom::Start(from)).ok();
-        let mut temp = Vec::new();
-        f.take(content_len).read_to_end(&mut temp).ok();
-        buf = temp;
     }
 
     res.status_code(StatusCode::PARTIAL_CONTENT);
@@ -627,7 +646,7 @@ fn handle_get_file_range(
     );
     res.headers_mut().insert(
         salvo::http::header::ETAG,
-        format!("\"{}+{}-{}\"", etag, from, to).parse().unwrap(),
+        format!("\"{}\"", etag).parse().unwrap(),
     );
     res.headers_mut().insert(
         salvo::http::header::LAST_MODIFIED,
@@ -641,7 +660,58 @@ fn handle_get_file_range(
         .insert(salvo::http::header::ACCEPT_RANGES, "bytes".parse().unwrap());
     res.headers_mut()
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-    res.write_body(buf).ok();
+    stream_file(res, file, content_len);
+}
+
+/// Normalize one byte range before doing arithmetic or allocating buffers.
+fn parse_byte_range(header: &str, length: u64) -> Option<(u64, u64)> {
+    if length == 0 {
+        return None;
+    }
+    let spec = header.strip_prefix("bytes=")?;
+    let (first, last) = spec.split_once('-')?;
+    if first.is_empty() {
+        let suffix = last.parse::<u64>().ok()?;
+        (suffix != 0).then(|| (length.saturating_sub(suffix), length - 1))
+    } else {
+        let start = first.parse::<u64>().ok()?;
+        let end = if last.is_empty() {
+            length - 1
+        } else {
+            last.parse::<u64>().ok()?.min(length - 1)
+        };
+        (start < length && start <= end).then_some((start, end))
+    }
+}
+
+/// The channel has backpressure; a request retains at most a small file chunk.
+fn stream_file(res: &mut Response, mut file: tokio::fs::File, mut remaining: u64) {
+    let mut sender = res.channel();
+    tokio::spawn(async move {
+        while remaining != 0 && !sender.is_closed() {
+            let mut chunk = vec![0; remaining.min(64 * 1024) as usize];
+            match file.read(&mut chunk).await {
+                Ok(0) => {
+                    sender.send_error(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "file shortened during transfer",
+                    ));
+                    break;
+                }
+                Ok(count) => {
+                    chunk.truncate(count);
+                    remaining -= count as u64;
+                    if sender.send_data(chunk).await.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    sender.send_error(error);
+                    break;
+                }
+            }
+        }
+    });
 }
 
 fn handle_get_dir(
@@ -677,8 +747,11 @@ fn handle_get_dir(
                             req_p.display()
                         ),
                     );
-                    if let Ok(data) = std::fs::read(&idx) {
-                        let metadata = idx.metadata().ok();
+                    if let Ok(file) = std::fs::File::open(&idx)
+                        && let Ok(metadata) = file.metadata()
+                    {
+                        let length = metadata.len();
+                        let metadata = Some(metadata);
                         res.status_code(StatusCode::OK);
                         res.headers_mut().insert(
                             salvo::http::header::CONTENT_TYPE,
@@ -701,7 +774,11 @@ fn handle_get_dir(
                         }
                         res.headers_mut()
                             .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-                        res.write_body(data).ok();
+                        res.headers_mut().insert(
+                            salvo::http::header::CONTENT_LENGTH,
+                            length.to_string().parse().unwrap(),
+                        );
+                        stream_file(res, tokio::fs::File::from_std(file), length);
                         return;
                     }
                 } else {
@@ -798,46 +875,23 @@ fn handle_dir_listing(
 
     let list_f = |out: &mut Vec<u8>| {
         let mut list: Vec<_> = rd
-            .filter_map(|p| p.ok())
-            .filter(|f| {
-                let fp = f.path();
-                let symlink = is_symlink(&fp);
-                !config.is_symlink_denied(symlink, &fp)
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = entry.file_name();
+                if is_internal_name(&name) || config.is_symlink_denied(is_symlink(&path), &path) {
+                    return None;
+                }
+                // Each entry is inspected once, never inside the sort comparator.
+                let metadata = path.metadata().ok()?;
+                let is_file = is_actually_file(&metadata.file_type(), &path);
+                let name = name.to_string_lossy().into_owned();
+                Some((is_file, name.to_lowercase(), name, path, metadata))
             })
             .collect();
+        list.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
 
-        list.sort_by(|lhs, rhs| {
-            let lhs_is_file = is_actually_file(
-                &lhs.file_type()
-                    .unwrap_or(lhs.metadata().unwrap().file_type()),
-                lhs.path(),
-            );
-            let rhs_is_file = is_actually_file(
-                &rhs.file_type()
-                    .unwrap_or(rhs.metadata().unwrap().file_type()),
-                rhs.path(),
-            );
-            (
-                lhs_is_file,
-                lhs.file_name().to_string_lossy().to_lowercase(),
-            )
-                .cmp(&(
-                    rhs_is_file,
-                    rhs.file_name().to_string_lossy().to_lowercase(),
-                ))
-        });
-
-        for f in list {
-            let path = f.path();
-            let is_file = path
-                .metadata()
-                .map(|m| is_actually_file(&m.file_type(), &path))
-                .unwrap_or(false);
-            let fmeta = match f.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let fname = f.file_name().to_string_lossy().to_string();
+        for (is_file, _, fname, path, fmeta) in list {
             let len = file_length(&fmeta, &path);
             let modified = file_time_modified(&fmeta);
 
@@ -984,6 +1038,10 @@ fn try_encode_generated_response(
     let encoding = response_encoding(accept_enc)?;
     let hash = blake3::hash(body.as_bytes());
     let cache_key = (hash, encoding);
+    // Fixed stripes bound coordination metadata while coalescing identical work.
+    let _generation = config.encoding_gates[hash.as_bytes()[0] as usize % 64]
+        .lock()
+        .ok()?;
 
     // Check gen cache
     {
@@ -998,19 +1056,278 @@ fn try_encode_generated_response(
     // Encode
     let enc_resp = encode_str(body, encoding)?;
 
-    if enc_resp.len() as u64 <= config.encoded_generated_limit
-        && let Ok(mut cache) = config.cache_gen.write()
-    {
-        config
-            .cache_gen_size
-            .fetch_add(enc_resp.len() as u64, AtomicOrdering::Relaxed);
-        cache.insert(
-            cache_key,
-            (enc_resp.clone(), AtomicU64::new(precise_time_ns())),
+    config.cache_generated(cache_key, &enc_resp);
+
+    Some((enc_resp, encoding))
+}
+
+#[cfg(test)]
+mod range_tests {
+    use salvo::prelude::*;
+    use salvo::test::{ResponseExt, TestClient};
+
+    use super::parse_byte_range;
+
+    #[test]
+    fn normalizes_ranges_without_overflow() {
+        for (header, expected) in [
+            ("bytes=0-8", Some((0, 5))),
+            ("bytes=-20", Some((0, 5))),
+            ("bytes=1-", Some((1, 5))),
+            ("bytes=0-18446744073709551615", Some((0, 5))),
+            ("bytes=18446744073709551615-", None),
+            ("bytes=5-1", None),
+            ("bytes=10-", None),
+            ("bytes=-0", None),
+            ("bytes=0-1,2-3", None),
+            ("bytes=0-18446744073709551616", None),
+        ] {
+            assert_eq!(parse_byte_range(header, 6), expected, "{header}");
+        }
+        assert_eq!(parse_byte_range("bytes=0-", 0), None);
+    }
+
+    #[tokio::test]
+    async fn range_responses_match_normalized_file_bytes() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::write(dir.path().join("data.txt"), b"abcdef").unwrap();
+        std::fs::write(dir.path().join("empty.txt"), b"").unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &[],
+        )));
+        for header in ["bytes=0-8", "bytes=-20", "bytes=0-18446744073709551615"] {
+            let mut response = TestClient::get("http://localhost/data.txt")
+                .add_header("Range", header, true)
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::PARTIAL_CONTENT));
+            assert_eq!(response.headers()["content-range"], "bytes 0-5/6");
+            assert_eq!(response.headers()["content-length"], "6");
+            assert!(response.body.is_channel());
+            assert_eq!(response.take_bytes(None).await.unwrap(), "abcdef");
+        }
+        for path in ["data.txt", "empty.txt"] {
+            let response = TestClient::get(format!("http://localhost/{path}"))
+                .add_header("Range", "bytes=10-", true)
+                .send(&service)
+                .await;
+            assert_eq!(
+                response.status_code,
+                Some(StatusCode::RANGE_NOT_SATISFIABLE)
+            );
+            assert!(response.headers().contains_key("content-range"));
+        }
+    }
+
+    #[tokio::test]
+    async fn large_download_uses_a_channel_and_preserves_contents() {
+        let dir = crate::test_support::TestDir::new();
+        let data = vec![42; 3 * 1024 * 1024 + 7];
+        std::fs::write(dir.path().join("data.bin"), &data).unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &["-e"],
+        )));
+        let mut response = TestClient::get("http://localhost/data.bin")
+            .send(&service)
+            .await;
+        assert!(response.body.is_channel());
+        assert_eq!(response.take_bytes(None).await.unwrap().as_ref(), data);
+    }
+
+    #[test]
+    fn concurrent_cold_encodings_publish_one_complete_file() {
+        let dir = crate::test_support::TestDir::new();
+        let path = dir.path().join("data.txt");
+        let data = b"compressible fixture\n".repeat(20_000);
+        std::fs::write(&path, &data).unwrap();
+        let config = crate::test_support::config(dir.path(), &[]);
+        let barrier = std::sync::Barrier::new(12);
+        std::thread::scope(|scope| {
+            let mut tasks = Vec::new();
+            for _ in 0..12 {
+                tasks.push(scope.spawn(|| {
+                    barrier.wait();
+                    super::try_encoded_file(
+                        &config,
+                        &mut std::fs::File::open(&path).unwrap(),
+                        &path,
+                        "fixture",
+                        crate::config::EncodingType::Gzip,
+                        "test",
+                    )
+                    .unwrap()
+                }));
+            }
+            for task in tasks {
+                let compressed = task.join().unwrap();
+                let mut decoded = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut flate2::read::GzDecoder::new(compressed.file),
+                    &mut decoded,
+                )
+                .unwrap();
+                assert_eq!(decoded, data);
+            }
+        });
+        let cache = config.cache_fs.read().unwrap();
+        assert_eq!(cache.len(), 1);
+        let ((cached_path, _, size), _) = cache.values().next().unwrap();
+        assert_eq!(
+            config
+                .cache_fs_size
+                .load(std::sync::atomic::Ordering::Relaxed),
+            *size
+        );
+        assert_eq!(std::fs::metadata(cached_path).unwrap().len(), *size);
+        assert_eq!(
+            std::fs::read_dir(&config.encoded_temp_dir.as_ref().unwrap().1)
+                .unwrap()
+                .count(),
+            1
         );
     }
 
-    Some((enc_resp, encoding))
+    #[tokio::test]
+    async fn plain_files_stay_available_when_expensive_jobs_are_busy() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::write(dir.path().join("data.txt"), b"available").unwrap();
+        let config = crate::test_support::config(dir.path(), &["-A"]);
+        let permits = config
+            .blocking_jobs
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let service = Service::new(crate::build_router(config.clone()));
+        let mut response = TestClient::get("http://localhost/data.txt")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+        assert_eq!(response.take_string().await.unwrap(), "available");
+        let response = TestClient::get("http://localhost/").send(&service).await;
+        assert_eq!(response.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+        let response = TestClient::get("http://localhost/")
+            .add_header("Accept", "application/x-tar", true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+        drop(permits);
+    }
+
+    #[tokio::test]
+    async fn listing_sorts_snapshots_and_hides_private_staging_names() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::create_dir(dir.path().join("Zdirectory")).unwrap();
+        std::fs::write(dir.path().join("afile.txt"), b"visible").unwrap();
+        std::fs::write(dir.path().join(".HPIP-UPLOAD-secret"), b"private").unwrap();
+        std::fs::create_dir(dir.path().join(".hpip-internal-secret")).unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &[],
+        )));
+        let mut response = TestClient::get("http://localhost/").send(&service).await;
+        let body = response.take_string().await.unwrap();
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+        assert!(body.find("Zdirectory").unwrap() < body.find("afile.txt").unwrap());
+        assert!(!body.contains(".HPIP-UPLOAD-secret"));
+        assert!(!body.contains(".hpip-internal-secret"));
+    }
+
+    #[tokio::test]
+    async fn cold_and_cached_compressed_responses_stream() {
+        let dir = crate::test_support::TestDir::new();
+        let data = "payload ".repeat(10_000);
+        std::fs::write(dir.path().join("data.txt"), &data).unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &[],
+        )));
+        for _ in 0..2 {
+            let mut response = TestClient::get("http://localhost/data.txt")
+                .add_header("Accept-Encoding", "gzip", true)
+                .send(&service)
+                .await;
+            assert_eq!(response.headers()["content-encoding"], "gzip");
+            assert!(response.body.is_channel());
+            assert_eq!(response.take_string().await.unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn opened_encoding_survives_cache_eviction() {
+        let dir = crate::test_support::TestDir::new();
+        let path = dir.path().join("data.txt");
+        let data = b"payload ".repeat(10_000);
+        std::fs::write(&path, &data).unwrap();
+        let config = crate::test_support::config(dir.path(), &["--encoded-filesystem", "4096"]);
+        let encoded = super::try_encoded_file(
+            &config,
+            &mut std::fs::File::open(&path).unwrap(),
+            &path,
+            "test",
+            crate::config::EncodingType::Gzip,
+            "test",
+        )
+        .unwrap();
+        let cached_path = config
+            .cache_fs
+            .read()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .0
+            .0
+            .clone();
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, [0; 4096]).unwrap();
+        assert!(config.cache_file(
+            (
+                blake3::hash(b"replacement"),
+                crate::config::EncodingType::Gzip
+            ),
+            replacement,
+            4096
+        ));
+        assert!(!cached_path.exists());
+        let mut decoded = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(encoded.file),
+            &mut decoded,
+        )
+        .unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
+    async fn index_and_custom_error_files_also_stream() {
+        let dir = crate::test_support::TestDir::new();
+        let data = vec![31; 3 * 1024 * 1024];
+        std::fs::write(dir.path().join("index.html"), &data).unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &[],
+        )));
+        let mut response = TestClient::get("http://localhost/").send(&service).await;
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+        assert!(response.body.is_channel());
+        assert_eq!(response.take_bytes(None).await.unwrap().as_ref(), data);
+
+        let fallback = dir.path().join("error.html");
+        std::fs::write(&fallback, &data).unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &["--404", fallback.to_str().unwrap()],
+        )));
+        let mut response = TestClient::get("http://localhost/missing")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::NOT_FOUND));
+        assert!(response.body.is_channel());
+        assert_eq!(response.take_bytes(None).await.unwrap().as_ref(), data);
+    }
 }
 
 #[cfg(test)]
@@ -1095,5 +1412,90 @@ mod selected_resource_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use salvo::test::{ResponseExt, TestClient};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn full_and_range_headers_and_bytes_use_the_opened_version() {
+        let dir = crate::test_support::TestDir::new();
+        let path = dir.path().join("data.txt");
+        let replacement = dir.path().join("replacement");
+        let config = crate::test_support::config(dir.path(), &["-e"]);
+        for range in [None, Some("bytes=1-4")] {
+            std::fs::write(&path, b"original snapshot").unwrap();
+            std::fs::write(
+                &replacement,
+                b"a longer replacement that must not be mixed into the response",
+            )
+            .unwrap();
+            let opened = tokio::fs::File::open(&path).await.unwrap();
+            let tag = format!("\"{}\"", file_etag(&opened.metadata().await.unwrap()));
+            std::fs::rename(&replacement, &path).unwrap();
+            let mut request = TestClient::get("http://localhost/data.txt").build();
+            if let Some(range) = range {
+                request
+                    .headers_mut()
+                    .insert("range", range.parse().unwrap());
+                request
+                    .headers_mut()
+                    .insert("if-range", tag.parse().unwrap());
+            }
+            let mut response = Response::new();
+            serve_open_file(&mut request, &mut response, &config, &path, opened, false).await;
+            assert_eq!(response.headers()["etag"], tag);
+            let expected: &[u8] = if range.is_some() {
+                b"rigi"
+            } else {
+                b"original snapshot"
+            };
+            assert_eq!(
+                response.headers()["content-length"],
+                expected.len().to_string()
+            );
+            assert_eq!(response.take_bytes(None).await.unwrap().as_ref(), expected);
+        }
+    }
+
+    #[test]
+    fn hash_and_compression_share_the_opened_version_after_path_replacement() {
+        let dir = crate::test_support::TestDir::new();
+        let path = dir.path().join("data.txt");
+        let replacement = dir.path().join("replacement");
+        let original = b"original fixture ".repeat(10_000);
+        std::fs::write(&path, &original).unwrap();
+        std::fs::write(&replacement, b"different replacement ".repeat(12_000)).unwrap();
+        let mut opened = std::fs::File::open(&path).unwrap();
+        let tag = file_etag(&opened.metadata().unwrap());
+        std::fs::rename(&replacement, &path).unwrap();
+        let config = crate::test_support::config(dir.path(), &[]);
+        let encoded = try_encoded_file(
+            &config,
+            &mut opened,
+            &path,
+            &tag,
+            EncodingType::Gzip,
+            "test",
+        )
+        .unwrap();
+        let mut contents = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(encoded.file),
+            &mut contents,
+        )
+        .unwrap();
+        assert_eq!(contents, original);
+        assert!(
+            config
+                .cache_fs
+                .read()
+                .unwrap()
+                .contains_key(&(blake3::hash(&original), EncodingType::Gzip))
+        );
     }
 }

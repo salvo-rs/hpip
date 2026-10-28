@@ -3,11 +3,14 @@ mod encoding;
 mod error;
 mod handler;
 mod hoops;
+mod http_cache;
 mod options;
 mod port;
 mod tls;
 pub mod util;
 
+#[cfg(test)]
+mod shutdown_tests;
 #[cfg(test)]
 mod test_support;
 
@@ -46,11 +49,13 @@ fn actual_main() -> i32 {
 
 async fn result_main() -> Result<(), Error> {
     let mut opts = Options::parse()?;
+    let _instance_temp = InstanceTemp::create(&opts.temp_directory.1)?;
 
     if opts.generate_tls {
         opts.tls_data = Some(tls::generate_tls_data(&opts.temp_directory)?);
     }
 
+    let generated_auth_paths = opts.generate_path_auth.clone();
     for path in mem::take(&mut opts.generate_path_auth) {
         opts.path_auth_data.insert(path, Some(generate_auth_data()));
     }
@@ -135,9 +140,12 @@ async fn result_main() -> Result<(), Error> {
         }
     }
 
-    if !opts.path_auth_data.is_empty() && opts.loglevel < options::LogLevel::NoAuth {
-        println!("Basic authentication credentials:");
+    if !generated_auth_paths.is_empty() && opts.loglevel < options::LogLevel::NoAuth {
+        println!("Generated basic authentication credentials:");
         for (path, creds) in &opts.path_auth_data {
+            if !generated_auth_paths.contains(path) {
+                continue;
+            }
             if let Some(ad) = creds {
                 let mut itr = ad.split(':');
                 let user = itr.next().unwrap_or("");
@@ -154,7 +162,7 @@ async fn result_main() -> Result<(), Error> {
         println!();
     }
 
-    let bind_addr = format!("{}:{}", opts.bind_address, port);
+    let bind_addr = std::net::SocketAddr::new(opts.bind_address, port);
 
     // Start the server
     let listener = TcpListener::new(bind_addr);
@@ -179,36 +187,66 @@ async fn result_main() -> Result<(), Error> {
 
     // Spawn cache pruning task if needed
     let config_prune = config.clone();
-    if opts.encoded_prune.is_some() {
+    let prune_task = if opts.encoded_prune.is_some() {
         let interval = config.prune_interval;
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-                config_prune.prune();
+                let work_config = config_prune.clone();
+                if let Some(job) = config_prune.spawn_blocking(move || work_config.prune()) {
+                    let _ = job.await;
+                }
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
     // Graceful shutdown on Ctrl-C
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to listen for Ctrl-C");
-        let _ = shutdown_tx.send(());
-    });
-
     let server = Server::new(DynTcpAcceptors::new(vec![acceptor]));
-
-    tokio::select! {
-        _ = server.serve(router) => {}
-        _ = shutdown_rx => {
-            config::log_msg(config.log, "Shutting down...");
+    let server_handle = server.handle();
+    let signal_task = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            server_handle.stop_graceful(Some(std::time::Duration::from_secs(30)));
         }
+    });
+    let result = server.try_serve(router).await;
+    signal_task.abort();
+    let _ = signal_task.await;
+    if let Some(task) = prune_task {
+        task.abort();
+        let _ = task.await;
     }
 
+    config.drain_blocking_jobs().await;
     config.clean_temp_dirs(&opts.temp_directory, opts.generate_tls);
-    Ok(())
+    result.map_err(|e| Error(format!("Serving requests: {e}")))
+}
+
+/// Own only the directory created exclusively for this process instance.
+struct InstanceTemp(std::path::PathBuf);
+
+impl InstanceTemp {
+    fn create(path: &std::path::Path) -> Result<Self, Error> {
+        let builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        builder
+            .create(path)
+            .map_err(|e| Error(format!("Creating private temporary directory: {e}")))?;
+        Ok(Self(path.to_owned()))
+    }
+}
+
+impl Drop for InstanceTemp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Middleware that injects the AppConfig into the Depot.
@@ -241,6 +279,7 @@ fn build_router(config: Arc<AppConfig>) -> Router {
     fn add_methods(router: Router, webdav_level: options::WebDavLevel) -> Router {
         let mut r = router
             .get(handler::get::handle_get)
+            .head(handler::head::handle_head)
             .put(handler::put::handle_put)
             .delete(handler::delete::handle_delete)
             .post(handler::archive::handle_post_archive)
@@ -286,8 +325,8 @@ fn build_router(config: Arc<AppConfig>) -> Router {
 
     let mut router = Router::new()
         .hoop(inject)
-        .hoop(hoops::additional_headers::AdditionalHeadersHoop)
-        .hoop(hoops::logging::LoggingHoop);
+        .hoop(hoops::logging::LoggingHoop)
+        .hoop(hoops::additional_headers::AdditionalHeadersHoop);
 
     // Add DAV header for WebDAV mode
     if webdav_level >= options::WebDavLevel::MkColMoveOnly {

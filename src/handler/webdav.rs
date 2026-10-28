@@ -1,6 +1,5 @@
 use std::fs::{self, Metadata};
 use std::io::{Error as IoError, ErrorKind as IoErrorKind, Write};
-use std::mem;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -67,15 +66,38 @@ pub async fn handle_propfind(req: &mut Request, depot: &mut Depot, res: &mut Res
         return;
     }
 
-    let depth = req
+    // Infinite-depth traversal is deliberately unsupported. A missing Depth
+    // header means infinity in WebDAV and receives the same finite-depth error.
+    let depth = match req
         .headers()
         .get("Depth")
-        .and_then(|v| v.to_str().ok())
-        .and_then(Depth::parse)
-        .unwrap_or(Depth::Zero);
+        .and_then(|value| value.to_str().ok())
+    {
+        Some("0") => Depth::Zero,
+        Some("1") => Depth::One,
+        None | Some("infinity") => {
+            res.status_code(StatusCode::FORBIDDEN);
+            res.headers_mut().insert(
+                salvo::http::header::CONTENT_TYPE,
+                "application/xml".parse().unwrap(),
+            );
+            res.write_body(r#"<?xml version="1.0" encoding="utf-8"?><D:error xmlns:D="DAV:"><D:propfind-finite-depth/></D:error>"#).ok();
+            return;
+        }
+        _ => {
+            set_error(
+                res,
+                StatusCode::BAD_REQUEST,
+                "400 Bad Request",
+                "Depth must be 0 or 1.",
+            );
+            return;
+        }
+    };
 
     if depth != Depth::Zero
-        && let Some(response) = crate::hoops::auth::check_tree_auth(req, &config, &url_path_raw)
+        && let Some(response) =
+            crate::hoops::auth::check_tree_auth_async(req, &config, &url_path_raw).await
     {
         *res = response;
         return;
@@ -763,6 +785,93 @@ struct ProppatchActionables {
     executable: Option<bool>,
 }
 
+struct ProppatchProperty {
+    name: OwnedXmlName,
+    value: String,
+    remove: bool,
+}
+
+fn prepare_proppatch(props: &[ProppatchProperty]) -> (ProppatchActionables, Vec<StatusCode>) {
+    let mut actionables = ProppatchActionables::default();
+    let mut statuses = Vec::with_capacity(props.len());
+    for prop in props {
+        let status = if prop.remove {
+            StatusCode::FORBIDDEN
+        } else if prop.name.namespace.as_deref() == Some(WEBDAV_XML_NAMESPACE_MICROSOFT.1) {
+            match prop.name.local_name.as_str() {
+                "Win32LastModifiedTime" | "Win32LastAccessTime" | "Win32CreationTime" => {
+                    if prop.name.local_name == "Win32CreationTime" && !cfg!(windows) {
+                        StatusCode::FORBIDDEN
+                    } else if let Some(value) = win32time(&prop.value) {
+                        match prop.name.local_name.as_str() {
+                            "Win32LastModifiedTime" => {
+                                actionables.Win32LastModifiedTime = Some(value)
+                            }
+                            "Win32LastAccessTime" => actionables.Win32LastAccessTime = Some(value),
+                            _ => actionables.Win32CreationTime = Some(value),
+                        }
+                        StatusCode::OK
+                    } else {
+                        StatusCode::CONFLICT
+                    }
+                }
+                _ => StatusCode::FORBIDDEN,
+            }
+        } else if cfg!(unix)
+            && prop.name.namespace.as_deref() == Some(WEBDAV_XML_NAMESPACE_APACHE.1)
+            && prop.name.local_name == "executable"
+        {
+            match prop.value.as_str() {
+                "T" => {
+                    actionables.executable = Some(true);
+                    StatusCode::OK
+                }
+                "F" => {
+                    actionables.executable = Some(false);
+                    StatusCode::OK
+                }
+                _ => StatusCode::CONFLICT,
+            }
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        statuses.push(status);
+    }
+    if statuses.iter().any(|status| *status != StatusCode::OK) {
+        for status in &mut statuses {
+            if *status == StatusCode::OK {
+                *status = StatusCode::FAILED_DEPENDENCY;
+            }
+        }
+    }
+    (actionables, statuses)
+}
+
+fn apply_proppatch(path: &Path, actionables: &ProppatchActionables) -> std::io::Result<()> {
+    let permissions = fs::metadata(path)?.permissions();
+    if let Some(executable) = actionables.executable {
+        set_executable(path, executable)?;
+    }
+    // Each platform updates all requested timestamps in one system call. If it
+    // fails after a chmod, restore the only preceding filesystem mutation.
+    if let Err(error) = set_times(
+        path,
+        actionables.Win32LastModifiedTime,
+        actionables.Win32LastAccessTime,
+        actionables.Win32CreationTime,
+    ) {
+        if actionables.executable.is_some() {
+            fs::set_permissions(path, permissions).map_err(|rollback| {
+                std::io::Error::other(format!(
+                    "property update failed: {error}; permission rollback failed: {rollback}"
+                ))
+            })?;
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 #[handler]
 pub async fn handle_proppatch(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
@@ -816,7 +925,7 @@ pub async fn handle_proppatch(req: &mut Request, depot: &mut Depot, res: &mut Re
         .ok()
         .map(|b| b.to_vec())
         .unwrap_or_default();
-    let (props, actionables) = match parse_proppatch(&body_bytes) {
+    let props = match parse_proppatch(&body_bytes) {
         Ok(pp) => pp,
         Err(e) => {
             let remote = req.remote_addr().to_string();
@@ -844,18 +953,34 @@ pub async fn handle_proppatch(req: &mut Request, depot: &mut Depot, res: &mut Re
         &format!("{} requested PROPPATCH on {}", remote, req_p.display()),
     );
 
-    set_times(
-        &req_p,
-        actionables.Win32LastModifiedTime,
-        actionables.Win32LastAccessTime,
-        actionables.Win32CreationTime,
-    );
-    if let Some(ex) = actionables.executable {
-        set_executable(&req_p, ex);
+    let (actionables, mut statuses) = prepare_proppatch(&props);
+    if statuses.iter().all(|status| *status == StatusCode::OK) {
+        static PROPERTY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let path = req_p.clone();
+        let Some(job) = config.spawn_blocking(move || {
+            let _guard = PROPERTY_LOCK
+                .lock()
+                .map_err(|_| IoError::other("property lock poisoned"))?;
+            apply_proppatch(&path, &actionables)
+        }) else {
+            res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+            return;
+        };
+        let result = job.await.unwrap_or_else(|error| Err(IoError::other(error)));
+        if let Err(error) = result {
+            log_msg(config.log, &format!("PROPPATCH failed: {error}"));
+            statuses.fill(if error.kind() == IoErrorKind::PermissionDenied {
+                StatusCode::FORBIDDEN
+            } else if error.kind() == IoErrorKind::Other {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::CONFLICT
+            });
+        }
     }
 
     let url = req.uri().to_string();
-    match write_proppatch_output(&props, &url) {
+    match write_proppatch_output(&props, &statuses, &url) {
         Ok(xml_bytes) => {
             res.status_code(StatusCode::MULTI_STATUS);
             res.headers_mut().insert(
@@ -877,9 +1002,7 @@ pub async fn handle_proppatch(req: &mut Request, depot: &mut Depot, res: &mut Re
     }
 }
 
-fn parse_proppatch(
-    body: &[u8],
-) -> Result<(Vec<(OwnedXmlName, String)>, ProppatchActionables), String> {
+fn parse_proppatch(body: &[u8]) -> Result<Vec<ProppatchProperty>, String> {
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
     enum State {
         Start,
@@ -887,6 +1010,7 @@ fn parse_proppatch(
         Action,
         Prop,
         InProp,
+        Done,
     }
 
     let mut xml = XmlReader::new_with_config(body, default_xml_parser_config());
@@ -894,7 +1018,6 @@ fn parse_proppatch(
     let mut props = vec![];
     let mut propname = None;
     let mut is_remove = false;
-    let mut actionables = ProppatchActionables::default();
     let mut propdata = String::new();
 
     loop {
@@ -903,29 +1026,31 @@ fn parse_proppatch(
         match (state, event) {
             (State::Start, XmlREvent::StartDocument { .. }) => (),
             (State::Start, XmlREvent::StartElement { ref name, .. })
-                if name.local_name == "propertyupdate" =>
+                if name.local_name == "propertyupdate"
+                    && name.namespace.as_deref() == Some("DAV:") =>
             {
                 state = State::PropertyUpdate
             }
 
             (State::PropertyUpdate, XmlREvent::StartElement { ref name, .. })
-                if name.local_name == "set" =>
+                if name.local_name == "set" && name.namespace.as_deref() == Some("DAV:") =>
             {
                 state = State::Action;
                 is_remove = false;
             }
             (State::PropertyUpdate, XmlREvent::StartElement { ref name, .. })
-                if name.local_name == "remove" =>
+                if name.local_name == "remove" && name.namespace.as_deref() == Some("DAV:") =>
             {
                 state = State::Action;
                 is_remove = true;
             }
             (State::PropertyUpdate, XmlREvent::EndElement { .. }) => {
-                return Ok((props, actionables));
+                state = State::Done;
             }
+            (State::Done, XmlREvent::EndDocument) if !props.is_empty() => return Ok(props),
 
             (State::Action, XmlREvent::StartElement { ref name, .. })
-                if name.local_name == "prop" =>
+                if name.local_name == "prop" && name.namespace.as_deref() == Some("DAV:") =>
             {
                 state = State::Prop
             }
@@ -939,27 +1064,18 @@ fn parse_proppatch(
 
             (State::InProp, XmlREvent::EndElement { name, .. }) => {
                 if Some(&name) == propname.as_ref() {
-                    props.push((name, mem::take(&mut propdata)));
+                    props.push(ProppatchProperty {
+                        name,
+                        value: std::mem::take(&mut propdata),
+                        remove: is_remove,
+                    });
                     state = State::Prop;
                 }
             }
             (State::InProp, XmlREvent::Characters(data)) if !is_remove => {
-                propdata = data;
-                match propname.as_ref().map(|n| n.local_name.as_str()) {
-                    Some("Win32CreationTime") => {
-                        actionables.Win32CreationTime = win32time(&propdata)
-                    }
-                    Some("Win32LastAccessTime") => {
-                        actionables.Win32LastAccessTime = win32time(&propdata)
-                    }
-                    Some("Win32LastModifiedTime") => {
-                        actionables.Win32LastModifiedTime = win32time(&propdata)
-                    }
-                    Some("executable") => actionables.executable = Some(propdata == "T"),
-                    _ => propdata.clear(),
-                }
+                propdata.push_str(&data);
             }
-            (State::InProp, _) => {}
+            (_, XmlREvent::Comment(_)) => {}
 
             (_, ev) => return Err(format!("Unexpected event {:?}", ev)),
         }
@@ -967,7 +1083,8 @@ fn parse_proppatch(
 }
 
 fn write_proppatch_output(
-    props: &[(OwnedXmlName, String)],
+    props: &[ProppatchProperty],
+    statuses: &[StatusCode],
     req_url: &str,
 ) -> Result<Vec<u8>, String> {
     let mut out = initialise_xml_output().map_err(|e| e.to_string())?;
@@ -978,6 +1095,8 @@ fn write_proppatch_output(
         start = start.ns(prefix, namespace);
     }
     out.write(start).map_err(|e| e.to_string())?;
+    out.write(XmlWEvent::start_element("D:response"))
+        .map_err(|e| e.to_string())?;
 
     out.write(XmlWEvent::start_element("D:href"))
         .map_err(|e| e.to_string())?;
@@ -986,28 +1105,32 @@ fn write_proppatch_output(
     out.write(XmlWEvent::end_element())
         .map_err(|e| e.to_string())?;
 
-    out.write(XmlWEvent::start_element("D:propstat"))
-        .map_err(|e| e.to_string())?;
-
-    for (name, _) in props {
+    for (prop, status) in props.iter().zip(statuses) {
+        out.write(XmlWEvent::start_element("D:propstat"))
+            .map_err(|e| e.to_string())?;
         out.write(XmlWEvent::start_element("D:prop"))
             .map_err(|e| e.to_string())?;
-        write_start_prop_element(&mut out, name.borrow()).map_err(|e| e.to_string())?;
+        write_start_prop_element(&mut out, prop.name.borrow()).map_err(|e| e.to_string())?;
         out.write(XmlWEvent::end_element())
             .map_err(|e| e.to_string())?;
         out.write(XmlWEvent::end_element())
             .map_err(|e| e.to_string())?;
+        out.write(XmlWEvent::start_element("D:status"))
+            .map_err(|e| e.to_string())?;
+        out.write(XmlWEvent::characters(&format!(
+            "HTTP/1.1 {} {}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("Unknown")
+        )))
+        .map_err(|e| e.to_string())?;
+        out.write(XmlWEvent::end_element())
+            .map_err(|e| e.to_string())?;
+
+        out.write(XmlWEvent::end_element())
+            .map_err(|e| e.to_string())?; // propstat
     }
-
-    out.write(XmlWEvent::start_element("D:status"))
-        .map_err(|e| e.to_string())?;
-    out.write(XmlWEvent::characters("HTTP/1.1 409 Conflict"))
-        .map_err(|e| e.to_string())?;
     out.write(XmlWEvent::end_element())
-        .map_err(|e| e.to_string())?;
-
-    out.write(XmlWEvent::end_element())
-        .map_err(|e| e.to_string())?; // propstat
+        .map_err(|e| e.to_string())?; // response
     out.write(XmlWEvent::end_element())
         .map_err(|e| e.to_string())?; // multistatus
 
@@ -1108,43 +1231,38 @@ pub async fn handle_copy(req: &mut Request, depot: &mut Depot, res: &mut Respons
 
 #[handler]
 pub async fn handle_move(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
-    let url_path_raw = req.uri().path().to_string();
-    let segments: Vec<&str> = url_path_raw.split('/').filter(|s| !s.is_empty()).collect();
-    let (req_p, ..) = resolve_path(
-        &config.hosted_directory.1,
-        &segments,
-        config.follow_symlinks,
-    );
-
-    let req_p_clone = req_p.clone();
-    let is_file = req_p
-        .metadata()
-        .map(|m| is_actually_file(&m.file_type(), &req_p))
-        .unwrap_or(true);
-
     handle_copy_move(req, depot, res, true).await;
-
-    // If copy_move succeeded (Created or NoContent), remove source
-    if res.status_code == Some(StatusCode::CREATED)
-        || res.status_code == Some(StatusCode::NO_CONTENT)
-    {
-        let removal = if is_file {
-            fs::remove_file(&req_p_clone)
-        } else {
-            fs::remove_dir_all(&req_p_clone)
-        };
-        if removal.is_err() {
-            res.status_code(StatusCode::LOCKED);
-            res.body(salvo::http::ResBody::None);
-        }
-    }
 }
 
 async fn handle_copy_move(req: &mut Request, depot: &mut Depot, res: &mut Response, is_move: bool) {
     let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
+    if let Some(response) = crate::hoops::auth::check_auth(req, &config) {
+        *res = response;
+        return;
+    }
+    let mut snapshot = Request::new();
+    *snapshot.uri_mut() = req.uri().clone();
+    *snapshot.headers_mut() = req.headers().clone();
+    *snapshot.method_mut() = req.method().clone();
+    let work_config = config.clone();
+    let Some(job) = config.spawn_blocking(move || {
+        let mut response = Response::new();
+        copy_move_work(&mut snapshot, &work_config, &mut response, is_move);
+        response
+    }) else {
+        res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+        return;
+    };
+    match job.await {
+        Ok(response) => *res = response,
+        Err(_) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+}
 
-    if let Some(resp) = crate::hoops::auth::check_auth(req, &config) {
+fn copy_move_work(req: &mut Request, config: &Arc<AppConfig>, res: &mut Response, is_move: bool) {
+    if let Some(resp) = crate::hoops::auth::check_auth(req, config) {
         *res = resp;
         return;
     }
@@ -1194,7 +1312,7 @@ async fn handle_copy_move(req: &mut Request, depot: &mut Depot, res: &mut Respon
         );
         return;
     };
-    if let Some(response) = crate::hoops::auth::check_auth_path(req, &config, &dest_path_str) {
+    if let Some(response) = crate::hoops::auth::check_auth_path(req, config, &dest_path_str) {
         *res = response;
         return;
     }
@@ -1282,7 +1400,7 @@ async fn handle_copy_move(req: &mut Request, depot: &mut Depot, res: &mut Respon
     let mut overwritten = false;
     if req_p.is_dir() && (depth != Depth::Zero || is_move) {
         for path in [&url_path_raw, &dest_path_str] {
-            if let Some(response) = crate::hoops::auth::check_tree_auth(req, &config, path) {
+            if let Some(response) = crate::hoops::auth::check_tree_auth(req, config, path) {
                 *res = response;
                 return;
             }
@@ -1293,16 +1411,30 @@ async fn handle_copy_move(req: &mut Request, depot: &mut Depot, res: &mut Respon
             res.status_code(StatusCode::PRECONDITION_FAILED);
             return;
         }
-        if !is_actually_file(&dest_p.metadata().unwrap().file_type(), &dest_p)
-            && fs::remove_dir(&dest_p).is_err()
-        {
+        if !is_move && dest_p.is_dir() && fs::remove_dir(&dest_p).is_err() {
             res.status_code(StatusCode::LOCKED);
             return;
         }
         overwritten = true;
     }
 
-    let source_file = is_actually_file(&req_p.metadata().unwrap().file_type(), &req_p);
+    if is_move {
+        if depth != Depth::Infinity {
+            set_error(
+                res,
+                StatusCode::BAD_REQUEST,
+                "400 Bad Request",
+                "MOVE requires Depth: infinity.",
+            );
+            return;
+        }
+        // A failed rename leaves the complete source in place. In particular,
+        // never emulate cross-device MOVE by deleting a partially copied tree.
+        copy_response(res, fs::rename(&req_p, &dest_p), overwritten);
+        return;
+    }
+
+    let source_file = req_p.is_file();
     if source_file {
         copy_response(res, fs::copy(&req_p, &dest_p).map(|_| ()), overwritten);
     } else {
@@ -1435,6 +1567,210 @@ fn set_error(res: &mut Response, status: StatusCode, title: &str, msg: &str) {
 }
 
 #[cfg(test)]
+mod move_tests {
+    use salvo::test::RequestBuilder;
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    #[tokio::test]
+    async fn moves_complete_directory_and_keeps_source_on_failure() {
+        let directory = TestDir::new();
+        fs::create_dir_all(directory.path().join("source/nested")).unwrap();
+        fs::write(directory.path().join("source/nested/file"), b"fixture").unwrap();
+        let service = Service::new(crate::build_router(config(directory.path(), &["-w", "-d"])));
+        let response = RequestBuilder::new(
+            "http://localhost/source",
+            salvo::http::Method::from_bytes(b"MOVE").unwrap(),
+        )
+        .add_header("Destination", "/destination", true)
+        .send(&service)
+        .await;
+        assert_eq!(response.status_code, Some(StatusCode::CREATED));
+        assert!(!directory.path().join("source").exists());
+        assert_eq!(
+            fs::read(directory.path().join("destination/nested/file")).unwrap(),
+            b"fixture"
+        );
+        let response = RequestBuilder::new(
+            "http://localhost/destination",
+            salvo::http::Method::from_bytes(b"MOVE").unwrap(),
+        )
+        .add_header("Destination", "/destination/child", true)
+        .send(&service)
+        .await;
+        assert!(!response.status_code.unwrap().is_success());
+        assert_eq!(
+            fs::read(directory.path().join("destination/nested/file")).unwrap(),
+            b"fixture"
+        );
+    }
+}
+
+#[cfg(test)]
+mod proppatch_tests {
+    use salvo::test::{RequestBuilder, ResponseExt};
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    fn request(body: &str) -> RequestBuilder {
+        RequestBuilder::new(
+            "http://localhost/file",
+            salvo::http::Method::from_bytes(b"PROPPATCH").unwrap(),
+        )
+        .add_header("Content-Type", "application/xml", true)
+        .body(body.to_owned())
+    }
+
+    #[tokio::test]
+    async fn supported_update_returns_valid_multistatus_and_actual_success() {
+        let directory = TestDir::new();
+        fs::write(directory.path().join("file"), b"fixture").unwrap();
+        let service = Service::new(crate::build_router(config(directory.path(), &["-w", "-d"])));
+        let mut response = request(r#"<D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:"><D:set><D:prop><Z:Win32LastModifiedTime>2020-09-13T12:26:40.123Z</Z:Win32LastModifiedTime></D:prop></D:set></D:propertyupdate>"#).send(&service).await;
+        assert_eq!(response.status_code, Some(StatusCode::MULTI_STATUS));
+        let xml = response.take_string().await.unwrap();
+        let mut stack = Vec::new();
+        let mut saw_response = false;
+        for event in XmlReader::new(xml.as_bytes()) {
+            match event.unwrap() {
+                XmlREvent::StartElement { name, .. } => {
+                    if name.local_name == "href" {
+                        assert_eq!(stack.last().map(String::as_str), Some("response"));
+                    }
+                    if name.local_name == "propstat" {
+                        assert_eq!(stack.last().map(String::as_str), Some("response"));
+                    }
+                    if name.local_name == "response" {
+                        saw_response = true;
+                    }
+                    stack.push(name.local_name);
+                }
+                XmlREvent::EndElement { .. } => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_response);
+        assert!(xml.contains("HTTP/1.1 200 OK"));
+        assert!(!xml.contains("409 Conflict"));
+        let modified = fs::metadata(directory.path().join("file"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+            1_600_000_000_123
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_property_prevents_every_change_in_the_request() {
+        let directory = TestDir::new();
+        let file = directory.path().join("file");
+        fs::write(&file, b"fixture").unwrap();
+        let original = fs::metadata(&file).unwrap().modified().unwrap();
+        let service = Service::new(crate::build_router(config(directory.path(), &["-w", "-d"])));
+        let mut response = request(r#"<D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:"><D:set><D:prop><Z:Win32LastModifiedTime>2020-09-13T12:26:40Z</Z:Win32LastModifiedTime><D:Win32LastModifiedTime>2021-01-01T00:00:00Z</D:Win32LastModifiedTime></D:prop></D:set></D:propertyupdate>"#).send(&service).await;
+        assert_eq!(response.status_code, Some(StatusCode::MULTI_STATUS));
+        let xml = response.take_string().await.unwrap();
+        assert!(xml.contains("403 Forbidden"));
+        assert!(xml.contains("424 Failed Dependency"));
+        assert!(!xml.contains("200 OK"));
+        assert_eq!(fs::metadata(file).unwrap().modified().unwrap(), original);
+    }
+
+    #[test]
+    fn invalid_values_and_live_property_removal_never_prepare_mutations() {
+        let props = parse_proppatch(br#"<D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:"><D:set><D:prop><Z:Win32LastModifiedTime>invalid</Z:Win32LastModifiedTime></D:prop></D:set><D:remove><D:prop><Z:Win32LastAccessTime/></D:prop></D:remove></D:propertyupdate>"#).unwrap();
+        let (_, statuses) = prepare_proppatch(&props);
+        assert_eq!(statuses, [StatusCode::CONFLICT, StatusCode::FORBIDDEN]);
+        assert!(
+            parse_proppatch(br#"<propertyupdate xmlns="wrong"><set/></propertyupdate>"#).is_err()
+        );
+        assert!(parse_proppatch(br#"<D:propertyupdate xmlns:D="DAV:"/>trailing"#).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_timestamp_update_restores_prior_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = TestDir::new();
+        let file = directory.path().join("file");
+        fs::write(&file, b"fixture").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+        let actionables = ProppatchActionables {
+            executable: Some(true),
+            Win32CreationTime: Some(1),
+            ..Default::default()
+        };
+        assert!(apply_proppatch(&file, &actionables).is_err());
+        assert_eq!(
+            fs::metadata(file).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+}
+
+#[cfg(test)]
+mod depth_limit_tests {
+    use salvo::prelude::*;
+    use salvo::test::{RequestBuilder, ResponseExt};
+
+    #[tokio::test]
+    async fn propfind_requires_finite_depth_before_traversing() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::create_dir(dir.path().join("child")).unwrap();
+        std::fs::write(dir.path().join("child/grandchild.txt"), b"data").unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &["-d"],
+        )));
+        for depth in ["infinity", "2", "invalid"] {
+            let mut response =
+                RequestBuilder::new("http://localhost/", "PROPFIND".parse().unwrap())
+                    .add_header("Depth", depth, true)
+                    .send(&service)
+                    .await;
+            assert_eq!(
+                response.status_code,
+                Some(if depth == "infinity" {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::BAD_REQUEST
+                })
+            );
+            if depth == "infinity" {
+                assert!(
+                    response
+                        .take_string()
+                        .await
+                        .unwrap()
+                        .contains("propfind-finite-depth")
+                );
+            }
+        }
+        let mut response = RequestBuilder::new("http://localhost/", "PROPFIND".parse().unwrap())
+            .add_header("Depth", "1", true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::MULTI_STATUS));
+        assert!(
+            !response
+                .take_string()
+                .await
+                .unwrap()
+                .contains("grandchild.txt")
+        );
+    }
+}
+
+#[cfg(test)]
 mod destination_auth_tests {
     use salvo::test::TestClient;
 
@@ -1502,5 +1838,49 @@ mod destination_auth_tests {
                 "{destination}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod blocking_admission_tests {
+    use salvo::test::RequestBuilder;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn busy_workers_do_not_mutate_copy_destinations_or_properties() {
+        let dir = crate::test_support::TestDir::new();
+        fs::write(dir.path().join("source"), b"fixture").unwrap();
+        fs::create_dir(dir.path().join("destination")).unwrap();
+        let before = fs::metadata(dir.path().join("source"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let config = crate::test_support::config(dir.path(), &["-w", "-d"]);
+        let _all_jobs = config
+            .blocking_jobs
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let service = Service::new(crate::build_router(config));
+        let response = RequestBuilder::new("http://localhost/source", "COPY".parse().unwrap())
+            .add_header("Destination", "/destination", true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(dir.path().join("destination").is_dir());
+        let response = RequestBuilder::new("http://localhost/source", "PROPPATCH".parse().unwrap())
+            .add_header("Content-Type", "application/xml", true)
+            .body(r#"<D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:"><D:set><D:prop><Z:Win32LastModifiedTime>2020-09-13T12:26:40Z</Z:Win32LastModifiedTime></D:prop></D:set></D:propertyupdate>"#)
+            .send(&service).await;
+        assert_eq!(response.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(
+            fs::metadata(dir.path().join("source"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before
+        );
     }
 }

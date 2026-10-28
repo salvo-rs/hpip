@@ -74,6 +74,10 @@ struct Cli {
     #[arg(short = 'w', long = "allow-write")]
     allow_write: bool,
 
+    /// Maximum upload size in bytes (suffixes K, M, G accepted). Default: 1G
+    #[arg(long = "max-upload-size", default_value = "1G")]
+    max_upload_size: String,
+
     /// Never generate dir listings. Default: false
     #[arg(short = 'l', long = "no-listings")]
     no_listings: bool,
@@ -150,11 +154,11 @@ struct Cli {
     #[arg(long = "gen-path-auth", num_args = 1)]
     gen_path_auth: Vec<String>,
 
-    /// Treat HEADER-NAME as proxy forwarded-for header when request comes from CIDR
+    /// Reserved proxy forwarding setting; currently rejected as unsupported
     #[arg(long = "proxy", num_args = 1)]
     proxy: Vec<String>,
 
-    /// Treat HEADER-NAME as proxy X-Original-URL header for redirects when request comes from CIDR
+    /// Reserved proxy redirect setting; currently rejected as unsupported
     #[arg(long = "proxy-redir", num_args = 1)]
     proxy_redir: Vec<String>,
 
@@ -162,7 +166,7 @@ struct Cli {
     #[arg(short = 'm', long = "mime-type", num_args = 1)]
     mime_type: Vec<String>,
 
-    /// Limit each request to returning BYTES per second, or 0 for unlimited. Default: 0
+    /// Bandwidth setting: only 0 (unlimited) is supported; nonzero values are rejected
     #[arg(long = "request-bandwidth")]
     request_bandwidth: Option<String>,
 
@@ -185,6 +189,7 @@ pub struct Options {
     pub strip_extensions: bool,
     pub try_404: Option<PathBuf>,
     pub allow_writes: bool,
+    pub upload_limit: u64,
     pub encode_fs: bool,
     pub encoded_filesystem_limit: Option<u64>,
     pub encoded_generated_limit: Option<u64>,
@@ -218,6 +223,21 @@ impl Options {
     }
 
     fn from_cli(cli: Cli) -> Result<Options, Error> {
+        if !cli.proxy.is_empty() || !cli.proxy_redir.is_empty() {
+            return Err(Error(
+                "Proxy header options are not implemented; remove --proxy and --proxy-redir".into(),
+            ));
+        }
+        if cli
+            .request_bandwidth
+            .as_deref()
+            .map(Self::bandwidth_parse)
+            .transpose()?
+            .flatten()
+            .is_some()
+        {
+            return Err(Error("Per-request bandwidth limiting is not implemented; remove --request-bandwidth or set it to 0".into()));
+        }
         let dir = &cli.dir;
         let dir_pb = std::fs::canonicalize(dir)
             .map_err(|_| Error(format!("Directory to host \"{}\" not found", dir)))?;
@@ -337,21 +357,18 @@ impl Options {
                 } else {
                     ("$TEMP".to_string(), env::temp_dir())
                 };
-                let suffix = dir_pb
-                    .to_string_lossy()
-                    .replace(r"\\?\", "")
-                    .replace(':', "")
-                    .replace('\\', "/")
-                    .replace('/', "-");
-                let suffix = if suffix.len() >= 255 - 5 {
-                    format!("hpip-{}", blake3::hash(suffix.as_bytes()).to_hex())
-                } else {
-                    format!(
-                        "hpip{}{}",
-                        if suffix.starts_with('-') { "" } else { "-" },
-                        suffix
-                    )
-                };
+                static NEXT_INSTANCE: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| Error(format!("Creating temporary namespace: {e}")))?
+                    .as_nanos();
+                let suffix = format!(
+                    ".hpip-internal-{}-{}-{}",
+                    std::process::id(),
+                    timestamp,
+                    NEXT_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                );
                 (
                     format!(
                         "{}{}{}",
@@ -371,6 +388,7 @@ impl Options {
             strip_extensions: cli.strip_extensions,
             try_404: cli.fallback_404.map(PathBuf::from),
             allow_writes: cli.allow_write,
+            upload_limit: Self::size_parse(&cli.max_upload_size)?,
             encode_fs: !cli.no_encode,
             encoded_filesystem_limit: cli
                 .encoded_filesystem
@@ -595,5 +613,44 @@ impl Options {
             })
             .map(|(hn, hd)| (hn.to_string(), hd.as_bytes().to_vec()))
             .ok_or_else(|| Error(format!("\"{}\" invalid header format", s)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_settings_that_cannot_be_enforced() {
+        let dir = crate::test_support::TestDir::new();
+        for flags in [
+            vec!["--proxy", "X-Forwarded-For:127.0.0.0/8"],
+            vec!["--proxy-redir", "X-Original-URL:127.0.0.0/8"],
+            vec!["--request-bandwidth", "1"],
+        ] {
+            assert!(
+                Options::parse_test(dir.path(), &flags)
+                    .unwrap_err()
+                    .0
+                    .contains("not implemented")
+            );
+        }
+        assert!(Options::parse_test(dir.path(), &["--request-bandwidth", "0"]).is_ok());
+    }
+
+    #[test]
+    fn instance_cleanup_does_not_remove_another_instances_files() {
+        let dir = crate::test_support::TestDir::new();
+        let flags = ["-t", dir.path().to_str().unwrap()];
+        let first = Options::parse_test(dir.path(), &flags).unwrap();
+        let second = Options::parse_test(dir.path(), &flags).unwrap();
+        assert_ne!(first.temp_directory.1, second.temp_directory.1);
+        let guard = crate::InstanceTemp::create(&first.temp_directory.1).unwrap();
+        let other = crate::InstanceTemp::create(&second.temp_directory.1).unwrap();
+        std::fs::write(second.temp_directory.1.join("keep"), "other instance").unwrap();
+        drop(guard);
+        assert!(second.temp_directory.1.join("keep").is_file());
+        assert!(crate::InstanceTemp::create(&second.temp_directory.1).is_err());
+        drop(other);
     }
 }

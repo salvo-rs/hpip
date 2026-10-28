@@ -3,12 +3,15 @@ use std::ffi::OsString;
 use std::fs;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Mutex, RwLock};
 
 use cidr::IpCidr;
 
 use crate::options::{LogLevel, Options, WebDavLevel};
+
+pub const MAX_CACHE_ENTRIES: usize = 4096;
+pub const NEGATIVE_CACHE_TTL_NS: u64 = 300 * 1_000_000_000;
 
 pub type CacheT<Cnt> = HashMap<(blake3::Hash, EncodingType), (Cnt, AtomicU64)>;
 
@@ -34,6 +37,7 @@ pub struct AppConfig {
     pub global_auth_data: Option<(String, Option<String>)>,
     pub path_auth_data: BTreeMap<String, Option<(String, Option<String>)>>,
     pub writes_temp_dir: Option<(String, PathBuf)>,
+    pub upload_limit: u64,
     pub encoded_temp_dir: Option<(String, PathBuf)>,
     #[allow(dead_code)]
     pub proxies: BTreeMap<IpCidr, String>,
@@ -44,6 +48,9 @@ pub struct AppConfig {
     #[allow(dead_code)]
     pub request_bandwidth: Option<NonZeroU64>,
 
+    pub blocking_jobs: std::sync::Arc<tokio::sync::Semaphore>,
+    accepting_blocking_jobs: AtomicBool,
+    pub encoding_gates: [Mutex<()>; 64],
     pub cache_gen: RwLock<CacheT<Vec<u8>>>,
     pub cache_fs_files: RwLock<HashMap<String, blake3::Hash>>,
     pub cache_fs: RwLock<CacheT<(PathBuf, bool, u64)>>,
@@ -99,7 +106,7 @@ impl AppConfig {
             }
         }
 
-        let mut allowed_methods = vec!["OPTIONS", "GET", "HEAD", "TRACE"]
+        let mut allowed_methods = vec!["OPTIONS", "GET", "HEAD"]
             .into_iter()
             .map(String::from)
             .collect::<Vec<_>>();
@@ -154,18 +161,22 @@ impl AppConfig {
                 opts.allow_writes,
                 "writes",
             ),
+            upload_limit: opts.upload_limit,
             encoded_temp_dir: AppConfig::temp_subdir(
                 &opts.temp_directory,
                 opts.encode_fs,
                 "encoded",
             ),
+            blocking_jobs: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+            accepting_blocking_jobs: AtomicBool::new(true),
+            encoding_gates: std::array::from_fn(|_| Mutex::new(())),
             cache_gen: Default::default(),
             cache_fs: Default::default(),
             cache_fs_files: Default::default(),
             cache_gen_size: Default::default(),
             cache_fs_size: Default::default(),
-            encoded_filesystem_limit: opts.encoded_filesystem_limit.unwrap_or(u64::MAX),
-            encoded_generated_limit: opts.encoded_generated_limit.unwrap_or(u64::MAX),
+            encoded_filesystem_limit: opts.encoded_filesystem_limit.unwrap_or(256 * 1024 * 1024),
+            encoded_generated_limit: opts.encoded_generated_limit.unwrap_or(16 * 1024 * 1024),
             encoded_prune: opts.encoded_prune,
             prune_interval: (opts.encoded_prune.unwrap_or(0) / 6).max(10),
             last_prune: AtomicU64::new(0),
@@ -176,6 +187,164 @@ impl AppConfig {
             request_bandwidth: opts.request_bandwidth,
             allowed_methods,
         }
+    }
+
+    /// Admit before spawning so overload cannot create an unbounded work queue.
+    pub fn spawn_blocking<F, R>(&self, work: F) -> Option<tokio::task::JoinHandle<R>>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        if !self.accepting_blocking_jobs.load(AtomicOrdering::SeqCst) {
+            return None;
+        }
+        let permit = self.blocking_jobs.clone().try_acquire_owned().ok()?;
+        if !self.accepting_blocking_jobs.load(AtomicOrdering::SeqCst) {
+            return None;
+        }
+        Some(tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        }))
+    }
+
+    /// Stop admission and wait for already admitted work before deleting its files.
+    pub async fn drain_blocking_jobs(&self) {
+        self.accepting_blocking_jobs
+            .store(false, AtomicOrdering::SeqCst);
+        let _all_jobs = self.blocking_jobs.clone().acquire_many_owned(4).await;
+    }
+
+    pub fn remember_hash(&self, key: String, hash: blake3::Hash) {
+        let mut index = self.cache_fs_files.write().unwrap();
+        if index.len() >= MAX_CACHE_ENTRIES && !index.contains_key(&key) {
+            // Metadata tags are only an optimization; dropping them is always safe.
+            index.clear();
+        }
+        index.insert(key, hash);
+    }
+
+    pub fn cache_negative(&self, key: (blake3::Hash, EncodingType)) {
+        let mut cache = self.cache_fs.write().unwrap();
+        if cache.len() >= MAX_CACHE_ENTRIES {
+            let oldest_negative = cache
+                .iter()
+                .filter(|(_, ((_, present, _), _))| !present)
+                .min_by_key(|(_, (_, atime))| atime.load(AtomicOrdering::Relaxed))
+                .map(|(key, _)| *key);
+            if let Some(key) = oldest_negative {
+                cache.remove(&key);
+            } else {
+                return;
+            }
+        }
+        cache.insert(
+            key,
+            (
+                (PathBuf::new(), false, 0),
+                AtomicU64::new(crate::util::precise_time_ns()),
+            ),
+        );
+    }
+
+    fn expire_negative_at(&self, now: u64) {
+        let mut indices = self.cache_fs_files.write().unwrap();
+        let mut cache = self.cache_fs.write().unwrap();
+        let ttl = self
+            .encoded_prune
+            .map(|seconds| seconds.saturating_mul(1_000_000_000))
+            .unwrap_or(NEGATIVE_CACHE_TTL_NS)
+            .min(NEGATIVE_CACHE_TTL_NS);
+        let mut removed = std::collections::HashSet::new();
+        cache.retain(|(hash, _), ((_, present, _), atime)| {
+            let retain = *present || now.saturating_sub(atime.load(AtomicOrdering::Relaxed)) <= ttl;
+            if !retain {
+                removed.insert(*hash);
+            }
+            retain
+        });
+        indices.retain(|_, hash| !removed.contains(hash));
+    }
+
+    /// Admit one completed cache file while holding the same lock as eviction.
+    pub fn cache_file(&self, key: (blake3::Hash, EncodingType), path: PathBuf, size: u64) -> bool {
+        if size > self.encoded_filesystem_limit {
+            return false;
+        }
+        let mut indices = self.cache_fs_files.write().unwrap();
+        let mut cache = self.cache_fs.write().unwrap();
+        if let Some(((old_path, true, _), _)) = cache.get(&key)
+            && *old_path != path
+            && let Err(error) = fs::remove_file(old_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return false;
+        }
+        cache.remove(&key);
+        let mut used = cache.values().map(|((_, _, size), _)| size).sum::<u64>();
+        while used > self.encoded_filesystem_limit - size || cache.len() >= MAX_CACHE_ENTRIES {
+            let Some(key) = cache
+                .iter()
+                .min_by_key(|(_, (_, time))| time.load(AtomicOrdering::Relaxed))
+                .map(|(key, _)| *key)
+            else {
+                return false;
+            };
+            let entry = cache.remove(&key).unwrap();
+            let ((old_path, present, old_size), _) = &entry;
+            if *present
+                && let Err(error) = fs::remove_file(old_path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                cache.insert(key, entry);
+                self.cache_fs_size.store(used, AtomicOrdering::Relaxed);
+                return false;
+            }
+            used -= old_size;
+            indices.retain(|_, hash| *hash != key.0);
+        }
+        cache.insert(
+            key,
+            (
+                (path, true, size),
+                AtomicU64::new(crate::util::precise_time_ns()),
+            ),
+        );
+        self.cache_fs_size
+            .store(used + size, AtomicOrdering::Relaxed);
+        true
+    }
+
+    pub fn cache_generated(&self, key: (blake3::Hash, EncodingType), data: &[u8]) {
+        let size = data.len() as u64;
+        if size > self.encoded_generated_limit {
+            return;
+        }
+        let mut cache = self.cache_gen.write().unwrap();
+        cache.remove(&key);
+        let mut used = cache
+            .values()
+            .map(|(data, _)| data.len() as u64)
+            .sum::<u64>();
+        while used > self.encoded_generated_limit - size || cache.len() >= MAX_CACHE_ENTRIES {
+            let Some(key) = cache
+                .iter()
+                .min_by_key(|(_, (_, time))| time.load(AtomicOrdering::Relaxed))
+                .map(|(key, _)| *key)
+            else {
+                return;
+            };
+            used -= cache.remove(&key).unwrap().0.len() as u64;
+        }
+        cache.insert(
+            key,
+            (
+                data.to_vec(),
+                AtomicU64::new(crate::util::precise_time_ns()),
+            ),
+        );
+        self.cache_gen_size
+            .store(used + size, AtomicOrdering::Relaxed);
     }
 
     pub fn create_temp_dir(&self, td: &Option<(String, PathBuf)>) {
@@ -207,6 +376,7 @@ impl AppConfig {
     }
 
     pub fn prune(&self) {
+        self.expire_negative_at(crate::util::precise_time_ns());
         use std::collections::HashSet;
 
         use crate::util::precise_time_ns;
@@ -392,5 +562,144 @@ pub fn log_msg(log: (bool, bool, bool), msg: &str) {
             }
             println!("{}", msg);
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_budget_tests {
+    use super::*;
+
+    #[test]
+    fn file_admission_enforces_total_without_a_prune_timer() {
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &["--encoded-filesystem", "150"]);
+        for number in 0..4u8 {
+            let path = dir.path().join(format!("cache-{number}"));
+            fs::write(&path, [number; 65]).unwrap();
+            assert!(config.cache_file((blake3::hash(&[number]), EncodingType::Gzip), path, 65));
+            assert!(config.cache_fs_size.load(AtomicOrdering::Relaxed) <= 150);
+            let actual = config
+                .cache_fs
+                .read()
+                .unwrap()
+                .values()
+                .map(|((path, ..), _)| fs::metadata(path).unwrap().len())
+                .sum::<u64>();
+            assert_eq!(actual, config.cache_fs_size.load(AtomicOrdering::Relaxed));
+        }
+        assert_eq!(config.cache_fs.read().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn generated_admission_counts_replacements_once_and_evicts() {
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &["--encoded-generated", "150"]);
+        let key = (blake3::hash(b"same"), EncodingType::Gzip);
+        config.cache_generated(key, &[1; 60]);
+        config.cache_generated(key, &[2; 65]);
+        assert_eq!(config.cache_gen_size.load(AtomicOrdering::Relaxed), 65);
+        for number in 0..4u8 {
+            config.cache_generated((blake3::hash(&[number]), EncodingType::Gzip), &[number; 65]);
+            assert!(config.cache_gen_size.load(AtomicOrdering::Relaxed) <= 150);
+        }
+        assert_eq!(config.cache_gen.read().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn busy_blocking_pool_rejects_work_without_queuing_it() {
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &[]);
+        let permits = config
+            .blocking_jobs
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let invoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let marker = invoked.clone();
+        assert!(
+            config
+                .spawn_blocking(move || marker.store(true, AtomicOrdering::SeqCst))
+                .is_none()
+        );
+        assert!(!invoked.load(AtomicOrdering::SeqCst));
+        drop(permits);
+        assert_eq!(config.spawn_blocking(|| 7).unwrap().await.unwrap(), 7);
+    }
+
+    #[test]
+    fn negative_entries_and_hash_indices_have_a_count_limit_and_expire() {
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &[]);
+        for number in 0..MAX_CACHE_ENTRIES + 32 {
+            let hash = blake3::hash(&number.to_le_bytes());
+            config.remember_hash(number.to_string(), hash);
+            config.cache_negative((hash, EncodingType::Gzip));
+        }
+        assert!(config.cache_fs_files.read().unwrap().len() <= MAX_CACHE_ENTRIES);
+        assert_eq!(config.cache_fs.read().unwrap().len(), MAX_CACHE_ENTRIES);
+        let latest = config
+            .cache_fs
+            .read()
+            .unwrap()
+            .values()
+            .map(|(_, atime)| atime.load(AtomicOrdering::Relaxed))
+            .max()
+            .unwrap();
+        config.expire_negative_at(latest + NEGATIVE_CACHE_TTL_NS + 1);
+        assert!(config.cache_fs.read().unwrap().is_empty());
+        assert!(config.cache_fs_files.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_eviction_keeps_the_entry_and_its_accounting() {
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &["--encoded-filesystem", "150"]);
+        let unremovable = dir.path().join("directory-cannot-be-unlinked-as-file");
+        fs::create_dir(&unremovable).unwrap();
+        assert!(config.cache_file(
+            (blake3::hash(b"first"), EncodingType::Gzip),
+            unremovable,
+            100
+        ));
+        let candidate = dir.path().join("candidate");
+        fs::write(&candidate, [1; 100]).unwrap();
+        assert!(!config.cache_file(
+            (blake3::hash(b"second"), EncodingType::Gzip),
+            candidate,
+            100
+        ));
+        assert_eq!(config.cache_fs.read().unwrap().len(), 1);
+        assert_eq!(config.cache_fs_size.load(AtomicOrdering::Relaxed), 100);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_existing_jobs_and_closes_admission() {
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &[]);
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let job = config
+            .spawn_blocking(move || {
+                started.send(()).unwrap();
+                wait_release.recv().unwrap();
+            })
+            .unwrap();
+        ready.await.unwrap();
+        let drain_config = config.clone();
+        let drain = tokio::spawn(async move { drain_config.drain_blocking_jobs().await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while config.accepting_blocking_jobs.load(AtomicOrdering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(config.spawn_blocking(|| ()).is_none());
+        assert!(!drain.is_finished());
+        release.send(()).unwrap();
+        job.await.unwrap();
+        drain.await.unwrap();
+        assert!(config.spawn_blocking(|| ()).is_none());
     }
 }

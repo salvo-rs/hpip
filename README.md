@@ -19,10 +19,12 @@ Quickly host files and directories over HTTP with support for WebDAV, compressio
 - **Range Requests** - Partial content serving for resumable downloads
 - **Symlink Control** - Follow, block, or sandbox symlinks
 - **Custom Headers** - Inject arbitrary HTTP headers
-- **Proxy Support** - X-Forwarded-For with CIDR whitelisting
 - **Cross-Platform** - Windows, macOS, and Linux
 
 ## Installation
+
+Rust 1.99 or newer is required. OpenSSL must be installed to import PKCS12
+identities with `--ssl` or generate a certificate with `--gen-ssl`.
 
 ```bash
 cargo install --path .
@@ -85,6 +87,9 @@ hpip -A /path/to/files
 | Option | Description |
 |--------|-------------|
 | `-w, --allow-write` | Enable PUT/DELETE for file upload and deletion |
+| `--max-upload-size <SIZE>` | Maximum upload size (default `1G`, suffixes K/M/G accepted) |
+
+Uploads stream to a private staging file and become visible at their destination only after successful completion. Requests larger than the configured limit return HTTP 413. An upload must finish within 15 minutes and must not stall for more than 30 seconds between body frames; interrupted uploads preserve an existing destination.
 
 ### Symlinks
 
@@ -101,6 +106,10 @@ hpip -A /path/to/files
 | `-D, --convenient-webdav` | Enable lite WebDAV (MKCOL, MOVE only) |
 | `-A, --archives` | Enable TAR/ZIP archive downloads |
 
+Write operations also require `-w`. PROPFIND supports explicit `Depth: 0` and
+`Depth: 1`; infinite depth is rejected. Cross-filesystem MOVE fails safely rather
+than copying and deleting the source. Uploads use staged atomic replacement.
+
 ### Security
 
 | Option | Description |
@@ -116,8 +125,8 @@ hpip -A /path/to/files
 
 | Option | Description |
 |--------|-------------|
-| `--proxy <HEADER:CIDR>` | Trust X-Forwarded-For from CIDR range |
-| `--proxy-redir <HEADER:CIDR>` | Trust X-Original-URL from CIDR range |
+| `--proxy <HEADER:CIDR>` | Reserved; currently rejected because forwarding is not implemented |
+| `--proxy-redir <HEADER:CIDR>` | Reserved; currently rejected because redirect forwarding is not implemented |
 | `-m, --mime-type <EXT:MIME>` | Override MIME type for extension |
 | `-H, --header <NAME:VALUE>` | Add custom response header |
 
@@ -129,6 +138,10 @@ hpip -A /path/to/files
 | `--encoded-generated <SIZE>` | Max memory cache for compressed responses |
 | `--encoded-prune <TIME>` | Prune cached files older than TIME (e.g. `1h`, `1d`) |
 
+Cache admission enforces aggregate limits even when no expiry interval is set.
+Defaults are 256 MiB on disk and 16 MiB for generated responses, with a separate
+4096-entry metadata cap. Negative compression decisions expire after five minutes.
+
 ### Logging
 
 | Option | Description |
@@ -137,11 +150,18 @@ hpip -A /path/to/files
 | `-Q, --quiet-time` | Don't prefix logs with timestamps |
 | `-c, --no-colour` | Disable colored output |
 
+Request completion records contain a request ID, method, path without its query,
+handler duration, explicit response status (or null before finalization), and
+expected body length when known. Handler duration excludes subsequent streaming
+transfer time; expected body length is not a count of bytes delivered. Configured
+passwords are not echoed at startup; generated credentials are displayed unless
+authentication output is suppressed.
+
 ### Bandwidth
 
 | Option | Description |
 |--------|-------------|
-| `--request-bandwidth <BYTES/S>` | Limit per-request bandwidth (0 = unlimited) |
+| `--request-bandwidth <BYTES/S>` | Only 0 (unlimited) is supported; nonzero limits are rejected |
 
 ## Collection Authorization
 
@@ -170,7 +190,6 @@ link cycles, more than 100,000 members, or nesting beyond 256 levels.
 | DELETE | Delete files (requires `-w`) |
 | POST | Create archives from directories |
 | OPTIONS | List allowed methods |
-| TRACE | Echo request headers |
 | PROPFIND | WebDAV directory listing (requires `-d`) |
 | PROPPATCH | WebDAV property modification (requires `-d`) |
 | MKCOL | WebDAV create directory (requires `-d` or `-D`) |
@@ -179,4 +198,19 @@ link cycles, more than 100,000 members, or nesting beyond 256 levels.
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0
+
+## Behavior and development checks
+
+File and archive responses use bounded streaming. Compression caches have total
+byte budgets and entry limits; `--encoded-prune` controls expiration independently
+of those capacity limits. Temporary state belongs to one server instance and is
+cleaned after graceful request and worker shutdown.
+
+Symlinks are followed by default. Use `-s` to block them or `-r` to restrict their
+targets to the hosted directory. These options do not establish an operating
+system sandbox against another process changing the filesystem concurrently.
+
+Run `cargo test --locked --all-targets`, `cargo clippy --locked --all-targets -- -D warnings`,
+and `cargo +nightly fmt --all --check`. Dependency policy and temporary test-only
+advisory decisions are documented in [docs/dependency-audit.md](docs/dependency-audit.md).

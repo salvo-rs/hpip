@@ -24,6 +24,44 @@ pub fn check_auth_path(req: &Request, config: &AppConfig, url_path: &str) -> Opt
     check_decoded_auth(req, config, &path)
 }
 
+/// Keep collection filesystem walks off the runtime and reject overload before
+/// spawning. Synchronous workers call `check_tree_auth` directly to avoid
+/// recursively reserving another worker slot.
+pub async fn check_tree_auth_async(
+    req: &Request,
+    config: &Arc<AppConfig>,
+    url_path: &str,
+) -> Option<Response> {
+    if config.path_auth_data.is_empty() {
+        // Without descendant rules, authorization never traverses a collection.
+        return check_auth_path(req, config, url_path);
+    }
+    let mut snapshot = Request::new();
+    *snapshot.uri_mut() = req.uri().clone();
+    *snapshot.method_mut() = req.method().clone();
+    *snapshot.headers_mut() = req.headers().clone();
+    *snapshot.remote_addr_mut() = req.remote_addr().clone();
+    let path = url_path.to_owned();
+    let work_config = config.clone();
+    let Some(job) = config.spawn_blocking(move || check_tree_auth(&snapshot, &work_config, &path))
+    else {
+        return Some(tree_worker_error(StatusCode::SERVICE_UNAVAILABLE));
+    };
+    match job.await {
+        Ok(result) => result,
+        Err(_) => Some(tree_worker_error(StatusCode::INTERNAL_SERVER_ERROR)),
+    }
+}
+
+fn tree_worker_error(status: StatusCode) -> Response {
+    let mut response = Response::new();
+    response.status_code(status);
+    response.render(Text::Plain(
+        "Collection authorization is temporarily unavailable.\n",
+    ));
+    response
+}
+
 /// Require authorization for the whole collection before producing output or
 /// mutating any member. Different descendant credentials can therefore make a
 /// collection operation unavailable until the policies are made consistent.
@@ -117,7 +155,7 @@ pub fn check_decoded_auth(req: &Request, config: &AppConfig, path: &str) -> Opti
 
     let remote = req.remote_addr().to_string();
     let method = req.method().to_string();
-    let url = req.uri().to_string();
+    let url = req.uri().path().to_string();
 
     if let Some(credentials) = supplied_credentials(req) {
         if required.iter().all(|expected| **expected == credentials) {
@@ -316,16 +354,25 @@ mod tests {
                 .send(&service)
                 .await;
             assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
-            let response = TestClient::get("http://localhost/collection/")
+            let mut response = TestClient::get("http://localhost/collection/")
                 .basic_auth("user", Some("pass"))
                 .add_header("Accept", accept, true)
                 .send(&service)
                 .await;
             assert_eq!(response.status_code, Some(StatusCode::OK));
+            assert!(!response.take_bytes(None).await.unwrap().is_empty());
         }
         for method in ["DELETE", "PROPFIND", "COPY", "MOVE"] {
             let mut request = TestClient::get("http://localhost/collection/")
-                .add_header("Depth", "infinity", true)
+                .add_header(
+                    "Depth",
+                    if method == "PROPFIND" {
+                        "1"
+                    } else {
+                        "infinity"
+                    },
+                    true,
+                )
                 .add_header("Destination", "/target", true)
                 .build();
             *request.method_mut() = method.parse().unwrap();
@@ -350,6 +397,120 @@ mod tests {
         assert!(!dir.path().join("target").exists());
     }
 
+    #[tokio::test]
+    async fn asynchronous_collection_checks_keep_the_same_authorization_results() {
+        let dir = TestDir::new();
+        std::fs::create_dir_all(dir.path().join("collection/private")).unwrap();
+        std::fs::write(dir.path().join("collection/private/file"), b"protected").unwrap();
+        let config = config(dir.path(), &["--path-auth", "collection/private=user:pass"]);
+        for password in [None, Some("wrong"), Some("pass")] {
+            let mut request = TestClient::get("http://localhost/collection/");
+            if let Some(password) = password {
+                request = request.basic_auth("user", Some(password));
+            }
+            let request = request.build();
+            let expected = check_tree_auth(&request, &config, "/collection/")
+                .map(|response| response.status_code);
+            let actual = check_tree_auth_async(&request, &config, "/collection/")
+                .await
+                .map(|response| response.status_code);
+            assert_eq!(actual, expected);
+            assert_eq!(actual.is_none(), password == Some("pass"));
+        }
+    }
+
+    #[tokio::test]
+    async fn busy_collection_workers_reject_async_routes_without_side_effects() {
+        let dir = TestDir::new();
+        std::fs::create_dir_all(dir.path().join("collection/private")).unwrap();
+        std::fs::write(dir.path().join("collection/private/file"), b"protected").unwrap();
+        let config = config(
+            dir.path(),
+            &[
+                "-w",
+                "-d",
+                "-A",
+                "--path-auth",
+                "collection/private=user:pass",
+            ],
+        );
+        let _workers = config
+            .blocking_jobs
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let service = Service::new(crate::build_router(config));
+        for method in ["GET", "HEAD", "PROPFIND", "DELETE", "POST"] {
+            let mut request = TestClient::get("http://localhost/collection/")
+                .basic_auth("user", Some("pass"))
+                .add_header("Accept", "application/x-tar", true)
+                .add_header("Depth", "1", true)
+                .add_header("Content-Type", "text/plain", true)
+                .body("vendor=http\narchive=yes-i-really-want-one\ntype=tar\n")
+                .build();
+            *request.method_mut() = method.parse().unwrap();
+            let response = service.handle(request).await;
+            assert_eq!(
+                response.status_code,
+                Some(StatusCode::SERVICE_UNAVAILABLE),
+                "{method}"
+            );
+            assert!(dir.path().join("collection/private/file").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_and_archive_complete_with_one_available_worker_slot() {
+        let dir = TestDir::new();
+        std::fs::create_dir_all(dir.path().join("collection/private")).unwrap();
+        std::fs::write(dir.path().join("collection/private/file"), b"protected").unwrap();
+        let config = config(
+            dir.path(),
+            &[
+                "-w",
+                "-d",
+                "-A",
+                "--path-auth",
+                "collection/private=user:pass",
+            ],
+        );
+        let _workers = config
+            .blocking_jobs
+            .clone()
+            .acquire_many_owned(3)
+            .await
+            .unwrap();
+        let service = Service::new(crate::build_router(config));
+        let mut request = TestClient::get("http://localhost/collection/")
+            .basic_auth("user", Some("pass"))
+            .add_header("Destination", "/copied", true)
+            .build();
+        *request.method_mut() = "COPY".parse().unwrap();
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(2), service.handle(request))
+                .await
+                .unwrap();
+        assert_eq!(response.status_code, Some(StatusCode::CREATED));
+        assert_eq!(
+            std::fs::read(dir.path().join("copied/private/file")).unwrap(),
+            b"protected"
+        );
+        let mut response = TestClient::get("http://localhost/collection/")
+            .basic_auth("user", Some("pass"))
+            .add_header("Accept", "application/x-tar", true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+        let bytes =
+            tokio::time::timeout(std::time::Duration::from_secs(2), response.take_bytes(None))
+                .await
+                .unwrap()
+                .unwrap();
+        let mut archive = tar::Archive::new(bytes.as_ref());
+        assert!(archive.entries().unwrap().any(|entry| entry.unwrap().path().unwrap() == std::path::Path::new("private/file")));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn recursive_alias_members_inherit_protection_outside_the_logical_subtree() {
@@ -363,7 +524,7 @@ mod tests {
             &["-d", "--path-auth", "private=user:pass"],
         )));
         let mut request = TestClient::get("http://localhost/public/")
-            .add_header("Depth", "infinity", true)
+            .add_header("Depth", "1", true)
             .build();
         *request.method_mut() = "PROPFIND".parse().unwrap();
         let response = service.handle(request).await;
