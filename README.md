@@ -1,6 +1,6 @@
 # hpip
 
-**Host These Things Please** - a modern async HTTP file server written in Rust.
+**hpip** is an asynchronous HTTP file server written in Rust.
 
 > This project is AI-generated and experimental in nature.
 
