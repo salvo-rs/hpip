@@ -302,8 +302,12 @@ async fn serve_open_file(
     let etag = file_etag(&metadata);
     let modified = file_time_modified(&metadata);
     let flen = file_length(&metadata, &req_p);
+    let encoding = file_encoding_candidate(req, config, req_p, flen);
 
+    // Byte ranges currently cover identity files only. Ignore Range when a
+    // coding was selected instead of changing the representation or its validator.
     if !is_404
+        && encoding.is_none()
         && let Some(range) = req
             .headers()
             .get(salvo::http::header::RANGE)
@@ -334,7 +338,7 @@ async fn serve_open_file(
     );
 
     // Check if we should try encoding
-    if let Some(encoding) = file_encoding_candidate(req, config, req_p, flen)
+    if let Some(encoding) = encoding
         && let Some(encoded) =
             encoded_file_job(config, &file, req_p, &etag, encoding, &remote).await
     {
