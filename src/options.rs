@@ -150,11 +150,11 @@ struct Cli {
     #[arg(long = "gen-path-auth", num_args = 1)]
     gen_path_auth: Vec<String>,
 
-    /// Treat HEADER-NAME as proxy forwarded-for header when request comes from CIDR
+    /// Reserved proxy forwarding setting; currently rejected as unsupported
     #[arg(long = "proxy", num_args = 1)]
     proxy: Vec<String>,
 
-    /// Treat HEADER-NAME as proxy X-Original-URL header for redirects when request comes from CIDR
+    /// Reserved proxy redirect setting; currently rejected as unsupported
     #[arg(long = "proxy-redir", num_args = 1)]
     proxy_redir: Vec<String>,
 
@@ -162,7 +162,7 @@ struct Cli {
     #[arg(short = 'm', long = "mime-type", num_args = 1)]
     mime_type: Vec<String>,
 
-    /// Limit each request to returning BYTES per second, or 0 for unlimited. Default: 0
+    /// Bandwidth setting: only 0 (unlimited) is supported; nonzero values are rejected
     #[arg(long = "request-bandwidth")]
     request_bandwidth: Option<String>,
 
