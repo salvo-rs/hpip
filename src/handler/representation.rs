@@ -4,7 +4,7 @@ use salvo::prelude::*;
 
 use super::archive::ArchiveType;
 use crate::config::AppConfig;
-use crate::util::guess_mime_type;
+use crate::util::{INDEX_EXTENSIONS, guess_mime_type, is_symlink};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Representation {
@@ -116,7 +116,22 @@ pub(super) fn select(req: &Request, config: &AppConfig, path: &Path) -> Represen
             .map(|index| guess_mime_type(&index, &config.mime_type_overrides))
             .unwrap_or_else(|| "text/html; charset=utf-8".to_owned())
     } else {
-        guess_mime_type(path, &config.mime_type_overrides)
+        let extension_candidate =
+            (config.strip_extensions && !path.exists() && path.extension().is_none())
+                .then(|| {
+                    INDEX_EXTENSIONS
+                        .iter()
+                        .map(|extension| path.with_extension(extension))
+                        .find(|candidate| {
+                            candidate.is_file()
+                                && !config.is_symlink_denied(is_symlink(candidate), candidate)
+                        })
+                })
+                .flatten();
+        guess_mime_type(
+            extension_candidate.as_deref().unwrap_or(path),
+            &config.mime_type_overrides,
+        )
     };
     let normal: mime::Mime = normal.parse().unwrap_or(mime::APPLICATION_OCTET_STREAM);
     let mut candidates = vec![(Representation::File, normal, false)];
@@ -232,6 +247,28 @@ mod tests {
                 assert_eq!(response.headers()["content-type"], expected, "{accept}");
                 response.take_bytes(None).await.unwrap();
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn extension_aliases_negotiate_the_selected_files_media_type() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::write(dir.path().join("asset.html"), "<p>fixture</p>").unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &["-x"],
+        )));
+        for request in [
+            TestClient::get("http://localhost/asset"),
+            TestClient::head("http://localhost/asset"),
+        ] {
+            let mut response = request
+                .add_header("Accept", "text/html", true)
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::OK));
+            assert_eq!(response.headers()["content-type"], "text/html");
+            response.take_bytes(None).await.unwrap();
         }
     }
 
