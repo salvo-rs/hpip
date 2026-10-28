@@ -381,6 +381,9 @@ fn write_propfind_recursive<W: Write>(
             .flatten()
             .collect();
         for f in entries {
+            if is_internal_name(&f.file_name()) {
+                continue;
+            }
             root_url.truncate(root_url_orig_len);
             root_url.push_str(&f.file_name().to_string_lossy());
 
@@ -443,6 +446,9 @@ fn write_propfind_recursive_custom<W: Write>(
             .flatten()
             .collect();
         for f in entries {
+            if is_internal_name(&f.file_name()) {
+                continue;
+            }
             root_url.truncate(root_url_orig_len);
             root_url.push_str(&f.file_name().to_string_lossy());
 
