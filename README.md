@@ -23,6 +23,9 @@ Quickly host files and directories over HTTP with support for WebDAV, compressio
 
 ## Installation
 
+Rust 1.99 or newer is required. OpenSSL must be installed to import PKCS12
+identities with `--ssl` or generate a certificate with `--gen-ssl`.
+
 ```bash
 cargo install --path .
 ```
@@ -103,6 +106,10 @@ Uploads stream to a private staging file and become visible at their destination
 | `-D, --convenient-webdav` | Enable lite WebDAV (MKCOL, MOVE only) |
 | `-A, --archives` | Enable TAR/ZIP archive downloads |
 
+Write operations also require `-w`. PROPFIND supports explicit `Depth: 0` and
+`Depth: 1`; infinite depth is rejected. Cross-filesystem MOVE fails safely rather
+than copying and deleting the source. Uploads use staged atomic replacement.
+
 ### Security
 
 | Option | Description |
@@ -139,6 +146,13 @@ Uploads stream to a private staging file and become visible at their destination
 | `-Q, --quiet-time` | Don't prefix logs with timestamps |
 | `-c, --no-colour` | Disable colored output |
 
+Request completion records contain a request ID, method, path without its query,
+handler duration, explicit response status (or null before finalization), and
+expected body length when known. Handler duration excludes subsequent streaming
+transfer time; expected body length is not a count of bytes delivered. Configured
+passwords are not echoed at startup; generated credentials are displayed unless
+authentication output is suppressed.
+
 ### Bandwidth
 
 | Option | Description |
@@ -172,7 +186,6 @@ link cycles, more than 100,000 members, or nesting beyond 256 levels.
 | DELETE | Delete files (requires `-w`) |
 | POST | Create archives from directories |
 | OPTIONS | List allowed methods |
-| TRACE | Echo request headers |
 | PROPFIND | WebDAV directory listing (requires `-d`) |
 | PROPPATCH | WebDAV property modification (requires `-d`) |
 | MKCOL | WebDAV create directory (requires `-d` or `-D`) |
@@ -181,4 +194,19 @@ link cycles, more than 100,000 members, or nesting beyond 256 levels.
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0
+
+## Behavior and development checks
+
+File and archive responses use bounded streaming. Compression caches have total
+byte budgets and entry limits; `--encoded-prune` controls expiration independently
+of those capacity limits. Temporary state belongs to one server instance and is
+cleaned after graceful request and worker shutdown.
+
+Symlinks are followed by default. Use `-s` to block them or `-r` to restrict their
+targets to the hosted directory. These options do not establish an operating
+system sandbox against another process changing the filesystem concurrently.
+
+Run `cargo test --locked --all-targets`, `cargo clippy --locked --all-targets -- -D warnings`,
+and `cargo +nightly fmt --all --check`. Dependency policy and temporary test-only
+advisory decisions are documented in [docs/dependency-audit.md](docs/dependency-audit.md).

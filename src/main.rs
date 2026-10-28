@@ -55,6 +55,7 @@ async fn result_main() -> Result<(), Error> {
         opts.tls_data = Some(tls::generate_tls_data(&opts.temp_directory)?);
     }
 
+    let generated_auth_paths = opts.generate_path_auth.clone();
     for path in mem::take(&mut opts.generate_path_auth) {
         opts.path_auth_data.insert(path, Some(generate_auth_data()));
     }
@@ -139,9 +140,12 @@ async fn result_main() -> Result<(), Error> {
         }
     }
 
-    if !opts.path_auth_data.is_empty() && opts.loglevel < options::LogLevel::NoAuth {
-        println!("Basic authentication credentials:");
+    if !generated_auth_paths.is_empty() && opts.loglevel < options::LogLevel::NoAuth {
+        println!("Generated basic authentication credentials:");
         for (path, creds) in &opts.path_auth_data {
+            if !generated_auth_paths.contains(path) {
+                continue;
+            }
             if let Some(ad) = creds {
                 let mut itr = ad.split(':');
                 let user = itr.next().unwrap_or("");

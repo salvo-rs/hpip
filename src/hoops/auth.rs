@@ -117,7 +117,7 @@ pub fn check_decoded_auth(req: &Request, config: &AppConfig, path: &str) -> Opti
 
     let remote = req.remote_addr().to_string();
     let method = req.method().to_string();
-    let url = req.uri().to_string();
+    let url = req.uri().path().to_string();
 
     if let Some(credentials) = supplied_credentials(req) {
         if required.iter().all(|expected| **expected == credentials) {
