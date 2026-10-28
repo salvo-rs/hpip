@@ -163,7 +163,9 @@ fn handle_nonexistent_get(
         && try_404.metadata().map(|m| !m.is_dir()).unwrap_or(false)
     {
         let mime_type = guess_mime_type(try_404, &config.mime_type_overrides);
-        if let Ok(data) = std::fs::read(try_404) {
+        if let Ok(file) = std::fs::File::open(try_404)
+            && let Ok(metadata) = file.metadata()
+        {
             res.status_code(StatusCode::NOT_FOUND);
             res.headers_mut().insert(
                 salvo::http::header::CONTENT_TYPE,
@@ -171,7 +173,12 @@ fn handle_nonexistent_get(
             );
             res.headers_mut()
                 .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-            res.write_body(data).ok();
+            let length = metadata.len();
+            res.headers_mut().insert(
+                salvo::http::header::CONTENT_LENGTH,
+                length.to_string().parse().unwrap(),
+            );
+            stream_file(res, tokio::fs::File::from_std(file), length);
             return;
         }
     }
@@ -697,8 +704,11 @@ fn handle_get_dir(
                             req_p.display()
                         ),
                     );
-                    if let Ok(data) = std::fs::read(&idx) {
-                        let metadata = idx.metadata().ok();
+                    if let Ok(file) = std::fs::File::open(&idx)
+                        && let Ok(metadata) = file.metadata()
+                    {
+                        let length = metadata.len();
+                        let metadata = Some(metadata);
                         res.status_code(StatusCode::OK);
                         res.headers_mut().insert(
                             salvo::http::header::CONTENT_TYPE,
@@ -721,7 +731,11 @@ fn handle_get_dir(
                         }
                         res.headers_mut()
                             .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-                        res.write_body(data).ok();
+                        res.headers_mut().insert(
+                            salvo::http::header::CONTENT_LENGTH,
+                            length.to_string().parse().unwrap(),
+                        );
+                        stream_file(res, tokio::fs::File::from_std(file), length);
                         return;
                     }
                 } else {
@@ -1240,5 +1254,33 @@ mod range_tests {
         )
         .unwrap();
         assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
+    async fn index_and_custom_error_files_also_stream() {
+        let dir = crate::test_support::TestDir::new();
+        let data = vec![31; 3 * 1024 * 1024];
+        std::fs::write(dir.path().join("index.html"), &data).unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &[],
+        )));
+        let mut response = TestClient::get("http://localhost/").send(&service).await;
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+        assert!(response.body.is_channel());
+        assert_eq!(response.take_bytes(None).await.unwrap().as_ref(), data);
+
+        let fallback = dir.path().join("error.html");
+        std::fs::write(&fallback, &data).unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &["--404", fallback.to_str().unwrap()],
+        )));
+        let mut response = TestClient::get("http://localhost/missing")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::NOT_FOUND));
+        assert!(response.body.is_channel());
+        assert_eq!(response.take_bytes(None).await.unwrap().as_ref(), data);
     }
 }
