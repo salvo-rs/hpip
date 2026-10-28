@@ -56,7 +56,7 @@ function Test-ArchiveChecksum {
         throw "Release checksum is missing or ambiguous for $ArchiveName"
     }
     $actual = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash
-    if ($actual -ine $expected[0]) {
+    if (-not [String]::Equals($actual, $expected[0], [StringComparison]::OrdinalIgnoreCase)) {
         throw "SHA256 verification failed for $ArchiveName"
     }
 }
