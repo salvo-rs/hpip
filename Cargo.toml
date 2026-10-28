@@ -10,7 +10,7 @@ homepage = "https://github.com/salvo-rs/hpip"
 build = "build.rs"
 
 [dependencies]
-salvo = { version = "0.95", features = ["rustls"] }
+salvo = { version = "0.95", default-features = false, features = ["server", "server-handle", "http1", "http2", "fix-http1-request-uri", "rustls", "aws-lc-rs"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -32,7 +32,7 @@ local-ip-address = "0.6"
 version = "8"
 
 [dependencies.zip]
-version = "8.6.0"
+version = "9"
 default-features = false
 features = ["deflate-flate2"]
 
@@ -47,6 +47,9 @@ libc = "0.2"
 
 [build-dependencies]
 base64 = "0.23"
+
+[dev-dependencies]
+salvo = { version = "0.95", default-features = false, features = ["test"] }
 
 [[bin]]
 name = "hpip"
