@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use salvo::prelude::*;
 
+use crate::util::entity_tag::{EntityTagList, request_tag_field};
+
 /// Evaluate file preconditions in RFC 9110 order before sending a body or Range.
 /// Returns true when a final 304 or 412 response has been prepared.
 pub fn preconditions(
@@ -9,39 +11,34 @@ pub fn preconditions(
     etag: Option<&str>,
     modified: DateTime<Utc>,
 ) -> bool {
-    let failed = if let Some(value) = req.headers().get("if-match") {
-        !value.to_str().is_ok_and(|value| {
-            value.split(',').any(|tag| {
-                let tag = tag.trim();
-                tag == "*"
-                    || (!tag.starts_with("W/")
-                        && etag.is_some_and(|etag| !etag.starts_with("W/") && tag == etag))
-            })
-        })
-    } else {
-        req.headers()
+    let matches_tag_field = |value: &str, weak| {
+        match EntityTagList::parse(value) {
+            // This function is called only after selecting an existing resource;
+            // a cold HEAD can know it exists without knowing its encoded ETag.
+            Some(EntityTagList::Any) => true,
+            Some(tags) => tags.matches(etag, weak),
+            None => false,
+        }
+    };
+    let failed = match request_tag_field(req, "if-match") {
+        Ok(Some(value)) => !matches_tag_field(&value, false),
+        Err(_) => true,
+        Ok(None) => req
+            .headers()
             .get("if-unmodified-since")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| DateTime::parse_from_rfc2822(value).ok())
-            .is_some_and(|date| modified.timestamp() > date.timestamp())
+            .is_some_and(|date| modified.timestamp() > date.timestamp()),
     };
-    let matches = if let Some(value) = req.headers().get("if-none-match") {
-        value.to_str().is_ok_and(|value| {
-            value.split(',').any(|tag| {
-                let tag = tag.trim();
-                tag == "*"
-                    || etag.is_some_and(|etag| {
-                        tag.strip_prefix("W/").unwrap_or(tag)
-                            == etag.strip_prefix("W/").unwrap_or(etag)
-                    })
-            })
-        })
-    } else {
-        req.headers()
+    let matches = match request_tag_field(req, "if-none-match") {
+        Ok(Some(value)) => matches_tag_field(&value, true),
+        Err(_) => false,
+        Ok(None) => req
+            .headers()
             .get("if-modified-since")
             .and_then(|h| h.to_str().ok())
             .and_then(|s| DateTime::parse_from_rfc2822(s).ok())
-            .is_some_and(|since| modified.timestamp() <= since.timestamp())
+            .is_some_and(|since| modified.timestamp() <= since.timestamp()),
     };
     if failed || matches {
         res.status_code(if failed {
@@ -84,6 +81,125 @@ mod tests {
     use salvo::test::{ResponseExt, TestClient};
 
     use super::*;
+
+    #[tokio::test]
+    async fn repeated_tag_field_lines_protect_reads_and_mutations() {
+        let dir = crate::test_support::TestDir::new();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, "original").unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &["-w"],
+        )));
+        let initial = TestClient::get("http://localhost/file.txt")
+            .send(&service)
+            .await;
+        let tag = initial.headers()["etag"].to_str().unwrap();
+        for method in ["GET", "HEAD"] {
+            for (header, expected) in [
+                ("If-Match", StatusCode::OK),
+                ("If-None-Match", StatusCode::NOT_MODIFIED),
+            ] {
+                let response = salvo::test::RequestBuilder::new(
+                    "http://localhost/file.txt",
+                    method.parse().unwrap(),
+                )
+                .add_header(header, r#""unrelated,*,tag""#, false)
+                .add_header(header, tag, false)
+                .send(&service)
+                .await;
+                assert_eq!(response.status_code, Some(expected), "{method} {header}");
+            }
+        }
+        for method in ["PUT", "DELETE"] {
+            let response = salvo::test::RequestBuilder::new(
+                "http://localhost/file.txt",
+                method.parse().unwrap(),
+            )
+            .add_header("If-None-Match", r#""unrelated""#, false)
+            .add_header("If-None-Match", tag, false)
+            .body("replacement")
+            .send(&service)
+            .await;
+            assert_eq!(response.status_code, Some(StatusCode::PRECONDITION_FAILED));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+
+            let response = salvo::test::RequestBuilder::new(
+                "http://localhost/file.txt",
+                method.parse().unwrap(),
+            )
+            .add_header("If-Match", tag, false)
+            .add_header("If-Match", "*", false)
+            .body("replacement")
+            .send(&service)
+            .await;
+            assert_eq!(response.status_code, Some(StatusCode::BAD_REQUEST));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+        }
+    }
+
+    #[tokio::test]
+    async fn quoted_commas_never_turn_an_opaque_tag_into_a_wildcard() {
+        let dir = crate::test_support::TestDir::new();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, "original").unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &["-w"],
+        )));
+        let initial = TestClient::get("http://localhost/file.txt")
+            .send(&service)
+            .await;
+        let tag = initial.headers()["etag"].to_str().unwrap();
+        for method in ["GET", "HEAD"] {
+            for (header, value, expected) in [
+                (
+                    "If-None-Match",
+                    r#""prefix,*,suffix""#.to_owned(),
+                    StatusCode::OK,
+                ),
+                (
+                    "If-Match",
+                    r#""prefix,*,suffix""#.to_owned(),
+                    StatusCode::PRECONDITION_FAILED,
+                ),
+                (
+                    "If-None-Match",
+                    format!(r#""ignored,comma", W/{tag}"#),
+                    StatusCode::NOT_MODIFIED,
+                ),
+                (
+                    "If-Match",
+                    format!(r#""ignored,comma", {tag}"#),
+                    StatusCode::OK,
+                ),
+            ] {
+                let response = salvo::test::RequestBuilder::new(
+                    "http://localhost/file.txt",
+                    method.parse().unwrap(),
+                )
+                .add_header(header, value, true)
+                .send(&service)
+                .await;
+                assert_eq!(response.status_code, Some(expected), "{method} {header}");
+            }
+        }
+        let response = TestClient::put("http://localhost/file.txt")
+            .add_header("If-Match", r#""prefix,*,suffix""#, true)
+            .body("replacement")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::PRECONDITION_FAILED));
+        let response = salvo::test::RequestBuilder::new(
+            "http://localhost/file.txt",
+            salvo::http::Method::DELETE,
+        )
+        .add_header("If-Match", r#""prefix", *"#, true)
+        .send(&service)
+        .await;
+        assert_eq!(response.status_code, Some(StatusCode::BAD_REQUEST));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "original");
+    }
 
     #[tokio::test]
     async fn unsupported_ranges_fall_back_to_a_full_conditional_response() {

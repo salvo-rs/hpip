@@ -5,6 +5,8 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use salvo::prelude::*;
 
+use super::entity_tag::{EntityTagList, request_tag_field};
+
 /// Coordinate conditional checks and namespace mutations made by this server.
 /// Filesystem changes by other processes remain outside this process lock.
 pub static MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -29,30 +31,29 @@ impl WriteConditions {
                 })
                 .transpose()
         };
-        Ok(Self {
-            if_match: header("if-match")?,
-            if_none_match: header("if-none-match")?,
+        let conditions = Self {
+            if_match: request_tag_field(req, "if-match")?,
+            if_none_match: request_tag_field(req, "if-none-match")?,
             // Invalid dates are ignored, as required for this conditional header.
             if_unmodified_since: header("if-unmodified-since")?
                 .and_then(|date| DateTime::parse_from_rfc2822(&date).ok())
                 .map(|date| date.with_timezone(&Utc)),
-        })
+        };
+        for value in [&conditions.if_match, &conditions.if_none_match]
+            .into_iter()
+            .flatten()
+        {
+            if EntityTagList::parse(value).is_none() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+        Ok(conditions)
     }
 
     pub(crate) fn allows(&self, current: Option<&str>) -> bool {
+        let current = current.map(|tag| format!("\"{tag}\""));
         let matches = |value: &str, weak: bool| {
-            if value.trim() == "*" {
-                return current.is_some();
-            }
-            value.split(',').any(|candidate| {
-                let candidate = candidate.trim();
-                let candidate = if weak {
-                    candidate.strip_prefix("W/").unwrap_or(candidate)
-                } else {
-                    candidate
-                };
-                current.is_some_and(|etag| candidate == format!("\"{etag}\""))
-            })
+            EntityTagList::parse(value).is_some_and(|tags| tags.matches(current.as_deref(), weak))
         };
         self.if_match
             .as_deref()
