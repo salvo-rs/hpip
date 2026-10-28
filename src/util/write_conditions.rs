@@ -52,14 +52,13 @@ impl WriteConditions {
                 .is_none_or(|value| !matches(value, true))
     }
 
-    pub(crate) fn allows_metadata(&self, current: Option<&Metadata>) -> io::Result<bool> {
-        let etag = current.map(super::file_etag);
-        if !self.allows(etag.as_deref()) {
+    pub(crate) fn allows_snapshot(&self, current: Option<&(Metadata, String)>) -> io::Result<bool> {
+        if !self.allows(current.map(|(_, etag)| etag.as_str())) {
             return Ok(false);
         }
         // If-Match takes precedence over If-Unmodified-Since.
         if self.if_match.is_none()
-            && let (Some(date), Some(metadata)) = (&self.if_unmodified_since, current)
+            && let (Some(date), Some((metadata, _))) = (&self.if_unmodified_since, current)
         {
             let modified: DateTime<Utc> = metadata.modified()?.into();
             return Ok(modified.timestamp() <= date.timestamp());
@@ -68,12 +67,12 @@ impl WriteConditions {
     }
 
     pub(crate) fn allows_path(&self, path: &Path) -> io::Result<bool> {
-        let metadata = match std::fs::metadata(path) {
-            Ok(metadata) => Some(metadata),
+        let snapshot = match super::path_metadata_and_etag(path) {
+            Ok(snapshot) => Some(snapshot),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
-        self.allows_metadata(metadata.as_ref())
+        self.allows_snapshot(snapshot.as_ref())
     }
 
     pub(crate) fn create_only(&self) -> bool {

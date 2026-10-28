@@ -41,8 +41,18 @@ pub fn win32_file_attributes(meta: &Metadata, path: &Path) -> u32 {
 }
 
 /// `st_dev`-`st_ino`-`st_mtime`
-pub fn file_etag(m: &Metadata) -> String {
+pub fn file_etag(m: &Metadata, _: &impl AsRawFd) -> io::Result<String> {
+    Ok(metadata_etag(m))
+}
+
+fn metadata_etag(m: &Metadata) -> String {
     format!("{:x}-{}-{}.{}", m.dev(), m.ino(), m.mtime(), m.mtime_nsec())
+}
+
+pub fn path_metadata_and_etag(path: &Path) -> io::Result<(Metadata, String)> {
+    let metadata = fs::metadata(path)?;
+    let etag = metadata_etag(&metadata);
+    Ok((metadata, etag))
 }
 
 /// Check if file is marked executable

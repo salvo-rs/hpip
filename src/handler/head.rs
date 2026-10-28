@@ -152,7 +152,13 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
         res.status_code(StatusCode::NOT_FOUND);
         return;
     };
-    let etag = file_etag(&metadata);
+    let etag = match file_etag(&metadata, &source) {
+        Ok(etag) => etag,
+        Err(_) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            return;
+        }
+    };
     let mut response_etag = Some(format!("\"{etag}\""));
     let mut length = Some(file_length(&metadata, &path));
     let identity_allowed = crate::encoding::request_accept_encoding(req)
