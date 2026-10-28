@@ -97,6 +97,28 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
     if is_file {
         handle_get_file(req, res, &config, &req_p, false).await;
     } else {
+        if let Some(index) = index_file(&config, &req_p) {
+            let index_url = format!(
+                "{}/index.{}",
+                url_path_raw.trim_end_matches('/'),
+                index
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .unwrap_or("")
+            );
+            if let Some(response) = crate::hoops::auth::check_auth_path(req, &config, &index_url) {
+                *res = response;
+                return;
+            }
+            if !url_path_raw.ends_with('/') {
+                res.status_code(StatusCode::SEE_OTHER);
+                res.headers_mut()
+                    .insert("location", format!("{url_path_raw}/").parse().unwrap());
+                return;
+            }
+            handle_get_file(req, res, &config, &index, false).await;
+            return;
+        }
         let mut work_request = Request::new();
         *work_request.uri_mut() = req.uri().clone();
         *work_request.headers_mut() = req.headers().clone();
@@ -109,7 +131,6 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
                 &work_config,
                 &req_p,
                 &url_path_str,
-                &url_path_raw,
             );
             response
         }) {
@@ -124,6 +145,22 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
             }
         }
     }
+}
+
+/// GET and HEAD select the same authorized default-index candidate.
+pub(super) fn index_file(config: &AppConfig, directory: &Path) -> Option<PathBuf> {
+    config
+        .check_indices
+        .then(|| {
+            INDEX_EXTENSIONS
+                .iter()
+                .map(|extension| directory.join("index").with_extension(extension))
+                .find(|candidate| {
+                    candidate.is_file()
+                        && !config.is_symlink_denied(is_symlink(candidate), candidate)
+                })
+        })
+        .flatten()
 }
 
 fn handle_invalid_url(_req: &mut Request, res: &mut Response, config: &AppConfig) {
@@ -723,88 +760,7 @@ fn handle_get_dir(
     config: &AppConfig,
     req_p: &Path,
     url_path: &str,
-    url_path_raw: &str,
 ) {
-    // Check for index files
-    if config.check_indices {
-        let mut idx = req_p.join("index");
-        for ext in INDEX_EXTENSIONS {
-            idx.set_extension(ext);
-            if idx.exists() && !config.is_symlink_denied(is_symlink(&idx), &idx) {
-                let index_url = format!("{}/index.{}", url_path_raw.trim_end_matches('/'), ext);
-                if let Some(response) = crate::hoops::auth::check_auth_path(req, config, &index_url)
-                {
-                    *res = response;
-                    return;
-                }
-                // Check if URL ends with slash
-                if url_path_raw.ends_with('/') {
-                    // Serve index file directly
-                    let mime_type = guess_mime_type(&idx, &config.mime_type_overrides);
-                    let remote = req.remote_addr().to_string();
-                    log_msg(
-                        config.log,
-                        &format!(
-                            "{} found index file for directory {}",
-                            remote,
-                            req_p.display()
-                        ),
-                    );
-                    if let Ok(file) = std::fs::File::open(&idx)
-                        && let Ok(metadata) = file.metadata()
-                    {
-                        let length = metadata.len();
-                        let metadata = Some(metadata);
-                        res.status_code(StatusCode::OK);
-                        res.headers_mut().insert(
-                            salvo::http::header::CONTENT_TYPE,
-                            mime_type.parse().unwrap(),
-                        );
-                        if let Some(ref m) = metadata {
-                            let etag = file_etag(m);
-                            res.headers_mut().insert(
-                                salvo::http::header::ETAG,
-                                format!("\"{}\"", etag).parse().unwrap(),
-                            );
-                            res.headers_mut().insert(
-                                salvo::http::header::LAST_MODIFIED,
-                                file_time_modified(m)
-                                    .format("%a, %d %b %Y %T GMT")
-                                    .to_string()
-                                    .parse()
-                                    .unwrap(),
-                            );
-                        }
-                        res.headers_mut()
-                            .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-                        res.headers_mut().insert(
-                            salvo::http::header::CONTENT_LENGTH,
-                            length.to_string().parse().unwrap(),
-                        );
-                        stream_file(res, tokio::fs::File::from_std(file), length);
-                        return;
-                    }
-                } else {
-                    // Redirect to add trailing slash
-                    let new_url = format!("{}/", url_path_raw);
-                    log_msg(
-                        config.log,
-                        &format!(
-                            "Redirecting to {} - found index file index.{}",
-                            new_url, ext
-                        ),
-                    );
-                    res.status_code(StatusCode::SEE_OTHER);
-                    res.headers_mut()
-                        .insert(salvo::http::header::LOCATION, new_url.parse().unwrap());
-                    res.headers_mut()
-                        .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-                    return;
-                }
-            }
-        }
-    }
-
     if !config.generate_listings {
         handle_nonexistent_get(req, res, config, req_p, url_path);
         return;
