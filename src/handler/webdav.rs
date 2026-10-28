@@ -1172,30 +1172,19 @@ async fn handle_copy_move(req: &mut Request, depot: &mut Depot, res: &mut Respon
         }
     };
 
-    // Extract path from destination URL
-    let dest_path_str = if dest_url.starts_with("http://") || dest_url.starts_with("https://") {
-        // Parse as full URL, extract path portion
-        match dest_url.find("://") {
-            Some(idx) => {
-                let after_scheme = &dest_url[idx + 3..];
-                match after_scheme.find('/') {
-                    Some(slash_idx) => after_scheme[slash_idx..].to_string(),
-                    None => "/".to_string(),
-                }
-            }
-            None => dest_url.clone(),
-        }
-    } else if dest_url.starts_with('/') {
-        dest_url.clone()
-    } else {
+    let Some(dest_path_str) = local_destination_path(req, &dest_url) else {
         set_error(
             res,
             StatusCode::BAD_REQUEST,
             "400 Bad Request",
-            "Destination URL invalid.",
+            "Destination must be a local resource URL without a query.",
         );
         return;
     };
+    if let Some(response) = crate::hoops::auth::check_auth_path(req, &config, &dest_path_str) {
+        *res = response;
+        return;
+    }
     let dest_segments: Vec<&str> = dest_path_str
         .split('/')
         .filter(|s: &&str| !s.is_empty())
@@ -1327,6 +1316,37 @@ async fn handle_copy_move(req: &mut Request, depot: &mut Depot, res: &mut Respon
     }
 }
 
+fn local_destination_path(req: &Request, destination: &str) -> Option<String> {
+    let uri: salvo::http::uri::Uri = destination.parse().ok()?;
+    if uri.query().is_some() || destination.starts_with("//") {
+        return None;
+    }
+    if let Some(authority) = uri.authority() {
+        let scheme = uri.scheme_str()?;
+        let request_scheme = req.uri().scheme_str().unwrap_or("http");
+        if !matches!(scheme, "http" | "https") || scheme != request_scheme {
+            return None;
+        }
+        let request_authority = req
+            .uri()
+            .authority()
+            .cloned()
+            .or_else(|| req.headers().get("Host")?.to_str().ok()?.parse().ok())?;
+        let default_port = if scheme == "https" { 443 } else { 80 };
+        if !authority
+            .host()
+            .eq_ignore_ascii_case(request_authority.host())
+            || authority.port_u16().unwrap_or(default_port)
+                != request_authority.port_u16().unwrap_or(default_port)
+        {
+            return None;
+        }
+    } else if uri.scheme().is_some() || !destination.starts_with('/') {
+        return None;
+    }
+    Some(uri.path().to_string())
+}
+
 fn copy_response(res: &mut Response, op_result: std::io::Result<()>, overwritten: bool) {
     match op_result {
         Ok(_) => {
@@ -1391,4 +1411,75 @@ fn set_error(res: &mut Response, status: StatusCode, title: &str, msg: &str) {
     res.headers_mut()
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
     res.render(Text::Html(body));
+}
+
+#[cfg(test)]
+mod destination_auth_tests {
+    use salvo::test::TestClient;
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    #[tokio::test]
+    async fn copy_and_move_require_target_credentials_before_mutation() {
+        let dir = TestDir::new();
+        fs::create_dir(dir.path().join("private")).unwrap();
+        fs::write(dir.path().join("public.txt"), "source").unwrap();
+        fs::write(dir.path().join("private/target.txt"), "original").unwrap();
+        let service = Service::new(crate::build_router(config(
+            dir.path(),
+            &["-w", "-d", "--path-auth", "private=user:pass"],
+        )));
+        for method in ["COPY", "MOVE"] {
+            let mut request = TestClient::get("http://localhost/public.txt")
+                .add_header("Destination", "/%70rivate/target.txt", true)
+                .build();
+            *request.method_mut() = method.parse().unwrap();
+            let response = service.handle(request).await;
+            assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+            assert_eq!(
+                fs::read_to_string(dir.path().join("private/target.txt")).unwrap(),
+                "original"
+            );
+            assert!(dir.path().join("public.txt").exists());
+        }
+        let mut request = TestClient::get("http://localhost/public.txt")
+            .basic_auth("user", Some("pass"))
+            .add_header("Destination", "http://localhost/private/new.txt", true)
+            .build();
+        *request.method_mut() = "COPY".parse().unwrap();
+        let response = service.handle(request).await;
+        assert_eq!(response.status_code, Some(StatusCode::CREATED));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("private/new.txt")).unwrap(),
+            "source"
+        );
+    }
+
+    #[test]
+    fn destinations_must_have_the_request_origin_and_no_query() {
+        let request = TestClient::get("http://localhost/source").build();
+        assert_eq!(
+            local_destination_path(&request, "/target"),
+            Some("/target".into())
+        );
+        assert_eq!(
+            local_destination_path(&request, "http://LOCALHOST:80/target"),
+            Some("/target".into())
+        );
+        for destination in [
+            "http://other.test/target",
+            "http://localhost:81/target",
+            "https://localhost/target",
+            "/target?query",
+            "//other.test/target",
+            "relative/target",
+            "ftp://localhost/target",
+        ] {
+            assert!(
+                local_destination_path(&request, destination).is_none(),
+                "{destination}"
+            );
+        }
+    }
 }
