@@ -10,6 +10,8 @@ mod tls;
 pub mod util;
 
 #[cfg(test)]
+mod shutdown_tests;
+#[cfg(test)]
 mod test_support;
 
 use std::hash::{BuildHasher, RandomState};
@@ -181,36 +183,36 @@ async fn result_main() -> Result<(), Error> {
 
     // Spawn cache pruning task if needed
     let config_prune = config.clone();
-    if opts.encoded_prune.is_some() {
+    let prune_task = if opts.encoded_prune.is_some() {
         let interval = config.prune_interval;
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
                 config_prune.prune();
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
     // Graceful shutdown on Ctrl-C
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to listen for Ctrl-C");
-        let _ = shutdown_tx.send(());
-    });
-
     let server = Server::new(DynTcpAcceptors::new(vec![acceptor]));
-
-    tokio::select! {
-        _ = server.serve(router) => {}
-        _ = shutdown_rx => {
-            config::log_msg(config.log, "Shutting down...");
+    let server_handle = server.handle();
+    let signal_task = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            server_handle.stop_graceful(Some(std::time::Duration::from_secs(30)));
         }
+    });
+    let result = server.try_serve(router).await;
+    signal_task.abort();
+    let _ = signal_task.await;
+    if let Some(task) = prune_task {
+        task.abort();
+        let _ = task.await;
     }
 
     config.clean_temp_dirs(&opts.temp_directory, opts.generate_tls);
-    Ok(())
+    result.map_err(|e| Error(format!("Serving requests: {e}")))
 }
 
 /// Own only the directory created exclusively for this process instance.
