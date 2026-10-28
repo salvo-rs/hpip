@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use salvo::prelude::*;
 
 use crate::config::{AppConfig, EncodingType, log_msg};
-use crate::encoding::compress::*;
 use crate::encoding::*;
 use crate::options::WebDavLevel;
 use crate::util::*;
