@@ -1,6 +1,7 @@
 pub mod display;
 pub mod file;
 pub mod html;
+pub mod namespace;
 pub mod os;
 pub mod path;
 pub mod time;

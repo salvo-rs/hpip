@@ -1463,7 +1463,30 @@ fn copy_move_work(req: &mut Request, config: &Arc<AppConfig>, res: &mut Response
         }
         // A failed rename leaves the complete source in place. In particular,
         // never emulate cross-device MOVE by deleting a partially copied tree.
-        copy_response(res, fs::rename(&req_p, &dest_p), overwritten);
+        let result = if overwrite {
+            fs::rename(&req_p, &dest_p)
+        } else {
+            crate::util::namespace::rename_no_replace(&req_p, &dest_p)
+        };
+        copy_response(res, result, overwritten);
+        return;
+    }
+
+    if !req_p.is_file() && depth == Depth::One {
+        set_error(
+            res,
+            StatusCode::BAD_REQUEST,
+            "400 Bad Request",
+            "COPY requires Depth: 0 or infinity.",
+        );
+        return;
+    }
+    if !overwrite {
+        copy_response(
+            res,
+            crate::util::namespace::copy_no_replace(&req_p, &dest_p, depth == Depth::Infinity),
+            false,
+        );
         return;
     }
 
@@ -1541,6 +1564,9 @@ fn copy_response(res: &mut Response, op_result: std::io::Result<()>, overwritten
             } else {
                 res.status_code(StatusCode::CREATED);
             }
+        }
+        Err(error) if error.kind() == IoErrorKind::AlreadyExists => {
+            res.status_code(StatusCode::PRECONDITION_FAILED);
         }
         Err(_) => {
             res.status_code(StatusCode::INSUFFICIENT_STORAGE);
