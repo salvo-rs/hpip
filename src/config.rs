@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Mutex, RwLock};
 
 use cidr::IpCidr;
@@ -48,6 +48,7 @@ pub struct AppConfig {
     pub request_bandwidth: Option<NonZeroU64>,
 
     pub blocking_jobs: std::sync::Arc<tokio::sync::Semaphore>,
+    accepting_blocking_jobs: AtomicBool,
     pub encoding_gates: [Mutex<()>; 64],
     pub cache_gen: RwLock<CacheT<Vec<u8>>>,
     pub cache_fs_files: RwLock<HashMap<String, blake3::Hash>>,
@@ -165,6 +166,7 @@ impl AppConfig {
                 "encoded",
             ),
             blocking_jobs: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+            accepting_blocking_jobs: AtomicBool::new(true),
             encoding_gates: std::array::from_fn(|_| Mutex::new(())),
             cache_gen: Default::default(),
             cache_fs: Default::default(),
@@ -191,11 +193,24 @@ impl AppConfig {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
+        if !self.accepting_blocking_jobs.load(AtomicOrdering::SeqCst) {
+            return None;
+        }
         let permit = self.blocking_jobs.clone().try_acquire_owned().ok()?;
+        if !self.accepting_blocking_jobs.load(AtomicOrdering::SeqCst) {
+            return None;
+        }
         Some(tokio::task::spawn_blocking(move || {
             let _permit = permit;
             work()
         }))
+    }
+
+    /// Stop admission and wait for already admitted work before deleting its files.
+    pub async fn drain_blocking_jobs(&self) {
+        self.accepting_blocking_jobs
+            .store(false, AtomicOrdering::SeqCst);
+        let _all_jobs = self.blocking_jobs.clone().acquire_many_owned(4).await;
     }
 
     pub fn remember_hash(&self, key: String, hash: blake3::Hash) {
@@ -654,5 +669,35 @@ mod cache_budget_tests {
         ));
         assert_eq!(config.cache_fs.read().unwrap().len(), 1);
         assert_eq!(config.cache_fs_size.load(AtomicOrdering::Relaxed), 100);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_existing_jobs_and_closes_admission() {
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &[]);
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let job = config
+            .spawn_blocking(move || {
+                started.send(()).unwrap();
+                wait_release.recv().unwrap();
+            })
+            .unwrap();
+        ready.await.unwrap();
+        let drain_config = config.clone();
+        let drain = tokio::spawn(async move { drain_config.drain_blocking_jobs().await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while config.accepting_blocking_jobs.load(AtomicOrdering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(config.spawn_blocking(|| ()).is_none());
+        assert!(!drain.is_finished());
+        release.send(()).unwrap();
+        job.await.unwrap();
+        drain.await.unwrap();
+        assert!(config.spawn_blocking(|| ()).is_none());
     }
 }
