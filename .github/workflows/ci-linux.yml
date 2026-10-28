@@ -74,6 +74,7 @@ jobs:
       - name: Validate delivery scripts
         run: |
           python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+          node --test .github/scripts/test-ui.cjs
           bash -n install.sh
           bash .github/scripts/test-install.sh
       - name: Build release

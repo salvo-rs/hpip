@@ -37,20 +37,21 @@ function make_confirm_icon(element, callback) {
 
 
 function rename(fname_from, fname_to, status_out) {
-  let root_url = window.location.origin + window.location.pathname;
-  if(!root_url.endsWith("/"))
-    root_url += "/";
-
   if(fname_from.endsWith("/"))
     fname_from = fname_from.substr(0, fname_from.length - 1);
   if(fname_to.endsWith("/"))
     fname_to   = fname_to.substr(0, fname_to.length - 1);
 
+  let source_url = url_for_filename(fname_from, status_out);
+  let destination_url = url_for_filename(fname_to, status_out);
+  if(source_url === null || destination_url === null)
+    return;
+
   if(fname_from == fname_to)  // 403 Forbidden nominally
     window.location.reload();
   else
-    make_request("MOVE", root_url + encodeURI(fname_from), status_out, function(request) {
-      request.setRequestHeader("Destination", root_url + encodeURI(fname_to));
+    make_request("MOVE", source_url, status_out, function(request) {
+      request.setRequestHeader("Destination", destination_url);
     });
 }
 
@@ -75,12 +76,20 @@ function make_filename_input(input_container, initial, callback) {
 }
 
 function create_new_directory(fname, status_out) {
+  let req_url = url_for_filename(fname, status_out);
+  if(req_url !== null)
+    make_request("MKCOL", req_url, status_out);
+}
+
+function url_for_filename(fname, status_out) {
+  if(!fname || fname === "." || fname === ".." || /[/\\]/.test(fname)) {
+    status_out.textContent = "Enter a file name without path separators.";
+    return null;
+  }
   let req_url = window.location.origin + window.location.pathname;
   if(!req_url.endsWith("/"))
     req_url += "/";
-  req_url += encodeURI(fname);
-
-  make_request("MKCOL", req_url, status_out);
+  return req_url + encodeURIComponent(fname);
 }
 
 let make_request_error = false;
