@@ -93,7 +93,32 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
         }
         handle_get_file(req, res, &config, &req_p, false).await;
     } else {
-        handle_get_dir(req, res, &config, &req_p, &url_path_str, &url_path_raw);
+        let mut work_request = Request::new();
+        *work_request.uri_mut() = req.uri().clone();
+        *work_request.headers_mut() = req.headers().clone();
+        let work_config = config.clone();
+        match config.spawn_blocking(move || {
+            let mut response = Response::new();
+            handle_get_dir(
+                &mut work_request,
+                &mut response,
+                &work_config,
+                &req_p,
+                &url_path_str,
+                &url_path_raw,
+            );
+            response
+        }) {
+            Some(job) => match job.await {
+                Ok(response) => *res = response,
+                Err(_) => {
+                    res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            },
+            None => {
+                res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+            }
+        }
     }
 }
 
@@ -172,7 +197,7 @@ fn handle_nonexistent_get(
 async fn handle_get_file(
     req: &mut Request,
     res: &mut Response,
-    config: &AppConfig,
+    config: &Arc<AppConfig>,
     req_p: &Path,
     is_404: bool,
 ) {
@@ -256,7 +281,7 @@ async fn handle_get_file(
             .get(salvo::http::header::ACCEPT_ENCODING)
             .and_then(|v| v.to_str().ok())
         && let Some(encoding) = response_encoding(accept_enc)
-        && let Some(encoded_data) = try_encoded_file(config, req_p, &etag, encoding, &remote)
+        && let Some(encoded_data) = encoded_file_job(config, req_p, &etag, encoding, &remote).await
     {
         res.status_code(if is_404 {
             StatusCode::NOT_FOUND
@@ -339,6 +364,24 @@ async fn handle_get_file(
     res.headers_mut()
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
     stream_file(res, file, flen);
+}
+
+async fn encoded_file_job(
+    config: &Arc<AppConfig>,
+    path: &Path,
+    etag: &str,
+    encoding: EncodingType,
+    remote: &str,
+) -> Option<Vec<u8>> {
+    let work_config = config.clone();
+    let path = path.to_path_buf();
+    let etag = etag.to_owned();
+    let remote = remote.to_owned();
+    config
+        .spawn_blocking(move || try_encoded_file(&work_config, &path, &etag, encoding, &remote))?
+        .await
+        .ok()
+        .flatten()
 }
 
 fn try_encoded_file(
@@ -1090,5 +1133,32 @@ mod range_tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn plain_files_stay_available_when_expensive_jobs_are_busy() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::write(dir.path().join("data.txt"), b"available").unwrap();
+        let config = crate::test_support::config(dir.path(), &["-A"]);
+        let permits = config
+            .blocking_jobs
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let service = Service::new(crate::build_router(config.clone()));
+        let mut response = TestClient::get("http://localhost/data.txt")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+        assert_eq!(response.take_string().await.unwrap(), "available");
+        let response = TestClient::get("http://localhost/").send(&service).await;
+        assert_eq!(response.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+        let response = TestClient::get("http://localhost/")
+            .add_header("Accept", "application/x-tar", true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+        drop(permits);
     }
 }

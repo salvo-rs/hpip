@@ -44,6 +44,7 @@ pub struct AppConfig {
     #[allow(dead_code)]
     pub request_bandwidth: Option<NonZeroU64>,
 
+    pub blocking_jobs: std::sync::Arc<tokio::sync::Semaphore>,
     pub encoding_gates: [Mutex<()>; 64],
     pub cache_gen: RwLock<CacheT<Vec<u8>>>,
     pub cache_fs_files: RwLock<HashMap<String, blake3::Hash>>,
@@ -160,6 +161,7 @@ impl AppConfig {
                 opts.encode_fs,
                 "encoded",
             ),
+            blocking_jobs: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             encoding_gates: std::array::from_fn(|_| Mutex::new(())),
             cache_gen: Default::default(),
             cache_fs: Default::default(),
@@ -178,6 +180,19 @@ impl AppConfig {
             request_bandwidth: opts.request_bandwidth,
             allowed_methods,
         }
+    }
+
+    /// Admit before spawning so overload cannot create an unbounded work queue.
+    pub fn spawn_blocking<F, R>(&self, work: F) -> Option<tokio::task::JoinHandle<R>>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let permit = self.blocking_jobs.clone().try_acquire_owned().ok()?;
+        Some(tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        }))
     }
 
     /// Admit one completed cache file while holding the same lock as eviction.
@@ -507,5 +522,27 @@ mod cache_budget_tests {
             assert!(config.cache_gen_size.load(AtomicOrdering::Relaxed) <= 150);
         }
         assert_eq!(config.cache_gen.read().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn busy_blocking_pool_rejects_work_without_queuing_it() {
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &[]);
+        let permits = config
+            .blocking_jobs
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let invoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let marker = invoked.clone();
+        assert!(
+            config
+                .spawn_blocking(move || marker.store(true, AtomicOrdering::SeqCst))
+                .is_none()
+        );
+        assert!(!invoked.load(AtomicOrdering::SeqCst));
+        drop(permits);
+        assert_eq!(config.spawn_blocking(|| 7).unwrap().await.unwrap(), 7);
     }
 }

@@ -233,16 +233,22 @@ fn serve_archive(req: &Request, res: &mut Response, config: &AppConfig, archive_
 
     let sender = res.channel();
     let runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        let mut writer = ArchiveWriter { sender, runtime };
-        let result = match archive_type {
-            ArchiveType::Tar => write_tar_body(&req_p, &mut writer),
-            ArchiveType::Zip => write_zip_body(&req_p, allow_encoding, &mut writer),
-        };
-        if let Err(error) = result {
-            writer.sender.send_error(error);
-        }
-    });
+    if config
+        .spawn_blocking(move || {
+            let mut writer = ArchiveWriter { sender, runtime };
+            let result = match archive_type {
+                ArchiveType::Tar => write_tar_body(&req_p, &mut writer),
+                ArchiveType::Zip => write_zip_body(&req_p, allow_encoding, &mut writer),
+            };
+            if let Err(error) = result {
+                writer.sender.send_error(error);
+            }
+        })
+        .is_none()
+    {
+        res.body(salvo::http::ResBody::None);
+        res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
 
 /// Bridge synchronous archive writers to a backpressured response channel.
