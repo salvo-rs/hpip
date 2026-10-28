@@ -188,8 +188,9 @@ pub fn check_decoded_auth(req: &Request, config: &AppConfig, path: &str) -> Opti
 fn supplied_credentials(req: &Request) -> Option<Credentials> {
     if let Some(auth_header) = req.headers().get(salvo::http::header::AUTHORIZATION)
         && let Ok(auth_str) = auth_header.to_str()
-        && auth_str.starts_with("Basic ")
-        && let Ok(decoded) = base64_decode(&auth_str[6..])
+        && let Some((scheme, credentials)) = auth_str.split_once(' ')
+        && scheme.eq_ignore_ascii_case("Basic")
+        && let Ok(decoded) = base64_decode(credentials.trim_start_matches(' '))
         && let Ok(cred_str) = String::from_utf8(decoded)
     {
         let (username, password) = if let Some(pos) = cred_str.find(':') {
@@ -299,6 +300,41 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
 #[cfg(test)]
 mod tests {
     use salvo::test::{ResponseExt, TestClient};
+
+    #[tokio::test]
+    async fn basic_credentials_accept_scheme_casing_and_space_separators() {
+        let dir = TestDir::new();
+        std::fs::create_dir(dir.path().join("private")).unwrap();
+        std::fs::write(dir.path().join("private/file.txt"), "protected").unwrap();
+        for flags in [
+            &["--auth", "user:pass"][..],
+            &["--path-auth", "private=user:pass"][..],
+        ] {
+            let service = Service::new(crate::build_router(config(dir.path(), flags)));
+            for prefix in ["Basic ", "basic ", "BASIC ", "bAsIc ", "Basic  "] {
+                let mut response = TestClient::get("http://localhost/private/file.txt")
+                    .add_header("Authorization", format!("{prefix}dXNlcjpwYXNz"), true)
+                    .send(&service)
+                    .await;
+                assert_eq!(response.status_code, Some(StatusCode::OK), "{prefix:?}");
+                assert_eq!(response.take_string().await.unwrap(), "protected");
+            }
+            for value in [
+                "basic dXNlcjp3cm9uZw==",
+                "BasicX dXNlcjpwYXNz",
+                "BasicdXNlcjpwYXNz",
+                "Basic\tdXNlcjpwYXNz",
+                "basic ",
+            ] {
+                let response = TestClient::get("http://localhost/private/file.txt")
+                    .add_header("Authorization", value, true)
+                    .send(&service)
+                    .await;
+                assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+                assert!(response.headers().contains_key("www-authenticate"));
+            }
+        }
+    }
 
     #[tokio::test]
     async fn internal_names_are_hidden_from_json_and_webdav_collections() {
