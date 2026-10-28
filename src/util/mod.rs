@@ -1,4 +1,5 @@
 pub mod display;
+pub(crate) mod entity_tag;
 pub mod file;
 pub mod html;
 pub mod metadata;
