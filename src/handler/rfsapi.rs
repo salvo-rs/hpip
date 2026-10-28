@@ -166,6 +166,7 @@ fn handle_get_raw_fs_dir(
         .into_iter()
         .flatten()
         .filter_map(|p| p.ok())
+        .filter(|entry| !is_internal_name(&entry.file_name()))
         .filter(|f| {
             let fp = f.path();
             let symlink = is_symlink(&fp);

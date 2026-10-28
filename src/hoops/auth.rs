@@ -24,6 +24,73 @@ pub fn check_auth_path(req: &Request, config: &AppConfig, url_path: &str) -> Opt
     check_decoded_auth(req, config, &path)
 }
 
+/// Require authorization for the whole collection before producing output or
+/// mutating any member. Different descendant credentials can therefore make a
+/// collection operation unavailable until the policies are made consistent.
+pub fn check_tree_auth(req: &Request, config: &AppConfig, url_path: &str) -> Option<Response> {
+    if let Some(response) = check_auth_path(req, config, url_path) {
+        return Some(response);
+    }
+    if config.path_auth_data.is_empty() {
+        return None;
+    }
+    let path = decoded_url_path(url_path)?;
+    let mut roots = vec![path.clone()];
+    if let Some(actual_path) = canonical_auth_path(config, &path) {
+        roots.push(actual_path);
+    }
+    // Include configured future descendants when authorizing a COPY target.
+    for rule in config.path_auth_data.keys() {
+        if roots
+            .iter()
+            .any(|root| root.is_empty() || path_rule_matches(rule, root))
+            && let Some(response) = check_decoded_auth(req, config, rule)
+        {
+            return Some(response);
+        }
+    }
+
+    let root = config.hosted_directory.1.join(&path);
+    if !root.exists() {
+        return None;
+    }
+    // Inspect real members as well, including directory aliases that point to
+    // protected resources outside the requested logical subtree.
+    for (count, entry) in walkdir::WalkDir::new(&root)
+        .follow_links(config.follow_symlinks)
+        .max_depth(256)
+        .into_iter()
+        .filter_entry(|entry| !crate::util::path::is_internal_name(entry.file_name()))
+        .enumerate()
+    {
+        let Ok(entry) = entry else {
+            return Some(collection_error(
+                "Cannot authorize every collection member.\n",
+            ));
+        };
+        if count >= 100_000 || (entry.depth() == 256 && entry.file_type().is_dir()) {
+            return Some(collection_error(
+                "Collection authorization limit exceeded.\n",
+            ));
+        }
+        let Ok(relative) = entry.path().strip_prefix(&config.hosted_directory.1) else {
+            return Some(collection_error("Invalid collection member path.\n"));
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if let Some(response) = check_decoded_auth(req, config, &relative) {
+            return Some(response);
+        }
+    }
+    None
+}
+
+fn collection_error(message: &'static str) -> Response {
+    let mut response = Response::new();
+    response.status_code(StatusCode::FORBIDDEN);
+    response.render(Text::Plain(message));
+    response
+}
+
 type Credentials = (String, Option<String>);
 
 /// A decoded resource name is never percent-decoded a second time.
@@ -194,6 +261,114 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
 #[cfg(test)]
 mod tests {
     use salvo::test::{ResponseExt, TestClient};
+
+    #[tokio::test]
+    async fn internal_names_are_hidden_from_json_and_webdav_collections() {
+        let dir = TestDir::new();
+        std::fs::create_dir(dir.path().join(".HPIP-INTERNAL-state")).unwrap();
+        std::fs::write(dir.path().join(".hpip-upload-staging"), "incomplete").unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "visible").unwrap();
+        let service = Service::new(crate::build_router(config(dir.path(), &["-d"])));
+        let mut response = TestClient::get("http://localhost/")
+            .add_header("Accept", "application/json", true)
+            .send(&service)
+            .await;
+        let json = response.take_string().await.unwrap();
+        assert!(json.contains("visible.txt"));
+        assert!(!json.to_ascii_lowercase().contains(".hpip-"));
+        for body in [
+            "",
+            "<D:propfind xmlns:D=\"DAV:\"><D:prop><D:getcontentlength/></D:prop></D:propfind>",
+        ] {
+            let mut request = TestClient::get("http://localhost/")
+                .add_header("Depth", "1", true)
+                .text(body)
+                .build();
+            *request.method_mut() = "PROPFIND".parse().unwrap();
+            let mut response = service.handle(request).await;
+            assert_eq!(response.status_code, Some(StatusCode::MULTI_STATUS));
+            let xml = response.take_string().await.unwrap();
+            assert!(xml.contains("visible.txt"));
+            assert!(!xml.to_ascii_lowercase().contains(".hpip-"));
+        }
+    }
+
+    #[tokio::test]
+    async fn collection_operations_require_all_descendant_policies() {
+        let dir = TestDir::new();
+        std::fs::create_dir_all(dir.path().join("collection/private")).unwrap();
+        std::fs::write(dir.path().join("collection/private/file.txt"), "protected").unwrap();
+        let service = Service::new(crate::build_router(config(
+            dir.path(),
+            &[
+                "-w",
+                "-d",
+                "-A",
+                "--path-auth",
+                "collection/private=user:pass",
+                "--path-auth",
+                "target/private=other:secret",
+            ],
+        )));
+        for accept in ["application/x-tar", "application/zip"] {
+            let response = TestClient::get("http://localhost/collection/")
+                .add_header("Accept", accept, true)
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+            let response = TestClient::get("http://localhost/collection/")
+                .basic_auth("user", Some("pass"))
+                .add_header("Accept", accept, true)
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::OK));
+        }
+        for method in ["DELETE", "PROPFIND", "COPY", "MOVE"] {
+            let mut request = TestClient::get("http://localhost/collection/")
+                .add_header("Depth", "infinity", true)
+                .add_header("Destination", "/target", true)
+                .build();
+            *request.method_mut() = method.parse().unwrap();
+            let response = service.handle(request).await;
+            assert_eq!(
+                response.status_code,
+                Some(StatusCode::UNAUTHORIZED),
+                "{method}"
+            );
+            assert!(dir.path().join("collection/private/file.txt").exists());
+            assert!(!dir.path().join("target").exists());
+        }
+        // Authorizing the source alone still cannot create a protected child
+        // of an as-yet nonexistent destination collection.
+        let mut request = TestClient::get("http://localhost/collection/")
+            .basic_auth("user", Some("pass"))
+            .add_header("Destination", "/target", true)
+            .build();
+        *request.method_mut() = "COPY".parse().unwrap();
+        let response = service.handle(request).await;
+        assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+        assert!(!dir.path().join("target").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recursive_alias_members_inherit_protection_outside_the_logical_subtree() {
+        let dir = TestDir::new();
+        std::fs::create_dir_all(dir.path().join("public")).unwrap();
+        std::fs::create_dir_all(dir.path().join("private")).unwrap();
+        std::fs::write(dir.path().join("private/file.txt"), "protected").unwrap();
+        std::os::unix::fs::symlink("../private", dir.path().join("public/alias")).unwrap();
+        let service = Service::new(crate::build_router(config(
+            dir.path(),
+            &["-d", "--path-auth", "private=user:pass"],
+        )));
+        let mut request = TestClient::get("http://localhost/public/")
+            .add_header("Depth", "infinity", true)
+            .build();
+        *request.method_mut() = "PROPFIND".parse().unwrap();
+        let response = service.handle(request).await;
+        assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+    }
 
     use super::*;
     use crate::test_support::{TestDir, config};

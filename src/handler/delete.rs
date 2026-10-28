@@ -69,6 +69,13 @@ pub async fn handle_delete(req: &mut Request, depot: &mut Depot, res: &mut Respo
         .map(|m| is_actually_file(&m.file_type(), &req_p))
         .unwrap_or(false);
 
+    if !is_file
+        && let Some(response) = crate::hoops::auth::check_tree_auth(req, &config, req.uri().path())
+    {
+        *res = response;
+        return;
+    }
+
     let result = if is_file {
         tokio::fs::remove_file(&req_p_clone).await
     } else {

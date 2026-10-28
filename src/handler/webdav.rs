@@ -74,6 +74,13 @@ pub async fn handle_propfind(req: &mut Request, depot: &mut Depot, res: &mut Res
         .and_then(Depth::parse)
         .unwrap_or(Depth::Zero);
 
+    if depth != Depth::Zero
+        && let Some(response) = crate::hoops::auth::check_tree_auth(req, &config, &url_path_raw)
+    {
+        *res = response;
+        return;
+    }
+
     let body_bytes = req
         .payload()
         .await
@@ -374,6 +381,9 @@ fn write_propfind_recursive<W: Write>(
             .flatten()
             .collect();
         for f in entries {
+            if is_internal_name(&f.file_name()) {
+                continue;
+            }
             root_url.truncate(root_url_orig_len);
             root_url.push_str(&f.file_name().to_string_lossy());
 
@@ -436,6 +446,9 @@ fn write_propfind_recursive_custom<W: Write>(
             .flatten()
             .collect();
         for f in entries {
+            if is_internal_name(&f.file_name()) {
+                continue;
+            }
             root_url.truncate(root_url_orig_len);
             root_url.push_str(&f.file_name().to_string_lossy());
 
@@ -1267,6 +1280,14 @@ async fn handle_copy_move(req: &mut Request, depot: &mut Depot, res: &mut Respon
     }
 
     let mut overwritten = false;
+    if req_p.is_dir() && (depth != Depth::Zero || is_move) {
+        for path in [&url_path_raw, &dest_path_str] {
+            if let Some(response) = crate::hoops::auth::check_tree_auth(req, &config, path) {
+                *res = response;
+                return;
+            }
+        }
+    }
     if dest_p.exists() {
         if !overwrite {
             res.status_code(StatusCode::PRECONDITION_FAILED);
