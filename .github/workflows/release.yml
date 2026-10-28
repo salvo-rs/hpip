@@ -31,9 +31,13 @@ jobs:
     needs: validate-version
     uses: ./.github/workflows/ci-windows.yml
 
+  check-security:
+    needs: validate-version
+    uses: ./.github/workflows/security-audit.yml
+
   publish-crate:
     name: Publish to crates.io
-    needs: [validate-version, check-linux, check-macos, check-windows]
+    needs: [validate-version, check-linux, check-macos, check-windows, check-security]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7

@@ -954,9 +954,19 @@ pub async fn handle_proppatch(req: &mut Request, depot: &mut Depot, res: &mut Re
 
     let (actionables, mut statuses) = prepare_proppatch(&props);
     if statuses.iter().all(|status| *status == StatusCode::OK) {
-        static PROPERTY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _guard = PROPERTY_LOCK.lock().await;
-        if let Err(error) = apply_proppatch(&req_p, &actionables) {
+        static PROPERTY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let path = req_p.clone();
+        let Some(job) = config.spawn_blocking(move || {
+            let _guard = PROPERTY_LOCK
+                .lock()
+                .map_err(|_| IoError::other("property lock poisoned"))?;
+            apply_proppatch(&path, &actionables)
+        }) else {
+            res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+            return;
+        };
+        let result = job.await.unwrap_or_else(|error| Err(IoError::other(error)));
+        if let Err(error) = result {
             log_msg(config.log, &format!("PROPPATCH failed: {error}"));
             statuses.fill(if error.kind() == IoErrorKind::PermissionDenied {
                 StatusCode::FORBIDDEN
@@ -1225,8 +1235,33 @@ pub async fn handle_move(req: &mut Request, depot: &mut Depot, res: &mut Respons
 
 async fn handle_copy_move(req: &mut Request, depot: &mut Depot, res: &mut Response, is_move: bool) {
     let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
+    if let Some(response) = crate::hoops::auth::check_auth(req, &config) {
+        *res = response;
+        return;
+    }
+    let mut snapshot = Request::new();
+    *snapshot.uri_mut() = req.uri().clone();
+    *snapshot.headers_mut() = req.headers().clone();
+    *snapshot.method_mut() = req.method().clone();
+    let work_config = config.clone();
+    let Some(job) = config.spawn_blocking(move || {
+        let mut response = Response::new();
+        copy_move_work(&mut snapshot, &work_config, &mut response, is_move);
+        response
+    }) else {
+        res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+        return;
+    };
+    match job.await {
+        Ok(response) => *res = response,
+        Err(_) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+}
 
-    if let Some(resp) = crate::hoops::auth::check_auth(req, &config) {
+fn copy_move_work(req: &mut Request, config: &Arc<AppConfig>, res: &mut Response, is_move: bool) {
+    if let Some(resp) = crate::hoops::auth::check_auth(req, config) {
         *res = resp;
         return;
     }
@@ -1276,7 +1311,7 @@ async fn handle_copy_move(req: &mut Request, depot: &mut Depot, res: &mut Respon
         );
         return;
     };
-    if let Some(response) = crate::hoops::auth::check_auth_path(req, &config, &dest_path_str) {
+    if let Some(response) = crate::hoops::auth::check_auth_path(req, config, &dest_path_str) {
         *res = response;
         return;
     }
@@ -1364,7 +1399,7 @@ async fn handle_copy_move(req: &mut Request, depot: &mut Depot, res: &mut Respon
     let mut overwritten = false;
     if req_p.is_dir() && (depth != Depth::Zero || is_move) {
         for path in [&url_path_raw, &dest_path_str] {
-            if let Some(response) = crate::hoops::auth::check_tree_auth(req, &config, path) {
+            if let Some(response) = crate::hoops::auth::check_tree_auth(req, config, path) {
                 *res = response;
                 return;
             }
@@ -1394,7 +1429,7 @@ async fn handle_copy_move(req: &mut Request, depot: &mut Depot, res: &mut Respon
         }
         // A failed rename leaves the complete source in place. In particular,
         // never emulate cross-device MOVE by deleting a partially copied tree.
-        copy_response(res, tokio::fs::rename(&req_p, &dest_p).await, overwritten);
+        copy_response(res, fs::rename(&req_p, &dest_p), overwritten);
         return;
     }
 
@@ -1802,5 +1837,49 @@ mod destination_auth_tests {
                 "{destination}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod blocking_admission_tests {
+    use salvo::test::RequestBuilder;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn busy_workers_do_not_mutate_copy_destinations_or_properties() {
+        let dir = crate::test_support::TestDir::new();
+        fs::write(dir.path().join("source"), b"fixture").unwrap();
+        fs::create_dir(dir.path().join("destination")).unwrap();
+        let before = fs::metadata(dir.path().join("source"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let config = crate::test_support::config(dir.path(), &["-w", "-d"]);
+        let _all_jobs = config
+            .blocking_jobs
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let service = Service::new(crate::build_router(config));
+        let response = RequestBuilder::new("http://localhost/source", "COPY".parse().unwrap())
+            .add_header("Destination", "/destination", true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(dir.path().join("destination").is_dir());
+        let response = RequestBuilder::new("http://localhost/source", "PROPPATCH".parse().unwrap())
+            .add_header("Content-Type", "application/xml", true)
+            .body(r#"<D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:"><D:set><D:prop><Z:Win32LastModifiedTime>2020-09-13T12:26:40Z</Z:Win32LastModifiedTime></D:prop></D:set></D:propertyupdate>"#)
+            .send(&service).await;
+        assert_eq!(response.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(
+            fs::metadata(dir.path().join("source"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before
+        );
     }
 }

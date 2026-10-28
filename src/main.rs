@@ -192,7 +192,10 @@ async fn result_main() -> Result<(), Error> {
         Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-                config_prune.prune();
+                let work_config = config_prune.clone();
+                if let Some(job) = config_prune.spawn_blocking(move || work_config.prune()) {
+                    let _ = job.await;
+                }
             }
         }))
     } else {

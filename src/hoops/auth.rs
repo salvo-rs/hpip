@@ -325,7 +325,15 @@ mod tests {
         }
         for method in ["DELETE", "PROPFIND", "COPY", "MOVE"] {
             let mut request = TestClient::get("http://localhost/collection/")
-                .add_header("Depth", "infinity", true)
+                .add_header(
+                    "Depth",
+                    if method == "PROPFIND" {
+                        "1"
+                    } else {
+                        "infinity"
+                    },
+                    true,
+                )
                 .add_header("Destination", "/target", true)
                 .build();
             *request.method_mut() = method.parse().unwrap();
@@ -363,7 +371,7 @@ mod tests {
             &["-d", "--path-auth", "private=user:pass"],
         )));
         let mut request = TestClient::get("http://localhost/public/")
-            .add_header("Depth", "infinity", true)
+            .add_header("Depth", "1", true)
             .build();
         *request.method_mut() = "PROPFIND".parse().unwrap();
         let response = service.handle(request).await;

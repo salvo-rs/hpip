@@ -1,6 +1,7 @@
 name: Dependency security
 
 on:
+  workflow_call:
   pull_request:
     paths: ["Cargo.toml", "Cargo.lock", ".github/scripts/audit_dependencies.py", ".github/workflows/security-audit.yml"]
   push:

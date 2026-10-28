@@ -138,6 +138,10 @@ than copying and deleting the source. Uploads use staged atomic replacement.
 | `--encoded-generated <SIZE>` | Max memory cache for compressed responses |
 | `--encoded-prune <TIME>` | Prune cached files older than TIME (e.g. `1h`, `1d`) |
 
+Cache admission enforces aggregate limits even when no expiry interval is set.
+Defaults are 256 MiB on disk and 16 MiB for generated responses, with a separate
+4096-entry metadata cap. Negative compression decisions expire after five minutes.
+
 ### Logging
 
 | Option | Description |
