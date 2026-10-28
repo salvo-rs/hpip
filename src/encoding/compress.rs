@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Seek, Write};
 use std::path::Path;
 
 use brotli::enc::BrotliCompress as brotli_compress;
@@ -99,12 +99,11 @@ pub fn encode_str(dt: &str, enc: EncodingType) -> Option<Vec<u8>> {
     }
 }
 
-/// Encode the file at `p` into the file at `op` using the given encoding. Returns false on failure.
-pub fn encode_file(p: &Path, op: &Path, enc: EncodingType) -> bool {
-    let inf = match File::open(p) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
+/// Encode the already opened input snapshot, never reopening its path.
+pub fn encode_open_file(mut inf: File, op: &Path, enc: EncodingType) -> bool {
+    if inf.rewind().is_err() {
+        return false;
+    }
     let outf = match File::create(op) {
         Ok(f) => f,
         Err(_) => return false,
@@ -135,13 +134,15 @@ pub fn encoding_name(enc: EncodingType) -> &'static str {
     }
 }
 
-/// Return the 256-bit BLAKE3 hash of the file.
-pub fn file_hash(p: &Path) -> Result<blake3::Hash, io::Error> {
+/// Hash the same opened input that will be compressed, then reset its cursor.
+pub fn file_hash_reader(source: &mut File) -> Result<blake3::Hash, io::Error> {
+    source.rewind()?;
     let mut ctx = blake3::Hasher::new();
     io::copy(
-        &mut BufReader::with_capacity(1024 * 1024, File::open(p)?),
+        &mut BufReader::with_capacity(1024 * 1024, &mut *source),
         &mut ctx,
     )?;
+    source.rewind()?;
     Ok(ctx.finalize())
 }
 

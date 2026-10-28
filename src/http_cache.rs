@@ -119,4 +119,26 @@ mod tests {
             .await;
         assert_eq!(r.status_code, Some(StatusCode::NOT_MODIFIED));
     }
+
+    #[tokio::test]
+    async fn ranges_reuse_the_full_representation_validator() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::write(dir.path().join("file.txt"), "fixture").unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &[],
+        )));
+        let full = TestClient::get("http://localhost/file.txt")
+            .send(&service)
+            .await;
+        let tag = full.headers()["etag"].to_str().unwrap();
+        let mut partial = TestClient::get("http://localhost/file.txt")
+            .add_header("Range", "bytes=0-2", true)
+            .add_header("If-Range", tag, true)
+            .send(&service)
+            .await;
+        assert_eq!(partial.status_code, Some(StatusCode::PARTIAL_CONTENT));
+        assert_eq!(partial.headers()["etag"], full.headers()["etag"]);
+        assert_eq!(partial.take_string().await.unwrap(), "fix");
+    }
 }

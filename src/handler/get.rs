@@ -95,25 +95,6 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
     let is_file = is_actually_file(&metadata.file_type(), &req_p);
 
     if is_file {
-        // Check for Range header - copy it before passing req mutably
-        let range_header = req
-            .headers()
-            .get(salvo::http::header::RANGE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        if let Some(range_str) = range_header {
-            let tag = format!("\"{}\"", file_etag(&metadata));
-            let modified = file_time_modified(&metadata);
-            if crate::http_cache::not_modified(req, res, &tag, modified) {
-                return;
-            }
-            if !crate::http_cache::range_matches(req, &tag, modified) {
-                handle_get_file(req, res, &config, &req_p, false).await;
-                return;
-            }
-            handle_get_file_range(req, res, &config, &req_p, &range_str).await;
-            return;
-        }
         handle_get_file(req, res, &config, &req_p, false).await;
     } else {
         let mut work_request = Request::new();
@@ -231,10 +212,38 @@ async fn handle_get_file(
     req_p: &Path,
     is_404: bool,
 ) {
+    let file = match tokio::fs::File::open(req_p).await {
+        Ok(file) => file,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                res.status_code(StatusCode::FORBIDDEN);
+                res.render(Text::Html(error_html(
+                    "403 Forbidden",
+                    format!("Can't access {}.", req_p.display()),
+                    "",
+                )));
+            } else {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            return;
+        }
+    };
+
+    serve_open_file(req, res, config, req_p, file, is_404).await;
+}
+
+async fn serve_open_file(
+    req: &mut Request,
+    res: &mut Response,
+    config: &Arc<AppConfig>,
+    req_p: &Path,
+    mut file: tokio::fs::File,
+    is_404: bool,
+) {
     let mime_type = guess_mime_type(req_p, &config.mime_type_overrides);
     let remote = req.remote_addr().to_string();
 
-    let metadata = match req_p.metadata() {
+    let metadata = match file.metadata().await {
         Ok(m) => m,
         Err(e) => {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -254,6 +263,23 @@ async fn handle_get_file(
     let etag = file_etag(&metadata);
     let modified = file_time_modified(&metadata);
     let flen = file_length(&metadata, &req_p);
+
+    if !is_404
+        && let Some(range) = req
+            .headers()
+            .get(salvo::http::header::RANGE)
+            .and_then(|header| header.to_str().ok())
+            .map(str::to_owned)
+    {
+        let tag = format!("\"{etag}\"");
+        if crate::http_cache::range_matches(req, &tag, modified) {
+            if crate::http_cache::not_modified(req, res, &tag, modified) {
+                return;
+            }
+            handle_get_file_range(req, res, config, req_p, file, metadata, &range).await;
+            return;
+        }
+    }
 
     log_msg(
         config.log,
@@ -278,7 +304,8 @@ async fn handle_get_file(
             .get(salvo::http::header::ACCEPT_ENCODING)
             .and_then(|v| v.to_str().ok())
         && let Some(encoding) = response_encoding(accept_enc)
-        && let Some(encoded) = encoded_file_job(config, req_p, &etag, encoding, &remote).await
+        && let Some(encoded) =
+            encoded_file_job(config, &file, req_p, &etag, encoding, &remote).await
     {
         let response_etag = format!("\"{}-{}\"", etag, encoding_name(encoding));
         if !is_404 && crate::http_cache::not_modified(req, res, &response_etag, modified) {
@@ -323,22 +350,10 @@ async fn handle_get_file(
     if !is_404 && crate::http_cache::not_modified(req, res, &format!("\"{}\"", etag), modified) {
         return;
     }
-    let file = match tokio::fs::File::open(req_p).await {
-        Ok(file) => file,
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                res.status_code(StatusCode::FORBIDDEN);
-                res.render(Text::Html(error_html(
-                    "403 Forbidden",
-                    format!("Can't access {}.", req_p.display()),
-                    "",
-                )));
-            } else {
-                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-            return;
-        }
-    };
+    if file.seek(std::io::SeekFrom::Start(0)).await.is_err() {
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        return;
+    }
 
     res.status_code(if is_404 {
         StatusCode::NOT_FOUND
@@ -374,17 +389,21 @@ async fn handle_get_file(
 
 async fn encoded_file_job(
     config: &Arc<AppConfig>,
+    source: &tokio::fs::File,
     path: &Path,
     etag: &str,
     encoding: EncodingType,
     remote: &str,
 ) -> Option<EncodedFile> {
+    let mut source = source.try_clone().await.ok()?.into_std().await;
     let work_config = config.clone();
     let path = path.to_path_buf();
     let etag = etag.to_owned();
     let remote = remote.to_owned();
     config
-        .spawn_blocking(move || try_encoded_file(&work_config, &path, &etag, encoding, &remote))?
+        .spawn_blocking(move || {
+            try_encoded_file(&work_config, &mut source, &path, &etag, encoding, &remote)
+        })?
         .await
         .ok()
         .flatten()
@@ -392,6 +411,7 @@ async fn encoded_file_job(
 
 fn try_encoded_file(
     config: &AppConfig,
+    source: &mut std::fs::File,
     req_p: &Path,
     etag: &str,
     encoding: EncodingType,
@@ -408,7 +428,7 @@ fn try_encoded_file(
     let hash = match hash {
         Some(h) => h,
         None => {
-            let h = file_hash(req_p).ok()?;
+            let h = file_hash_reader(source).ok()?;
             config.remember_hash(index_key, h);
             h
         }
@@ -462,10 +482,10 @@ fn try_encoded_file(
     }
 
     let pending = PendingEncoding(resp_p.with_extension(format!("{}.partial", enc_ext)));
-    if encode_file(req_p, &pending.0, encoding) {
+    if encode_open_file(source.try_clone().ok()?, &pending.0, encoding) {
         let resp_meta = pending.0.metadata().ok()?;
         let resp_len = resp_meta.len();
-        let orig_len = req_p
+        let orig_len = source
             .metadata()
             .map(|m| file_length(&m, req_p))
             .unwrap_or(0);
@@ -536,17 +556,12 @@ async fn handle_get_file_range(
     res: &mut Response,
     config: &AppConfig,
     req_p: &Path,
+    mut file: tokio::fs::File,
+    metadata: std::fs::Metadata,
     range_str: &str,
 ) {
     let remote = req.remote_addr().to_string();
     let mime_type = guess_mime_type(req_p, &config.mime_type_overrides);
-    let metadata = match req_p.metadata() {
-        Ok(m) => m,
-        Err(_) => {
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            return;
-        }
-    };
     let flen = file_length(&metadata, req_p);
     let etag = file_etag(&metadata);
     let modified = file_time_modified(&metadata);
@@ -573,13 +588,6 @@ async fn handle_get_file_range(
     );
 
     let content_len = to - from + 1;
-    let mut file = match tokio::fs::File::open(req_p).await {
-        Ok(file) => file,
-        Err(_) => {
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            return;
-        }
-    };
     if file.seek(std::io::SeekFrom::Start(from)).await.is_err() {
         res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
         return;
@@ -600,7 +608,7 @@ async fn handle_get_file_range(
     );
     res.headers_mut().insert(
         salvo::http::header::ETAG,
-        format!("\"{}+{}-{}\"", etag, from, to).parse().unwrap(),
+        format!("\"{}\"", etag).parse().unwrap(),
     );
     res.headers_mut().insert(
         salvo::http::header::LAST_MODIFIED,
@@ -1105,6 +1113,7 @@ mod range_tests {
                     barrier.wait();
                     super::try_encoded_file(
                         &config,
+                        &mut std::fs::File::open(&path).unwrap(),
                         &path,
                         "fixture",
                         crate::config::EncodingType::Gzip,
@@ -1217,6 +1226,7 @@ mod range_tests {
         let config = crate::test_support::config(dir.path(), &["--encoded-filesystem", "4096"]);
         let encoded = super::try_encoded_file(
             &config,
+            &mut std::fs::File::open(&path).unwrap(),
             &path,
             "test",
             crate::config::EncodingType::Gzip,
@@ -1343,5 +1353,90 @@ mod selected_resource_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use salvo::test::{ResponseExt, TestClient};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn full_and_range_headers_and_bytes_use_the_opened_version() {
+        let dir = crate::test_support::TestDir::new();
+        let path = dir.path().join("data.txt");
+        let replacement = dir.path().join("replacement");
+        let config = crate::test_support::config(dir.path(), &["-e"]);
+        for range in [None, Some("bytes=1-4")] {
+            std::fs::write(&path, b"original snapshot").unwrap();
+            std::fs::write(
+                &replacement,
+                b"a longer replacement that must not be mixed into the response",
+            )
+            .unwrap();
+            let opened = tokio::fs::File::open(&path).await.unwrap();
+            let tag = format!("\"{}\"", file_etag(&opened.metadata().await.unwrap()));
+            std::fs::rename(&replacement, &path).unwrap();
+            let mut request = TestClient::get("http://localhost/data.txt").build();
+            if let Some(range) = range {
+                request
+                    .headers_mut()
+                    .insert("range", range.parse().unwrap());
+                request
+                    .headers_mut()
+                    .insert("if-range", tag.parse().unwrap());
+            }
+            let mut response = Response::new();
+            serve_open_file(&mut request, &mut response, &config, &path, opened, false).await;
+            assert_eq!(response.headers()["etag"], tag);
+            let expected: &[u8] = if range.is_some() {
+                b"rigi"
+            } else {
+                b"original snapshot"
+            };
+            assert_eq!(
+                response.headers()["content-length"],
+                expected.len().to_string()
+            );
+            assert_eq!(response.take_bytes(None).await.unwrap().as_ref(), expected);
+        }
+    }
+
+    #[test]
+    fn hash_and_compression_share_the_opened_version_after_path_replacement() {
+        let dir = crate::test_support::TestDir::new();
+        let path = dir.path().join("data.txt");
+        let replacement = dir.path().join("replacement");
+        let original = b"original fixture ".repeat(10_000);
+        std::fs::write(&path, &original).unwrap();
+        std::fs::write(&replacement, b"different replacement ".repeat(12_000)).unwrap();
+        let mut opened = std::fs::File::open(&path).unwrap();
+        let tag = file_etag(&opened.metadata().unwrap());
+        std::fs::rename(&replacement, &path).unwrap();
+        let config = crate::test_support::config(dir.path(), &[]);
+        let encoded = try_encoded_file(
+            &config,
+            &mut opened,
+            &path,
+            &tag,
+            EncodingType::Gzip,
+            "test",
+        )
+        .unwrap();
+        let mut contents = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(encoded.file),
+            &mut contents,
+        )
+        .unwrap();
+        assert_eq!(contents, original);
+        assert!(
+            config
+                .cache_fs
+                .read()
+                .unwrap()
+                .contains_key(&(blake3::hash(&original), EncodingType::Gzip))
+        );
     }
 }
