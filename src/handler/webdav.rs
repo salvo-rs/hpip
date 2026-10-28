@@ -1555,7 +1555,7 @@ fn copy_response_multierror(
 // ─── Helpers ───────────────────────────────────────────
 
 fn set_error(res: &mut Response, status: StatusCode, title: &str, msg: &str) {
-    let body = error_html(title, msg, "");
+    let body = error_html_text(title, msg, "");
     res.status_code(status);
     res.headers_mut().insert(
         salvo::http::header::CONTENT_TYPE,

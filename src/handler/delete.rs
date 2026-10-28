@@ -54,7 +54,7 @@ pub async fn handle_delete(req: &mut Request, depot: &mut Depot, res: &mut Respo
 
     if !req_p.exists() || config.is_symlink_denied(symlink, &req_p) {
         res.status_code(StatusCode::NOT_FOUND);
-        res.render(Text::Html(error_html(
+        res.render(Text::Html(error_html_text(
             "404 Not Found",
             format!("The requested entity \"{}\" doesn't exist.", url_path_str),
             "",
@@ -106,11 +106,35 @@ pub async fn handle_delete(req: &mut Request, depot: &mut Depot, res: &mut Respo
         }
         Err(e) => {
             res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            res.render(Text::Html(error_html(
+            res.render(Text::Html(error_html_text(
                 "500 Internal Server Error",
                 "Failed to delete the entity.",
                 format!("{}", e),
             )));
         }
+    }
+}
+
+#[cfg(test)]
+mod error_text_tests {
+    use salvo::test::{RequestBuilder, ResponseExt};
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    #[tokio::test]
+    async fn delete_not_found_keeps_markup_in_the_path_as_text() {
+        let directory = TestDir::new();
+        let service = Service::new(crate::build_router(config(directory.path(), &["-w"])));
+        let mut response = RequestBuilder::new(
+            "http://localhost/%3Cimg%20data-review%3Dhpip%3E",
+            salvo::http::Method::DELETE,
+        )
+        .send(&service)
+        .await;
+        assert_eq!(response.status_code, Some(StatusCode::NOT_FOUND));
+        let html = response.take_string().await.unwrap();
+        assert!(html.contains("&lt;img data-review=hpip&gt;"));
+        assert!(!html.contains("<img data-review=hpip>"));
     }
 }

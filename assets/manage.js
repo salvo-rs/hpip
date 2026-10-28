@@ -99,7 +99,7 @@ function make_request(verb, url, status_out, request_modifier) {
     if(request.status >= 200 && request.status < 300)
       window.location.reload();
     else {
-      status_out.innerHTML = request.status + " " + request.statusText + (request.response ? " — " : "") + request.response;
+      status_out.textContent = request.status + " " + request.statusText + (request.response ? " — " : "") + request.response;
       status_out.classList.add("has-log");
       make_request_error = true;
     }

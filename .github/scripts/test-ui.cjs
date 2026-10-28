@@ -54,3 +54,13 @@ test('invalid basenames do not send requests to a normalized parent or child', (
     assert.match(status.textContent, /file name/);
   }
 });
+
+test('management errors remain text rather than parsed response markup', () => {
+  const { context, requests, status } = management();
+  Object.defineProperty(status, 'innerHTML', { set() { throw new Error('unsafe HTML insertion'); } });
+  context.rename('source', 'target', status);
+  const request = requests[0];
+  Object.assign(request, { status: 404, statusText: 'Not Found', response: '<img data-review=marker>' });
+  request.listeners.loadend();
+  assert.equal(status.textContent, '404 Not Found — <img data-review=marker>');
+});

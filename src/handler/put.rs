@@ -171,7 +171,7 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
     let illegal = config.is_symlink_denied_nonexistent(symlink, &req_p);
     if illegal {
         res.status_code(StatusCode::NOT_FOUND);
-        res.render(Text::Html(error_html(
+        res.render(Text::Html(error_html_text(
             "404 Not Found",
             format!("The requested entity \"{}\" doesn't exist.", url_path_str),
             "",
@@ -265,7 +265,7 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
         Err(UploadError::Io(e)) => {
             crate::config::log_msg(config.log, &format!("{} File not created. {}", remote, e));
             res.status_code(StatusCode::SERVICE_UNAVAILABLE);
-            res.render(Text::Html(error_html(
+            res.render(Text::Html(error_html_text(
                 "503 Service Unavailable",
                 "File not created.",
                 format!("{}", e),
