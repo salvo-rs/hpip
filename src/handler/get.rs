@@ -301,7 +301,13 @@ async fn serve_open_file(
         }
     };
 
-    let etag = file_etag(&metadata);
+    let etag = match file_etag(&metadata, &file) {
+        Ok(etag) => etag,
+        Err(_) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            return;
+        }
+    };
     let modified = file_time_modified(&metadata);
     let flen = file_length(&metadata, &req_p);
     let encoding = file_encoding_candidate(req, config, req_p, flen);
@@ -661,7 +667,13 @@ async fn handle_get_file_range(
     let remote = req.remote_addr().to_string();
     let mime_type = guess_mime_type(req_p, &config.mime_type_overrides);
     let flen = file_length(&metadata, req_p);
-    let etag = file_etag(&metadata);
+    let etag = match file_etag(&metadata, &file) {
+        Ok(etag) => etag,
+        Err(_) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            return;
+        }
+    };
     let modified = file_time_modified(&metadata);
 
     let Some((from, to)) = parse_byte_range(range_str, flen) else {
@@ -1506,7 +1518,10 @@ mod snapshot_tests {
             )
             .unwrap();
             let opened = tokio::fs::File::open(&path).await.unwrap();
-            let tag = format!("\"{}\"", file_etag(&opened.metadata().await.unwrap()));
+            let tag = format!(
+                "\"{}\"",
+                file_etag(&opened.metadata().await.unwrap(), &opened).unwrap()
+            );
             std::fs::rename(&replacement, &path).unwrap();
             let mut request = TestClient::get("http://localhost/data.txt").build();
             if let Some(range) = range {
@@ -1542,7 +1557,7 @@ mod snapshot_tests {
         std::fs::write(&path, &original).unwrap();
         std::fs::write(&replacement, b"different replacement ".repeat(12_000)).unwrap();
         let mut opened = std::fs::File::open(&path).unwrap();
-        let tag = file_etag(&opened.metadata().unwrap());
+        let tag = file_etag(&opened.metadata().unwrap(), &opened).unwrap();
         std::fs::rename(&replacement, &path).unwrap();
         let config = crate::test_support::config(dir.path(), &[]);
         let encoded = try_encoded_file(

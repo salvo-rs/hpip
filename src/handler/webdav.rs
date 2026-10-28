@@ -1734,7 +1734,7 @@ mod remaining_mutation_condition_tests {
         fs::write(&path, b"original data").unwrap();
         let metadata = fs::metadata(&path).unwrap();
         let before = metadata.modified().unwrap();
-        let tag = format!("\"{}\"", file_etag(&metadata));
+        let tag = format!("\"{}\"", path_metadata_and_etag(&path).unwrap().1);
         let service = Service::new(crate::build_router(config(fixture.path(), &["-w", "-d"])));
         for (header, value) in [
             ("If-Match", "\"stale\"".to_owned()),
@@ -2584,7 +2584,7 @@ mod mutation_precondition_tests {
             fs::write(&destination, b"destination bytes").unwrap();
             let service =
                 Service::new(crate::build_router(config(directory.path(), &["-w", "-d"])));
-            let etag = format!("\"{}\"", file_etag(&fs::metadata(&source).unwrap()));
+            let etag = format!("\"{}\"", path_metadata_and_etag(&source).unwrap().1);
             for (header, value) in [
                 ("If-Match", "\"stale-tag\"".to_owned()),
                 ("If-Match", format!("W/{etag}")),
@@ -2636,7 +2636,7 @@ mod mutation_precondition_tests {
         let directory = TestDir::new();
         let source = directory.path().join("source.txt");
         fs::write(&source, b"original").unwrap();
-        let etag = format!("\"{}\"", file_etag(&fs::metadata(&source).unwrap()));
+        let etag = format!("\"{}\"", path_metadata_and_etag(&source).unwrap().1);
         let service = Service::new(crate::build_router(config(directory.path(), &["-w"])));
         let put = TestClient::put("http://localhost/source.txt")
             .add_header("If-Match", &etag, true)

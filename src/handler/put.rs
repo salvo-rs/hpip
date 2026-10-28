@@ -435,15 +435,20 @@ async fn write_request_file(
     }
     file.sync_all().await?;
     let _commit_lock = MUTATION_LOCK.lock().await;
-    let metadata = match tokio::fs::metadata(destination).await {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    if !conditions.allows_metadata(metadata.as_ref())? {
+    let destination_path = destination.to_path_buf();
+    let metadata =
+        match tokio::task::spawn_blocking(move || path_metadata_and_etag(&destination_path))
+            .await
+            .map_err(std::io::Error::other)?
+        {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+    if !conditions.allows_snapshot(metadata.as_ref())? {
         return Err(UploadError::PreconditionFailed);
     }
-    if let Some(metadata) = metadata.as_ref() {
+    if let Some((metadata, _)) = metadata.as_ref() {
         file.set_permissions(metadata.permissions()).await?;
     }
     drop(file);
@@ -635,7 +640,7 @@ mod conditional_upload_tests {
         std::fs::create_dir_all(&directory).unwrap();
         let destination = directory.join("file");
         std::fs::write(&destination, b"original").unwrap();
-        let old_tag = file_etag(&std::fs::metadata(&destination).unwrap());
+        let old_tag = path_metadata_and_etag(&destination).unwrap().1;
         let conditions = WriteConditions {
             if_match: Some(format!("\"{old_tag}\"")),
             ..Default::default()
