@@ -212,5 +212,6 @@ targets to the hosted directory. These options do not establish an operating
 system sandbox against another process changing the filesystem concurrently.
 
 Run `cargo test --locked --all-targets`, `cargo clippy --locked --all-targets -- -D warnings`,
-and `cargo +nightly fmt --all --check`. Dependency policy and temporary test-only
-advisory decisions are documented in [docs/dependency-audit.md](docs/dependency-audit.md).
+and `cargo +nightly fmt --all --check`. The dependency audit rejects all findings,
+including development dependency warnings, as documented in
+[docs/dependency-audit.md](docs/dependency-audit.md).
