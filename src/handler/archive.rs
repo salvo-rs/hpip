@@ -167,6 +167,10 @@ pub fn serve_archive_from_get(
 }
 
 fn serve_archive(req: &Request, res: &mut Response, config: &AppConfig, archive_type: ArchiveType) {
+    if let Some(response) = crate::hoops::auth::check_tree_auth(req, config, req.uri().path()) {
+        *res = response;
+        return;
+    }
     let url_path_raw = req.uri().path().to_string();
     let segments: Vec<&str> = url_path_raw.split('/').filter(|s| !s.is_empty()).collect();
     let (req_p, symlink, url_err) = resolve_path(
