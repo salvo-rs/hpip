@@ -100,9 +100,16 @@ impl Drop for CopyStaging {
 /// Copy privately and expose the complete file/collection only if the target
 /// name is still absent. Failed publication never changes the source.
 pub fn copy_no_replace(from: &Path, to: &Path, recursive: bool) -> io::Result<()> {
+    let metadata = fs::metadata(from)?;
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "only files and directories can be copied",
+        ));
+    }
     let staging = CopyStaging::create(to)?;
     let entry = staging.0.join("entry");
-    if from.is_file() {
+    if metadata.is_file() {
         fs::copy(from, &entry)?;
     } else if recursive {
         let errors = super::webdav::copy_dir(from, &entry)?;
@@ -195,8 +202,10 @@ mod tests {
     fn failed_copy_removes_staging_and_leaves_destination_absent() {
         let fixture = crate::test_support::TestDir::new();
         let target = fixture.path().join("target");
-        assert!(copy_no_replace(&fixture.path().join("missing"), &target, true).is_err());
-        assert!(!target.exists());
-        assert_eq!(fs::read_dir(fixture.path()).unwrap().count(), 0);
+        for recursive in [false, true] {
+            assert!(copy_no_replace(&fixture.path().join("missing"), &target, recursive).is_err());
+            assert!(!target.exists());
+            assert_eq!(fs::read_dir(fixture.path()).unwrap().count(), 0);
+        }
     }
 }
