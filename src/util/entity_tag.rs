@@ -1,5 +1,25 @@
 //! Entity-tag fields are comma-separated lists of quoted opaque tags, not CSV.
 
+/// Repeated list field lines have the same semantics as one comma-joined value.
+pub(crate) fn request_tag_field(
+    req: &salvo::Request,
+    name: &str,
+) -> Result<Option<String>, salvo::http::StatusCode> {
+    let mut combined = None::<String>;
+    for value in req.headers().get_all(name) {
+        let value = value
+            .to_str()
+            .map_err(|_| salvo::http::StatusCode::BAD_REQUEST)?;
+        if let Some(combined) = &mut combined {
+            combined.push(',');
+            combined.push_str(value);
+        } else {
+            combined = Some(value.to_owned());
+        }
+    }
+    Ok(combined)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum EntityTagList<'a> {
     Any,

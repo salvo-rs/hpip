@@ -5,7 +5,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use salvo::prelude::*;
 
-use super::entity_tag::EntityTagList;
+use super::entity_tag::{EntityTagList, request_tag_field};
 
 /// Coordinate conditional checks and namespace mutations made by this server.
 /// Filesystem changes by other processes remain outside this process lock.
@@ -32,8 +32,8 @@ impl WriteConditions {
                 .transpose()
         };
         let conditions = Self {
-            if_match: header("if-match")?,
-            if_none_match: header("if-none-match")?,
+            if_match: request_tag_field(req, "if-match")?,
+            if_none_match: request_tag_field(req, "if-none-match")?,
             // Invalid dates are ignored, as required for this conditional header.
             if_unmodified_since: header("if-unmodified-since")?
                 .and_then(|date| DateTime::parse_from_rfc2822(&date).ok())

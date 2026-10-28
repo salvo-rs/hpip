@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use salvo::prelude::*;
 
-use crate::util::entity_tag::EntityTagList;
+use crate::util::entity_tag::{EntityTagList, request_tag_field};
 
 /// Evaluate file preconditions in RFC 9110 order before sending a body or Range.
 /// Returns true when a final 304 or 412 response has been prepared.
@@ -20,27 +20,25 @@ pub fn preconditions(
             None => false,
         }
     };
-    let failed = if let Some(value) = req.headers().get("if-match") {
-        !value
-            .to_str()
-            .is_ok_and(|value| matches_tag_field(value, false))
-    } else {
-        req.headers()
+    let failed = match request_tag_field(req, "if-match") {
+        Ok(Some(value)) => !matches_tag_field(&value, false),
+        Err(_) => true,
+        Ok(None) => req
+            .headers()
             .get("if-unmodified-since")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| DateTime::parse_from_rfc2822(value).ok())
-            .is_some_and(|date| modified.timestamp() > date.timestamp())
+            .is_some_and(|date| modified.timestamp() > date.timestamp()),
     };
-    let matches = if let Some(value) = req.headers().get("if-none-match") {
-        value
-            .to_str()
-            .is_ok_and(|value| matches_tag_field(value, true))
-    } else {
-        req.headers()
+    let matches = match request_tag_field(req, "if-none-match") {
+        Ok(Some(value)) => matches_tag_field(&value, true),
+        Err(_) => false,
+        Ok(None) => req
+            .headers()
             .get("if-modified-since")
             .and_then(|h| h.to_str().ok())
             .and_then(|s| DateTime::parse_from_rfc2822(s).ok())
-            .is_some_and(|since| modified.timestamp() <= since.timestamp())
+            .is_some_and(|since| modified.timestamp() <= since.timestamp()),
     };
     if failed || matches {
         res.status_code(if failed {
@@ -83,6 +81,62 @@ mod tests {
     use salvo::test::{ResponseExt, TestClient};
 
     use super::*;
+
+    #[tokio::test]
+    async fn repeated_tag_field_lines_protect_reads_and_mutations() {
+        let dir = crate::test_support::TestDir::new();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, "original").unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &["-w"],
+        )));
+        let initial = TestClient::get("http://localhost/file.txt")
+            .send(&service)
+            .await;
+        let tag = initial.headers()["etag"].to_str().unwrap();
+        for method in ["GET", "HEAD"] {
+            for (header, expected) in [
+                ("If-Match", StatusCode::OK),
+                ("If-None-Match", StatusCode::NOT_MODIFIED),
+            ] {
+                let response = salvo::test::RequestBuilder::new(
+                    "http://localhost/file.txt",
+                    method.parse().unwrap(),
+                )
+                .add_header(header, r#""unrelated,*,tag""#, false)
+                .add_header(header, tag, false)
+                .send(&service)
+                .await;
+                assert_eq!(response.status_code, Some(expected), "{method} {header}");
+            }
+        }
+        for method in ["PUT", "DELETE"] {
+            let response = salvo::test::RequestBuilder::new(
+                "http://localhost/file.txt",
+                method.parse().unwrap(),
+            )
+            .add_header("If-None-Match", r#""unrelated""#, false)
+            .add_header("If-None-Match", tag, false)
+            .body("replacement")
+            .send(&service)
+            .await;
+            assert_eq!(response.status_code, Some(StatusCode::PRECONDITION_FAILED));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+
+            let response = salvo::test::RequestBuilder::new(
+                "http://localhost/file.txt",
+                method.parse().unwrap(),
+            )
+            .add_header("If-Match", tag, false)
+            .add_header("If-Match", "*", false)
+            .body("replacement")
+            .send(&service)
+            .await;
+            assert_eq!(response.status_code, Some(StatusCode::BAD_REQUEST));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+        }
+    }
 
     #[tokio::test]
     async fn quoted_commas_never_turn_an_opaque_tag_into_a_wildcard() {
