@@ -147,7 +147,11 @@ pub fn copy_dir(from: &Path, to: &Path) -> IoResult<Vec<(IoError, String)>> {
     fs::create_dir(to)?;
 
     let mut errors = Vec::new();
-    for entry in WalkDir::new(from).min_depth(1) {
+    for entry in WalkDir::new(from)
+        .min_depth(1)
+        .into_iter()
+        .filter_entry(|entry| !super::path::is_internal_name(entry.file_name()))
+    {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -242,6 +246,20 @@ mod copy_tests {
         assert_eq!(fs::read(to.join("nested/file")).unwrap(), b"fixture");
         assert!(copy_dir(&from, &from.join("child")).is_err());
         assert!(!from.join("child").exists());
+    }
+
+    #[test]
+    fn copying_a_collection_omits_private_uploads_and_instance_state() {
+        let directory = TestDir::new();
+        let from = directory.path().join("source");
+        let to = directory.path().join("copy");
+        fs::create_dir_all(from.join("nested/.hpip-internal-instance")).unwrap();
+        fs::write(from.join("nested/file"), b"visible").unwrap();
+        fs::write(from.join("nested/.HPIP-UPLOAD-active"), b"unfinished").unwrap();
+        fs::write(from.join("nested/.hpip-internal-instance/key"), b"private").unwrap();
+        assert!(copy_dir(&from, &to).unwrap().is_empty());
+        assert_eq!(fs::read(to.join("nested/file")).unwrap(), b"visible");
+        assert_eq!(fs::read_dir(to.join("nested")).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
