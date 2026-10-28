@@ -79,6 +79,25 @@ get_latest_version() {
 
 # --- Download and install ---
 
+verify_checksum() {
+    local archive_path="$1" checksums_path="$2" archive_name="$3"
+    local expected actual
+    expected=$(awk -v archive="$archive_name" '$2 == archive || $2 == "*" archive { print $1 }' "$checksums_path")
+    if [[ ! "$expected" =~ ^[[:xdigit:]]{64}$ ]]; then
+        error "release checksum is missing or ambiguous for $archive_name"
+    fi
+    if command -v sha256sum > /dev/null 2>&1; then
+        actual=$(sha256sum "$archive_path" | awk '{print $1}')
+    elif command -v shasum > /dev/null 2>&1; then
+        actual=$(shasum -a 256 "$archive_path" | awk '{print $1}')
+    else
+        error "need sha256sum or shasum to verify the release"
+    fi
+    if [ "$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')" ]; then
+        error "SHA256 verification failed for $archive_name"
+    fi
+}
+
 download_and_install() {
     local version="$1"
     local target="$2"
@@ -96,9 +115,13 @@ download_and_install() {
 
     if command -v curl > /dev/null 2>&1; then
         curl -fsSL "$url" -o "${tmpdir}/${archive_name}"
+        curl -fsSL "https://github.com/${REPO}/releases/download/${version}/SHA256SUMS" -o "${tmpdir}/SHA256SUMS"
     elif command -v wget > /dev/null 2>&1; then
         wget -q "$url" -O "${tmpdir}/${archive_name}"
+        wget -q "https://github.com/${REPO}/releases/download/${version}/SHA256SUMS" -O "${tmpdir}/SHA256SUMS"
     fi
+
+    verify_checksum "${tmpdir}/${archive_name}" "${tmpdir}/SHA256SUMS" "$archive_name"
 
     info "Extracting to ${install_dir}..."
 
@@ -136,4 +159,6 @@ main() {
     fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
