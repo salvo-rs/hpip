@@ -9,6 +9,18 @@ use flate2::write::{GzEncoder, ZlibEncoder};
 
 use crate::config::EncodingType;
 
+/// Accept-Encoding is a list field; repeated lines form one ordered field value.
+pub fn request_accept_encoding(req: &salvo::Request) -> Option<String> {
+    let fields = req
+        .headers()
+        .get_all("accept-encoding")
+        .iter()
+        .map(|value| value.to_str())
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    (!fields.is_empty()).then(|| fields.join(","))
+}
+
 pub fn identity_acceptable(accept: &str) -> bool {
     let mut identity = None;
     let mut wildcard = None;
