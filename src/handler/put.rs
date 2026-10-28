@@ -1,5 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use salvo::prelude::*;
 use tokio::io::AsyncWriteExt;
@@ -138,7 +139,7 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
     let existent = req_p.exists();
 
     // Write file
-    let result = write_file(&config, &req_p, &body_bytes).await;
+    let result = write_file(&req_p, &body_bytes).await;
     match result {
         Ok(()) => {
             if let Some(ms) = mtime {
@@ -181,42 +182,127 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
     }
 }
 
-async fn write_file(
-    config: &AppConfig,
-    req_p: &PathBuf,
-    data: &[u8],
-) -> Result<(), std::io::Error> {
-    // Try direct creation first
-    match tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(req_p)
-        .await
-    {
-        Ok(mut file) => {
-            file.write_all(data).await?;
-            file.flush().await?;
-            Ok(())
-        }
-        Err(_) => {
-            // File exists or error; use temp file approach
-            config.create_temp_dir(&config.writes_temp_dir);
-            let temp_dir = &config.writes_temp_dir.as_ref().unwrap().1;
-            let temp_file_p =
-                temp_dir.join(req_p.file_name().unwrap_or(std::ffi::OsStr::new("upload")));
+/// An upload is never visible at its destination until the complete file is ready.
+/// The guard also removes unfinished files when the request future is cancelled.
+struct PendingUpload {
+    path: PathBuf,
+}
 
-            // Write to temp
+impl PendingUpload {
+    fn create(destination: &Path) -> std::io::Result<(Self, tokio::fs::File)> {
+        static NEXT_UPLOAD: AtomicU64 = AtomicU64::new(0);
+        let parent = destination.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "upload has no parent")
+        })?;
+        loop {
+            let id = NEXT_UPLOAD.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(".hpip-upload-{}-{id}", std::process::id()));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
             {
-                let mut temp_file = tokio::fs::File::create(&temp_file_p).await?;
-                temp_file.write_all(data).await?;
-                temp_file.flush().await?;
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
             }
-
-            // Copy temp to dest
-            let result = tokio::fs::copy(&temp_file_p, req_p).await;
-            let _ = tokio::fs::remove_file(&temp_file_p).await;
-            result?;
-            Ok(())
+            match options.open(&path) {
+                Ok(file) => return Ok((Self { path }, tokio::fs::File::from_std(file))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
         }
+    }
+
+    async fn commit(self, destination: &Path) -> std::io::Result<()> {
+        // Both paths are on the same filesystem. Rename replaces atomically;
+        // never fall back to copying over the live destination.
+        tokio::fs::rename(&self.path, destination).await
+    }
+}
+
+impl Drop for PendingUpload {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+async fn write_file(destination: &Path, data: &[u8]) -> std::io::Result<()> {
+    let (pending, mut file) = PendingUpload::create(destination)?;
+    file.write_all(data).await?;
+    file.flush().await?;
+    file.sync_all().await?;
+    if let Ok(metadata) = tokio::fs::metadata(destination).await {
+        file.set_permissions(metadata.permissions()).await?;
+    }
+    drop(file);
+    pending.commit(destination).await
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+
+    fn fixture() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "hpip-atomic-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn same_basename_uploads_do_not_share_staging_files() {
+        let dir = fixture();
+        let a = dir.join("a");
+        let b = dir.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let a_file = a.join("same.txt");
+        let b_file = b.join("same.txt");
+        let a_data = vec![b'a'; 128 * 1024];
+        let b_data = vec![b'b'; 128 * 1024];
+        let (ra, rb) = tokio::join!(write_file(&a_file, &a_data), write_file(&b_file, &b_data));
+        ra.unwrap();
+        rb.unwrap();
+        assert_eq!(
+            std::fs::read(a.join("same.txt")).unwrap(),
+            vec![b'a'; 128 * 1024]
+        );
+        assert_eq!(
+            std::fs::read(b.join("same.txt")).unwrap(),
+            vec![b'b'; 128 * 1024]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_commit_preserves_destination_and_cleans_staging() {
+        let dir = fixture();
+        let destination = dir.join("existing-directory");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("keep"), b"original").unwrap();
+        assert!(write_file(&destination, b"new").await.is_err());
+        assert_eq!(
+            std::fs::read(destination.join("keep")).unwrap(),
+            b"original"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn abandoned_upload_is_invisible_and_removed() {
+        let dir = fixture();
+        let destination = dir.join("file");
+        std::fs::write(&destination, b"original").unwrap();
+        let (pending, mut file) = PendingUpload::create(&destination).unwrap();
+        file.write_all(b"unfinished").await.unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        drop(file);
+        drop(pending);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
