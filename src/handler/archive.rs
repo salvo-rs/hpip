@@ -85,10 +85,11 @@ pub async fn handle_post_archive(req: &mut Request, depot: &mut Depot, res: &mut
         .headers()
         .get(salvo::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+        .and_then(|value| value.parse::<mime::Mime>().ok());
 
-    if content_type != "text/plain" {
+    if !content_type
+        .is_some_and(|value| value.type_() == mime::TEXT && value.subtype() == mime::PLAIN)
+    {
         res.status_code(StatusCode::BAD_REQUEST);
         return;
     }
@@ -128,6 +129,59 @@ pub async fn handle_post_archive(req: &mut Request, depot: &mut Depot, res: &mut
     };
 
     serve_archive(req, res, &config, at).await;
+}
+
+#[cfg(test)]
+mod post_content_type_tests {
+    use std::io::Read;
+
+    use salvo::test::{ResponseExt, TestClient};
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    #[tokio::test]
+    async fn archive_forms_accept_equivalent_plain_text_media_types() {
+        let directory = TestDir::new();
+        std::fs::write(directory.path().join("file.txt"), "archive fixture").unwrap();
+        let service = Service::new(crate::build_router(config(directory.path(), &["-A"])));
+        let form = "vendor=http\narchive=yes-i-really-want-one\ntype=tar\n";
+        for content_type in [
+            "text/plain",
+            "Text/Plain",
+            "text/plain; charset=utf-8",
+            "Text/Plain; Charset=\"UTF-8\"",
+        ] {
+            let mut response = TestClient::post("http://localhost/")
+                .add_header("Content-Type", content_type, true)
+                .body(form)
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::OK), "{content_type}");
+            assert_eq!(response.headers()["content-type"], "application/x-tar");
+            let bytes = response.take_bytes(None).await.unwrap();
+            let mut archive = tar::Archive::new(bytes.as_ref());
+            let mut entries = archive.entries().unwrap();
+            let mut entry = entries.next().unwrap().unwrap();
+            assert_eq!(entry.path().unwrap().to_str().unwrap(), "file.txt");
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents).unwrap();
+            assert_eq!(contents, "archive fixture");
+            assert!(entries.next().is_none());
+        }
+        for content_type in [
+            "application/json",
+            "text/plain; charset",
+            "not a media type",
+        ] {
+            let response = TestClient::post("http://localhost/")
+                .add_header("Content-Type", content_type, true)
+                .body(form)
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::BAD_REQUEST));
+        }
+    }
 }
 
 /// Serve an archive from a GET request with Accept header
