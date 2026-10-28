@@ -145,7 +145,32 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
     if let Some(encoding) =
         super::get::file_encoding_candidate(req, &config, &path, length.unwrap())
     {
-        match super::get::cached_file_encoding(&config, &path, &etag, encoding) {
+        let mut cached = super::get::cached_file_encoding(&config, &path, &etag, encoding);
+        if cached.is_none()
+            && req
+                .headers()
+                .get("if-match")
+                .is_some_and(|value| value != "*")
+        {
+            // A specific strong precondition needs the actual selected coding.
+            // Ordinary cold HEAD requests still avoid all encoding work.
+            let Ok(source) = tokio::fs::File::open(&path).await else {
+                res.status_code(StatusCode::NOT_FOUND);
+                return;
+            };
+            cached = Some(
+                super::get::encoded_file_job(
+                    &config,
+                    &source,
+                    &path,
+                    &etag,
+                    encoding,
+                    &req.remote_addr().to_string(),
+                )
+                .await,
+            );
+        }
+        match cached {
             Some(Some(encoded)) => {
                 let coding = crate::encoding::encoding_name(encoding);
                 response_etag = Some(format!("\"{etag}-{coding}\""));
@@ -162,7 +187,7 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
             }
         }
     }
-    if crate::http_cache::not_modified(
+    if crate::http_cache::preconditions(
         req,
         res,
         response_etag.as_deref(),
