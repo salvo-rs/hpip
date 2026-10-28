@@ -84,3 +84,31 @@ test('folder discovery failure remains visible instead of reporting upload compl
   const list = page.body.children.find(child => child.tagName === 'DL');
   assert.match(list.children.at(-1).innerText, /folder.*permission denied/);
 });
+
+test('mixed transfer items select actual file entries rather than parallel indexes', () => {
+  const page = uploader();
+  const file = { name: 'image#one.png' };
+  const transfer = {
+    types: ['Files', 'text/html'], files: [file],
+    items: [
+      { kind: 'string', webkitGetAsEntry() { return null; } },
+      { kind: 'file', webkitGetAsEntry() { return null; }, getAsFile() { return file; } },
+    ],
+  };
+  page.body.listeners.drop({ preventDefault() {}, dataTransfer: transfer });
+  assert.equal(page.requests.length, 1);
+  assert.equal(page.requests[0].file, file);
+  assert.equal(page.requests[0].url, '/base/image%23one.png');
+  page.complete(page.requests[0]);
+  assert.equal(page.reloads(), 1);
+});
+
+test('clipboard-style file lists without entry APIs still upload every file', () => {
+  const page = uploader();
+  const files = [{ name: 'one.txt' }, { name: 'two.txt' }];
+  assert.doesNotThrow(() => page.body.listeners.paste({ target: page.body, preventDefault() {}, clipboardData: { files } }));
+  assert.equal(page.requests.length, 2);
+  for(const request of page.requests)
+    page.complete(request);
+  assert.equal(page.reloads(), 1);
+});

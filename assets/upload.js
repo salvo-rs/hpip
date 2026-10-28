@@ -38,15 +38,32 @@ window.addEventListener("DOMContentLoaded", function() {
 
   function process_transfer(transfer) {
     ++pending_discovery;
-    for(let i = transfer.files.length - 1; i >= 0; --i) {
-      if(!transfer.items[i].webkitGetAsEntry) {
-        let file = transfer.files[i];
-        upload_file(url + encodeURIComponent(file.name), file);
-      } else
-        recurse_upload(transfer.items[i].webkitGetAsEntry(), url);
+    try {
+      const items = Array.from(transfer.items || []).filter(item => item.kind === "file");
+      if(items.length) {
+        for(const item of items) {
+          try {
+            const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+            if(entry)
+              recurse_upload(entry, url);
+            else {
+              const file = item.getAsFile ? item.getAsFile() : null;
+              if(!file)
+                throw new Error("No file available from the transfer item");
+              upload_file(url + encodeURIComponent(file.name), file);
+            }
+          } catch(error) {
+            discovery_error("a dropped file", error);
+          }
+        }
+      } else {
+        for(const file of Array.from(transfer.files || []))
+          upload_file(url + encodeURIComponent(file.name), file);
+      }
+    } finally {
+      --pending_discovery;
+      maybe_reload();
     }
-    --pending_discovery;
-    maybe_reload();
   }
 
   function maybe_reload() {
