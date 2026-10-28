@@ -27,6 +27,31 @@ fn default_xml_emitter_config() -> XmlEmitterConfig {
     config
 }
 
+const CONTROL_BODY_LIMIT: usize = 64 * 1024;
+
+async fn control_body(req: &mut Request, res: &mut Response) -> Option<Vec<u8>> {
+    control_body_with_timeout(req, res, std::time::Duration::from_secs(30)).await
+}
+
+async fn control_body_with_timeout(
+    req: &mut Request,
+    res: &mut Response,
+    timeout: std::time::Duration,
+) -> Option<Vec<u8>> {
+    let status =
+        match tokio::time::timeout(timeout, req.payload_with_max_size(CONTROL_BODY_LIMIT)).await {
+            Ok(Ok(bytes)) if bytes.len() <= CONTROL_BODY_LIMIT => return Some(bytes.to_vec()),
+            Ok(Ok(_)) | Ok(Err(salvo::http::ParseError::PayloadTooLarge)) => {
+                StatusCode::PAYLOAD_TOO_LARGE
+            }
+            Ok(Err(_)) => StatusCode::BAD_REQUEST,
+            Err(_) => StatusCode::REQUEST_TIMEOUT,
+        };
+    res.status_code(status);
+    res.render(Text::Plain("Unable to read the WebDAV request body."));
+    None
+}
+
 // ─── PROPFIND ──────────────────────────────────────────
 
 #[handler]
@@ -103,12 +128,9 @@ pub async fn handle_propfind(req: &mut Request, depot: &mut Depot, res: &mut Res
         return;
     }
 
-    let body_bytes = req
-        .payload()
-        .await
-        .ok()
-        .map(|b| b.to_vec())
-        .unwrap_or_default();
+    let Some(body_bytes) = control_body(req, res).await else {
+        return;
+    };
     let props = match parse_propfind(&body_bytes) {
         Ok(p) => p,
         Err(e) => match e {
@@ -919,12 +941,9 @@ pub async fn handle_proppatch(req: &mut Request, depot: &mut Depot, res: &mut Re
         return;
     }
 
-    let body_bytes = req
-        .payload()
-        .await
-        .ok()
-        .map(|b| b.to_vec())
-        .unwrap_or_default();
+    let Some(body_bytes) = control_body(req, res).await else {
+        return;
+    };
     let props = match parse_proppatch(&body_bytes) {
         Ok(pp) => pp,
         Err(e) => {
@@ -1190,12 +1209,9 @@ pub async fn handle_mkcol(req: &mut Request, depot: &mut Depot, res: &mut Respon
     }
 
     // Check for non-empty body
-    let body = req
-        .payload()
-        .await
-        .ok()
-        .map(|b| b.to_vec())
-        .unwrap_or_default();
+    let Some(body) = control_body(req, res).await else {
+        return;
+    };
     if !body.is_empty() {
         res.status_code(StatusCode::UNSUPPORTED_MEDIA_TYPE);
         return;
@@ -1564,6 +1580,103 @@ fn set_error(res: &mut Response, status: StatusCode, title: &str, msg: &str) {
     res.headers_mut()
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
     res.render(Text::Html(body));
+}
+
+#[cfg(test)]
+mod control_body_tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use salvo::hyper::body::{Body, Bytes, Frame};
+    use salvo::test::RequestBuilder;
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    #[tokio::test]
+    async fn oversized_control_bodies_never_become_empty_requests() {
+        let directory = TestDir::new();
+        let source = directory.path().join("file");
+        fs::write(&source, b"unchanged").unwrap();
+        let before = fs::metadata(&source).unwrap().modified().unwrap();
+        let service = Service::new(crate::build_router(config(directory.path(), &["-w", "-d"])));
+        for (method, path) in [
+            ("MKCOL", "/collection"),
+            ("PROPFIND", "/"),
+            ("PROPPATCH", "/file"),
+        ] {
+            let response =
+                RequestBuilder::new(format!("http://localhost{path}"), method.parse().unwrap())
+                    .add_header("Depth", "0", true)
+                    .add_header("Content-Type", "application/xml", true)
+                    .body(vec![b'x'; CONTROL_BODY_LIMIT + 1])
+                    .send(&service)
+                    .await;
+            assert_eq!(
+                response.status_code,
+                Some(StatusCode::PAYLOAD_TOO_LARGE),
+                "{method}"
+            );
+        }
+        assert!(!directory.path().join("collection").exists());
+        assert_eq!(fs::read(&source).unwrap(), b"unchanged");
+        assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), before);
+        let response = RequestBuilder::new("http://localhost/small", "MKCOL".parse().unwrap())
+            .body("not empty")
+            .send(&service)
+            .await;
+        assert_eq!(
+            response.status_code,
+            Some(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        );
+        assert!(!directory.path().join("small").exists());
+    }
+
+    struct BrokenBody(bool);
+
+    impl Body for BrokenBody {
+        type Data = Bytes;
+        type Error = salvo::BoxedError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            if self.0 {
+                Poll::Pending
+            } else {
+                Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "interrupted",
+                )))))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_and_stalled_control_bodies_are_errors() {
+        for (pending, status) in [
+            (false, StatusCode::BAD_REQUEST),
+            (true, StatusCode::REQUEST_TIMEOUT),
+        ] {
+            let mut request = Request::new();
+            *request.body_mut() = salvo::http::ReqBody::Boxed {
+                inner: Box::pin(BrokenBody(pending)),
+                fuse_config: None,
+            };
+            let mut response = Response::new();
+            assert!(
+                control_body_with_timeout(
+                    &mut request,
+                    &mut response,
+                    std::time::Duration::from_millis(5)
+                )
+                .await
+                .is_none()
+            );
+            assert_eq!(response.status_code, Some(status));
+        }
+    }
 }
 
 #[cfg(test)]
