@@ -2,6 +2,7 @@ pub mod display;
 pub(crate) mod entity_tag;
 pub mod file;
 pub mod html;
+pub(crate) mod http_date;
 pub mod metadata;
 pub mod namespace;
 pub mod os;

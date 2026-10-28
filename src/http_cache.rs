@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use salvo::prelude::*;
 
 use crate::util::entity_tag::{EntityTagList, request_tag_field};
+use crate::util::http_date::request_date;
 
 /// Evaluate file preconditions in RFC 9110 order before sending a body or Range.
 /// Returns true when a final 304 or 412 response has been prepared.
@@ -23,21 +24,13 @@ pub fn preconditions(
     let failed = match request_tag_field(req, "if-match") {
         Ok(Some(value)) => !matches_tag_field(&value, false),
         Err(_) => true,
-        Ok(None) => req
-            .headers()
-            .get("if-unmodified-since")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| DateTime::parse_from_rfc2822(value).ok())
+        Ok(None) => request_date(req, "if-unmodified-since")
             .is_some_and(|date| modified.timestamp() > date.timestamp()),
     };
     let matches = match request_tag_field(req, "if-none-match") {
         Ok(Some(value)) => matches_tag_field(&value, true),
         Err(_) => false,
-        Ok(None) => req
-            .headers()
-            .get("if-modified-since")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| DateTime::parse_from_rfc2822(s).ok())
+        Ok(None) => request_date(req, "if-modified-since")
             .is_some_and(|since| modified.timestamp() <= since.timestamp()),
     };
     if failed || matches {
@@ -124,6 +117,56 @@ mod tests {
             .await;
         assert_eq!(response.status_code, Some(StatusCode::NOT_MODIFIED));
         assert_eq!(response.headers()["content-encoding"], "gzip");
+    }
+
+    #[tokio::test]
+    async fn repeated_date_conditions_are_ignored_for_reads_and_writes() {
+        let dir = crate::test_support::TestDir::new();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, "original").unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &["-w"],
+        )));
+        let past = "Wed, 01 Jan 2020 00:00:00 GMT";
+        let future = "Wed, 01 Jan 2031 00:00:00 GMT";
+        for method in ["GET", "HEAD"] {
+            for (name, first, second) in [
+                ("If-Modified-Since", future, past),
+                ("If-Unmodified-Since", past, future),
+            ] {
+                let response = salvo::test::RequestBuilder::new(
+                    "http://localhost/file.txt",
+                    method.parse().unwrap(),
+                )
+                .add_header(name, first, false)
+                .add_header(name, second, false)
+                .send(&service)
+                .await;
+                assert_eq!(
+                    response.status_code,
+                    Some(StatusCode::OK),
+                    "{method} {name}"
+                );
+            }
+        }
+        let response = TestClient::put("http://localhost/file.txt")
+            .add_header("If-Unmodified-Since", past, false)
+            .add_header("If-Unmodified-Since", future, false)
+            .body("replacement")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::NO_CONTENT));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "replacement");
+        let response = TestClient::put("http://localhost/file.txt")
+            .add_header("If-Match", r#""obsolete""#, true)
+            .add_header("If-Unmodified-Since", past, false)
+            .add_header("If-Unmodified-Since", future, false)
+            .body("must not overwrite")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::PRECONDITION_FAILED));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "replacement");
     }
 
     #[tokio::test]
