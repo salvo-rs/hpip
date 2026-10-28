@@ -218,9 +218,10 @@ byte budgets and entry limits; `--encoded-prune` controls expiration independent
 of those capacity limits. Temporary state belongs to one server instance and is
 cleaned after graceful request and worker shutdown.
 
-JSON directory metadata and WebDAV PROPFIND snapshots use the bounded worker
-pool. Each directory snapshot is limited to 10,000 entries and each serialized
-metadata response to 16 MiB; exceeding either budget returns HTTP 507.
+HTML directory listings, JSON metadata, and WebDAV PROPFIND snapshots use the
+bounded worker pool. Each directory snapshot is limited to 10,000 entries and
+each generated listing or metadata response to 16 MiB; exceeding either budget
+returns HTTP 507 before compression or transmission of a partial listing.
 
 Archive streams have a separate four-job limit, so slow downloads do not consume
 the metadata and mutation worker pool. Each output send must complete within 30

@@ -825,91 +825,31 @@ fn handle_dir_listing(
         }
     };
 
-    let rd = match req_p.read_dir() {
-        Ok(rd) => rd,
-        Err(_) => {
-            res.status_code(StatusCode::FORBIDDEN);
-            res.render(Text::Html(error_html_text(
-                "403 Forbidden",
-                format!("Can't access {}.", url_path),
-                "",
-            )));
+    let entries = match crate::util::metadata::directory_entries(req_p) {
+        Ok(entries) => entries,
+        Err(error) => {
+            res.status_code(if error.kind() == std::io::ErrorKind::FileTooLarge {
+                StatusCode::INSUFFICIENT_STORAGE
+            } else {
+                StatusCode::FORBIDDEN
+            });
             return;
         }
     };
-
-    let list_f = |out: &mut Vec<u8>| {
-        let mut list: Vec<_> = rd
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let path = entry.path();
-                let name = entry.file_name();
-                if is_internal_name(&name) || config.is_symlink_denied(is_symlink(&path), &path) {
-                    return None;
-                }
-                // Each entry is inspected once, never inside the sort comparator.
-                let metadata = path.metadata().ok()?;
-                let is_file = is_actually_file(&metadata.file_type(), &path);
-                let name = name.to_string_lossy().into_owned();
-                Some((is_file, name.to_lowercase(), name, path, metadata))
-            })
-            .collect();
-        list.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
-
-        for (is_file, _, fname, path, fmeta) in list {
-            let len = file_length(&fmeta, &path);
-            let modified = file_time_modified(&fmeta);
-
-            let size_display = if is_file {
-                format!(
-                    "<abbr title=\"{} B\">{}</abbr>",
-                    len,
-                    HumanReadableSize(len)
-                )
-            } else {
-                "&nbsp;".to_string()
-            };
-
-            let manage_col = if show_file_management_controls {
-                let mut s = String::from(
-                    "<td><a href class=\"delete_file_icon\" onclick=\"delete_onclick(arguments[0])\">Delete</a>",
-                );
-                if config.webdav >= WebDavLevel::MkColMoveOnly {
-                    s.push_str(" <a href class=\"rename_icon\" onclick=\"rename_onclick(arguments[0])\">Rename</a>");
-                }
-                s.push_str("</td>");
-                s
-            } else {
-                String::new()
-            };
-
-            let escaped_fname = encode_tail_if_trimmed(escape_specials(&fname));
-
-            let _ = writeln!(
-                out,
-                "<tr id=\"{}\"><td><a href=\"{}{}\" tabindex=\"-1\" class=\"{}{}_icon\"></a></td> <td><a \
-                 href=\"{}{}\">{}{}</a></td> <td><a href=\"{}{}\" tabindex=\"-1\"><time ms={}>{}</time></a></td> \
-                 <td><a href=\"{}{}\" tabindex=\"-1\">{}</a></td> {}</tr>",
-                NoDoubleQuotes(&fname),
-                relpath_escaped,
-                escaped_fname,
-                if is_file { "file" } else { "dir" },
-                file_icon_suffix(&path, is_file),
-                relpath_escaped,
-                escaped_fname,
-                NoHtmlLiteral(&fname),
-                if is_file { "" } else { "/" },
-                relpath_escaped,
-                escaped_fname,
-                modified.timestamp_millis(),
-                modified.format("%F %T"),
-                relpath_escaped,
-                escaped_fname,
-                size_display,
-                manage_col,
-            );
+    let rows = match directory_listing_rows(
+        config,
+        entries,
+        &relpath_escaped,
+        show_file_management_controls,
+        crate::util::metadata::MAX_METADATA_BYTES,
+    ) {
+        Ok(rows) => rows,
+        Err(_) => {
+            res.status_code(StatusCode::INSUFFICIENT_STORAGE);
+            return;
         }
     };
+    let list_f = |out: &mut Vec<u8>| out.extend_from_slice(&rows);
 
     let body = directory_listing_html(
         &relpath_escaped[!is_root as usize..],
@@ -968,6 +908,12 @@ fn handle_dir_listing(
         },
     );
 
+    // Include the template and controls in the same complete-response budget.
+    if body.len() > crate::util::metadata::MAX_METADATA_BYTES {
+        res.status_code(StatusCode::INSUFFICIENT_STORAGE);
+        return;
+    }
+
     // Try encoding the generated response
     let encoded_body = try_encode_generated_response(req, config, &body);
 
@@ -987,6 +933,142 @@ fn handle_dir_listing(
         res.write_body(enc_data).ok();
     } else {
         res.write_body(body.into_bytes()).ok();
+    }
+}
+
+fn directory_listing_rows(
+    config: &AppConfig,
+    entries: Vec<std::fs::DirEntry>,
+    relpath_escaped: &str,
+    show_file_management_controls: bool,
+    maximum: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut out = crate::util::metadata::MetadataBuffer::new(maximum);
+    let mut list: Vec<_> = entries
+        .into_iter()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name();
+            if is_internal_name(&name) || config.is_symlink_denied(is_symlink(&path), &path) {
+                return None;
+            }
+            // Each entry is inspected once, never inside the sort comparator.
+            let metadata = path.metadata().ok()?;
+            let is_file = is_actually_file(&metadata.file_type(), &path);
+            let name = name.to_string_lossy().into_owned();
+            Some((is_file, name.to_lowercase(), name, path, metadata))
+        })
+        .collect();
+    list.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
+
+    for (is_file, _, fname, path, fmeta) in list {
+        let len = file_length(&fmeta, &path);
+        let modified = file_time_modified(&fmeta);
+
+        let size_display = if is_file {
+            format!(
+                "<abbr title=\"{} B\">{}</abbr>",
+                len,
+                HumanReadableSize(len)
+            )
+        } else {
+            "&nbsp;".to_string()
+        };
+
+        let manage_col = if show_file_management_controls {
+            let mut s = String::from(
+                "<td><a href class=\"delete_file_icon\" onclick=\"delete_onclick(arguments[0])\">Delete</a>",
+            );
+            if config.webdav >= WebDavLevel::MkColMoveOnly {
+                s.push_str(" <a href class=\"rename_icon\" onclick=\"rename_onclick(arguments[0])\">Rename</a>");
+            }
+            s.push_str("</td>");
+            s
+        } else {
+            String::new()
+        };
+
+        let escaped_fname = encode_tail_if_trimmed(escape_specials(&fname));
+
+        writeln!(
+            &mut out,
+            "<tr id=\"{}\"><td><a href=\"{}{}\" tabindex=\"-1\" class=\"{}{}_icon\"></a></td> <td><a \
+             href=\"{}{}\">{}{}</a></td> <td><a href=\"{}{}\" tabindex=\"-1\"><time ms={}>{}</time></a></td> \
+             <td><a href=\"{}{}\" tabindex=\"-1\">{}</a></td> {}</tr>",
+            NoDoubleQuotes(&fname),
+            relpath_escaped,
+            escaped_fname,
+            if is_file { "file" } else { "dir" },
+            file_icon_suffix(&path, is_file),
+            relpath_escaped,
+            escaped_fname,
+            NoHtmlLiteral(&fname),
+            if is_file { "" } else { "/" },
+            relpath_escaped,
+            escaped_fname,
+            modified.timestamp_millis(),
+            modified.format("%F %T"),
+            relpath_escaped,
+            escaped_fname,
+            size_display,
+            manage_col,
+        )?;
+    }
+    Ok(out.into_bytes())
+}
+
+#[cfg(test)]
+mod listing_budget_tests {
+    use salvo::test::{ResponseExt, TestClient};
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    #[test]
+    fn html_rows_stop_at_the_output_budget_without_losing_escaping() {
+        let directory = TestDir::new();
+        std::fs::write(directory.path().join("a&b.txt"), b"content").unwrap();
+        let config = config(directory.path(), &[]);
+        let rows = directory_listing_rows(
+            &config,
+            crate::util::metadata::directory_entries(directory.path()).unwrap(),
+            "/",
+            false,
+            4096,
+        )
+        .unwrap();
+        assert!(std::str::from_utf8(&rows).unwrap().contains("a&amp;b.txt"));
+        assert_eq!(
+            directory_listing_rows(
+                &config,
+                crate::util::metadata::directory_entries(directory.path()).unwrap(),
+                "/",
+                false,
+                rows.len() - 1,
+            )
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::FileTooLarge
+        );
+    }
+
+    #[tokio::test]
+    async fn wide_html_listings_reject_before_encoding_or_rendering_partial_rows() {
+        let directory = TestDir::new();
+        for index in 0..=crate::util::metadata::MAX_METADATA_ENTRIES {
+            std::fs::File::create(directory.path().join(format!("entry-{index}.txt"))).unwrap();
+        }
+        let service = Service::new(crate::build_router(config(directory.path(), &[])));
+        let mut response = TestClient::get("http://localhost/")
+            .add_header("Accept", "text/html", true)
+            .add_header("Accept-Encoding", "gzip", true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::INSUFFICIENT_STORAGE));
+        assert!(!response.headers().contains_key("content-encoding"));
+        let body = response.take_bytes(None).await.unwrap();
+        assert!(body.len() < 4096);
+        assert!(!String::from_utf8_lossy(&body).contains("entry-0.txt"));
     }
 }
 
