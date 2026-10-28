@@ -11,9 +11,21 @@ pub fn load_identity(
 ) -> Result<salvo::conn::rustls::RustlsConfig, Error> {
     use salvo::conn::rustls::{Keycert, RustlsConfig};
 
+    // OpenSSL's Windows file BIO does not accept Rust's verbatim canonical paths.
+    #[cfg(windows)]
+    let openssl_path = {
+        let path = path.to_string_lossy();
+        if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+            PathBuf::from(format!(r"\\{unc}"))
+        } else {
+            PathBuf::from(path.strip_prefix(r"\\?\").unwrap_or(&path))
+        }
+    };
+    #[cfg(not(windows))]
+    let openssl_path = path;
     let output = Command::new("openssl")
         .args(["pkcs12", "-in"])
-        .arg(path)
+        .arg(openssl_path)
         .args([
             "-nodes",
             "-passin",
@@ -119,7 +131,7 @@ mod tests {
         let ((_, path), password) =
             generate_tls_data(&(dir.path().display().to_string(), dir.path().to_owned())).unwrap();
         let acceptor = TcpListener::new("127.0.0.1:0")
-            .rustls(load_identity(&path, &password).unwrap())
+            .rustls(load_identity(&path.canonicalize().unwrap(), &password).unwrap())
             .try_bind()
             .await
             .unwrap();
