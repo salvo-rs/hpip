@@ -1488,7 +1488,12 @@ fn copy_move_work(req: &mut Request, config: &Arc<AppConfig>, res: &mut Response
             res.status_code(StatusCode::PRECONDITION_FAILED);
             return;
         }
-        if !is_move && dest_p.is_dir() && fs::remove_dir(&dest_p).is_err() {
+        // Preserve the existing collection until the complete copy is ready.
+        // Retain the current policy of refusing nonempty destination collections.
+        if !is_move
+            && dest_p.is_dir()
+            && !fs::read_dir(&dest_p).is_ok_and(|mut entries| entries.next().is_none())
+        {
             res.status_code(StatusCode::LOCKED);
             return;
         }
@@ -1516,39 +1521,11 @@ fn copy_move_work(req: &mut Request, config: &Arc<AppConfig>, res: &mut Response
         return;
     }
 
-    let source_file = req_p.is_file();
-    if source_file {
-        copy_response(res, fs::copy(&req_p, &dest_p).map(|_| ()), overwritten);
-    } else {
-        match depth {
-            Depth::Zero if !is_move => copy_response(res, fs::create_dir(&dest_p), overwritten),
-            Depth::Infinity => match copy_dir(&req_p, &dest_p) {
-                Ok(errors) => {
-                    if errors.is_empty() {
-                        copy_response(res, Ok(()), overwritten);
-                    } else {
-                        res.status_code(StatusCode::MULTI_STATUS);
-                        if let Ok(xml_bytes) = copy_response_multierror(&errors, &url_path_raw) {
-                            res.headers_mut().insert(
-                                salvo::http::header::CONTENT_TYPE,
-                                "text/xml; charset=utf-8".parse().unwrap(),
-                            );
-                            res.write_body(xml_bytes).ok();
-                        }
-                    }
-                }
-                Err(_) => copy_response(res, Err(IoError::other("copy failed")), overwritten),
-            },
-            _ => {
-                set_error(
-                    res,
-                    StatusCode::BAD_REQUEST,
-                    "400 Bad Request",
-                    &format!("Invalid depth: {}", depth),
-                );
-            }
-        }
+    let result = crate::util::namespace::copy_replace(&req_p, &dest_p, depth == Depth::Infinity);
+    if let Err(error) = &result {
+        log_msg(config.log, &format!("COPY failed: {error}"));
     }
+    copy_response(res, result, overwritten);
 }
 
 fn control_header<T>(
@@ -1616,43 +1593,6 @@ fn copy_response(res: &mut Response, op_result: std::io::Result<()>, overwritten
     }
 }
 
-fn copy_response_multierror(
-    errors: &[(IoError, String)],
-    base_url: &str,
-) -> Result<Vec<u8>, String> {
-    let mut out = initialise_xml_output().map_err(|e| e.to_string())?;
-    out.write(
-        XmlWEvent::start_element("D:multistatus")
-            .ns(WEBDAV_XML_NAMESPACE_DAV.0, WEBDAV_XML_NAMESPACE_DAV.1),
-    )
-    .map_err(|e| e.to_string())?;
-    out.write(XmlWEvent::start_element("D:response"))
-        .map_err(|e| e.to_string())?;
-
-    for (_, subp) in errors {
-        out.write(XmlWEvent::start_element("D:href"))
-            .map_err(|e| e.to_string())?;
-        let href = format!("{}/{}", base_url.trim_end_matches('/'), subp);
-        out.write(XmlWEvent::characters(&href))
-            .map_err(|e| e.to_string())?;
-        out.write(XmlWEvent::end_element())
-            .map_err(|e| e.to_string())?;
-    }
-
-    out.write(XmlWEvent::start_element("D:status"))
-        .map_err(|e| e.to_string())?;
-    out.write(XmlWEvent::characters("HTTP/1.1 507 Insufficient Storage"))
-        .map_err(|e| e.to_string())?;
-    out.write(XmlWEvent::end_element())
-        .map_err(|e| e.to_string())?;
-    out.write(XmlWEvent::end_element())
-        .map_err(|e| e.to_string())?;
-    out.write(XmlWEvent::end_element())
-        .map_err(|e| e.to_string())?;
-
-    Ok(out.into_inner())
-}
-
 // ─── Helpers ───────────────────────────────────────────
 
 fn set_error(res: &mut Response, status: StatusCode, title: &str, msg: &str) {
@@ -1665,6 +1605,51 @@ fn set_error(res: &mut Response, status: StatusCode, title: &str, msg: &str) {
     res.headers_mut()
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
     res.render(Text::Html(body));
+}
+
+#[cfg(test)]
+mod overwrite_copy_tests {
+    use salvo::test::RequestBuilder;
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    #[tokio::test]
+    async fn descendant_copy_failure_keeps_existing_target_and_success_replaces_complete_content() {
+        let fixture = TestDir::new();
+        fs::create_dir(fixture.path().join("source")).unwrap();
+        fs::write(fixture.path().join("source/payload"), b"new payload").unwrap();
+        fs::create_dir(fixture.path().join("source/child")).unwrap();
+        fs::create_dir(fixture.path().join("target")).unwrap();
+        let service = Service::new(crate::build_router(config(fixture.path(), &["-w", "-d"])));
+        let response = RequestBuilder::new("http://localhost/source", "COPY".parse().unwrap())
+            .add_header("Destination", "/source/child", true)
+            .add_header("Overwrite", "T", true)
+            .send(&service)
+            .await;
+        assert!(!response.status_code.unwrap().is_success());
+        assert!(fixture.path().join("source/child").is_dir());
+        assert_eq!(
+            fs::read(fixture.path().join("source/payload")).unwrap(),
+            b"new payload"
+        );
+        let response = RequestBuilder::new("http://localhost/source", "COPY".parse().unwrap())
+            .add_header("Destination", "/target", true)
+            .add_header("Overwrite", "T", true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::NO_CONTENT));
+        assert_eq!(
+            fs::read(fixture.path().join("target/payload")).unwrap(),
+            b"new payload"
+        );
+        assert!(fixture.path().join("target/child").is_dir());
+        assert!(
+            fs::read_dir(fixture.path())
+                .unwrap()
+                .all(|entry| !is_internal_name(&entry.unwrap().file_name()))
+        );
+    }
 }
 
 #[cfg(test)]
