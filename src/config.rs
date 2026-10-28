@@ -3,8 +3,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Mutex, RwLock};
 
 use cidr::IpCidr;
 
@@ -44,6 +44,7 @@ pub struct AppConfig {
     #[allow(dead_code)]
     pub request_bandwidth: Option<NonZeroU64>,
 
+    pub encoding_gates: [Mutex<()>; 64],
     pub cache_gen: RwLock<CacheT<Vec<u8>>>,
     pub cache_fs_files: RwLock<HashMap<String, blake3::Hash>>,
     pub cache_fs: RwLock<CacheT<(PathBuf, bool, u64)>>,
@@ -159,6 +160,7 @@ impl AppConfig {
                 opts.encode_fs,
                 "encoded",
             ),
+            encoding_gates: std::array::from_fn(|_| Mutex::new(())),
             cache_gen: Default::default(),
             cache_fs: Default::default(),
             cache_fs_files: Default::default(),

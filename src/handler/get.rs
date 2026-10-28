@@ -348,59 +348,56 @@ fn try_encoded_file(
     encoding: EncodingType,
     remote: &str,
 ) -> Option<Vec<u8>> {
+    // Include the path because metadata tags can collide between different files.
+    let index_key = format!("{}:{etag}", req_p.display());
     // Check if we have it cached
     let hash = {
         let cache = config.cache_fs_files.read().ok()?;
-        cache.get(etag).cloned()
+        cache.get(&index_key).cloned()
     };
 
     let hash = match hash {
         Some(h) => h,
         None => {
             let h = file_hash(req_p).ok()?;
-            config
-                .cache_fs_files
-                .write()
-                .ok()?
-                .insert(etag.to_string(), h);
+            config.cache_fs_files.write().ok()?.insert(index_key, h);
             h
         }
     };
 
     let cache_key = (hash, encoding);
+    // Fixed stripes bound coordination metadata while coalescing identical work.
+    let _generation = config.encoding_gates[hash.as_bytes()[0] as usize % 64]
+        .lock()
+        .ok()?;
 
-    // Check fs cache
-    {
+    let cached_path = {
         let cache = config.cache_fs.read().ok()?;
-        if let Some(((resp_p, true, _), atime)) = cache.get(&cache_key)
-            && let Ok(data) = std::fs::read(resp_p)
-        {
-            atime.store(precise_time_ns(), AtomicOrdering::Relaxed);
-            let orig_len = req_p
-                .metadata()
-                .map(|m| file_length(&m, req_p))
-                .unwrap_or(0);
-            log_msg(
-                config.log,
-                &format!(
-                    "{} encoded as {} for {:.1}% ratio (cached)",
-                    remote,
-                    encoding_name(encoding),
-                    (orig_len as f64) / (data.len() as f64) * 100.0
-                ),
-            );
-            return Some(data);
+        match cache.get(&cache_key) {
+            Some(((path, true, _), atime)) => {
+                atime.store(precise_time_ns(), AtomicOrdering::Relaxed);
+                Some(path.clone())
+            }
+            Some(((_, false, _), _)) => return None,
+            None => None,
         }
-        if let Some(((_, false, _), _)) = cache.get(&cache_key) {
-            // Previously determined not worth encoding
-            return None;
-        }
+    };
+    if let Some(path) = cached_path
+        && let Ok(data) = std::fs::read(path)
+    {
+        return Some(data);
     }
 
     // Encode the file
     config.create_temp_dir(&config.encoded_temp_dir);
     let temp_dir = &config.encoded_temp_dir.as_ref()?.1;
-    let mut resp_p = temp_dir.join(cache_key.0.to_hex().as_str());
+    static NEXT_ENCODING: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT_ENCODING.fetch_add(1, AtomicOrdering::Relaxed);
+    let mut resp_p = temp_dir.join(format!(
+        "{}-{}-{sequence}",
+        cache_key.0.to_hex(),
+        std::process::id()
+    ));
 
     let ext_str = req_p.extension().and_then(|e| e.to_str()).unwrap_or("");
     let enc_ext = encoding_extension(encoding);
@@ -410,8 +407,9 @@ fn try_encoded_file(
         resp_p.set_extension(format!("{}.{}", ext_str, enc_ext));
     }
 
-    if encode_file(req_p, &resp_p, encoding) {
-        let resp_meta = resp_p.metadata().ok()?;
+    let pending = PendingEncoding(resp_p.with_extension(format!("{}.partial", enc_ext)));
+    if encode_file(req_p, &pending.0, encoding) {
+        let resp_meta = pending.0.metadata().ok()?;
         let resp_len = resp_meta.len();
         let orig_len = req_p
             .metadata()
@@ -440,6 +438,7 @@ fn try_encoded_file(
             ),
         );
 
+        std::fs::rename(&pending.0, &resp_p).ok()?;
         let data = std::fs::read(&resp_p).ok()?;
         if !config.cache_file(cache_key, resp_p.clone(), resp_len) {
             let _ = std::fs::remove_file(&resp_p);
@@ -458,6 +457,14 @@ fn try_encoded_file(
         ),
     );
     None
+}
+
+struct PendingEncoding(PathBuf);
+
+impl Drop for PendingEncoding {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 async fn handle_get_file_range(
@@ -935,6 +942,10 @@ fn try_encode_generated_response(
     let encoding = response_encoding(accept_enc)?;
     let hash = blake3::hash(body.as_bytes());
     let cache_key = (hash, encoding);
+    // Fixed stripes bound coordination metadata while coalescing identical work.
+    let _generation = config.encoding_gates[hash.as_bytes()[0] as usize % 64]
+        .lock()
+        .ok()?;
 
     // Check gen cache
     {
@@ -1027,5 +1038,57 @@ mod range_tests {
             .await;
         assert!(response.body.is_channel());
         assert_eq!(response.take_bytes(None).await.unwrap().as_ref(), data);
+    }
+
+    #[test]
+    fn concurrent_cold_encodings_publish_one_complete_file() {
+        let dir = crate::test_support::TestDir::new();
+        let path = dir.path().join("data.txt");
+        let data = b"compressible fixture\n".repeat(20_000);
+        std::fs::write(&path, &data).unwrap();
+        let config = crate::test_support::config(dir.path(), &[]);
+        let barrier = std::sync::Barrier::new(12);
+        std::thread::scope(|scope| {
+            let mut tasks = Vec::new();
+            for _ in 0..12 {
+                tasks.push(scope.spawn(|| {
+                    barrier.wait();
+                    super::try_encoded_file(
+                        &config,
+                        &path,
+                        "fixture",
+                        crate::config::EncodingType::Gzip,
+                        "test",
+                    )
+                    .unwrap()
+                }));
+            }
+            for task in tasks {
+                let compressed = task.join().unwrap();
+                let mut decoded = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut flate2::read::GzDecoder::new(compressed.as_slice()),
+                    &mut decoded,
+                )
+                .unwrap();
+                assert_eq!(decoded, data);
+            }
+        });
+        let cache = config.cache_fs.read().unwrap();
+        assert_eq!(cache.len(), 1);
+        let ((cached_path, _, size), _) = cache.values().next().unwrap();
+        assert_eq!(
+            config
+                .cache_fs_size
+                .load(std::sync::atomic::Ordering::Relaxed),
+            *size
+        );
+        assert_eq!(std::fs::metadata(cached_path).unwrap().len(), *size);
+        assert_eq!(
+            std::fs::read_dir(&config.encoded_temp_dir.as_ref().unwrap().1)
+                .unwrap()
+                .count(),
+            1
+        );
     }
 }
