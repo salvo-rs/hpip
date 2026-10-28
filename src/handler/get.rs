@@ -35,12 +35,15 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
     }
 
     let url_path_raw = req.uri().path().to_string();
-    let url_path_str = percent_encoding::percent_decode_str(&url_path_raw)
+    let decoded_path = percent_encoding::percent_decode_str(&url_path_raw)
         .decode_utf8()
-        .map(|s| s.to_string())
-        .unwrap_or_default();
+        .map(|s| s.to_string());
+    let Ok(url_path_str) = decoded_path else {
+        handle_invalid_url(req, res, &config);
+        return;
+    };
 
-    let segments: Vec<&str> = url_path_str.split('/').filter(|s| !s.is_empty()).collect();
+    let segments: Vec<&str> = url_path_raw.split('/').filter(|s| !s.is_empty()).collect();
 
     let (mut req_p, symlink, url_err) = resolve_path(
         &config.hosted_directory.1,
