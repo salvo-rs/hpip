@@ -111,6 +111,7 @@ pub(super) fn select(req: &Request, config: &AppConfig, path: &Path) -> Represen
         return Representation::File;
     }
     let preferences = preferences(req);
+    let mut missing = false;
     let normal = if path.is_dir() {
         super::get::index_file(config, path)
             .map(|index| guess_mime_type(&index, &config.mime_type_overrides))
@@ -128,10 +129,20 @@ pub(super) fn select(req: &Request, config: &AppConfig, path: &Path) -> Represen
                         })
                 })
                 .flatten();
-        guess_mime_type(
-            extension_candidate.as_deref().unwrap_or(path),
-            &config.mime_type_overrides,
-        )
+        missing = !path.exists() && extension_candidate.is_none();
+        if missing {
+            config
+                .try_404
+                .as_ref()
+                .filter(|fallback| fallback.is_file())
+                .map(|fallback| guess_mime_type(fallback, &config.mime_type_overrides))
+                .unwrap_or_else(|| "text/html; charset=utf-8".to_owned())
+        } else {
+            guess_mime_type(
+                extension_candidate.as_deref().unwrap_or(path),
+                &config.mime_type_overrides,
+            )
+        }
     };
     let normal: mime::Mime = normal.parse().unwrap_or(mime::APPLICATION_OCTET_STREAM);
     let mut candidates = vec![(Representation::File, normal, false)];
@@ -165,7 +176,12 @@ pub(super) fn select(req: &Request, config: &AppConfig, path: &Path) -> Represen
             best = Some(score);
         }
     }
-    selected
+    // Representation negotiation must not replace an otherwise applicable 404.
+    if missing && selected == Representation::NotAcceptable {
+        Representation::File
+    } else {
+        selected
+    }
 }
 
 #[cfg(test)]
@@ -270,6 +286,69 @@ mod tests {
             assert_eq!(response.headers()["content-type"], "text/html");
             response.take_bytes(None).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn missing_resources_keep_their_404_and_configured_fallback() {
+        let dir = crate::test_support::TestDir::new();
+        let fallback = dir.path().join("fallback.html");
+        std::fs::write(&fallback, "<p>fallback fixture</p>").unwrap();
+        for flags in [vec![], vec!["--404", fallback.to_str().unwrap()]] {
+            let service = Service::new(crate::build_router(crate::test_support::config(
+                dir.path(),
+                &flags,
+            )));
+            for accept in ["text/html", "text/plain", "*/*;q=0"] {
+                for request in [
+                    TestClient::get("http://localhost/client-route"),
+                    TestClient::head("http://localhost/client-route"),
+                ] {
+                    let response = request
+                        .add_header("Accept", accept, true)
+                        .send(&service)
+                        .await;
+                    assert_eq!(
+                        response.status_code,
+                        Some(StatusCode::NOT_FOUND),
+                        "{flags:?} {accept}"
+                    );
+                }
+            }
+            let mut response = TestClient::get("http://localhost/client-route")
+                .add_header("Accept", "text/html", true)
+                .send(&service)
+                .await;
+            let body = response.take_string().await.unwrap();
+            if flags.is_empty() {
+                assert!(body.contains("client-route"));
+            } else {
+                assert_eq!(body, "<p>fallback fixture</p>");
+            }
+        }
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &["--404", fallback.to_str().unwrap()],
+        )));
+        let mut response = TestClient::get("http://localhost/client-route")
+            .add_header("Accept", "text/html;q=1,application/json;q=0.1", true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::NOT_FOUND));
+        assert_eq!(
+            response.take_string().await.unwrap(),
+            "<p>fallback fixture</p>"
+        );
+        let response = TestClient::get("http://localhost/client-route")
+            .add_header("Accept", "application/json", true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::NOT_FOUND));
+        assert!(
+            response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json")
+        );
     }
 
     #[test]
