@@ -220,8 +220,10 @@ fn copy_symlink(from: &Path, to: &Path) -> IoResult<()> {
 
 /// Parse a Win32 time string to ms since epoch
 pub fn win32time(t: &str) -> Option<u64> {
-    let tm = chrono::DateTime::parse_from_str(t, "%a, %d %b %Y %T %Z").ok()?;
-    Some(tm.timestamp_millis() as u64)
+    let tm = chrono::DateTime::parse_from_rfc2822(t)
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(t))
+        .ok()?;
+    tm.timestamp_millis().try_into().ok()
 }
 
 #[cfg(test)]
