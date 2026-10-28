@@ -392,10 +392,14 @@ impl Options {
             log_colour: !cli.no_colour,
             webdav,
             archives: cli.archives,
-            tls_data: cli.ssl.map(|id| {
-                let id_pb = std::fs::canonicalize(&id).expect("TLS identity file not found");
-                ((id, id_pb), env::var("HTTP_SSL_PASS").unwrap_or_default())
-            }),
+            tls_data: cli
+                .ssl
+                .map(|id| {
+                    let id_pb = std::fs::canonicalize(&id)
+                        .map_err(|e| Error(format!("TLS identity file unavailable: {e}")))?;
+                    Ok::<_, Error>(((id, id_pb), env::var("HTTP_SSL_PASS").unwrap_or_default()))
+                })
+                .transpose()?,
             generate_tls: cli.gen_ssl,
             path_auth_data,
             generate_path_auth,

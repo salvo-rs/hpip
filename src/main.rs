@@ -20,6 +20,7 @@ use std::sync::Arc;
 use config::AppConfig;
 use error::Error;
 use options::Options;
+use salvo::conn::tcp::{DynTcpAcceptor, DynTcpAcceptors, ToDynTcpAcceptor};
 use salvo::prelude::*;
 
 fn main() {
@@ -156,7 +157,25 @@ async fn result_main() -> Result<(), Error> {
     let bind_addr = format!("{}:{}", opts.bind_address, port);
 
     // Start the server
-    let acceptor = TcpListener::new(bind_addr).bind().await;
+    let listener = TcpListener::new(bind_addr);
+    let acceptor: Box<dyn DynTcpAcceptor> = if let Some(((_, identity), password)) = &opts.tls_data
+    {
+        let tls_config = tls::load_identity(identity, password)?;
+        Box::new(ToDynTcpAcceptor(
+            listener
+                .rustls(tls_config)
+                .try_bind()
+                .await
+                .map_err(|e| Error(format!("Starting TLS listener: {e}")))?,
+        ))
+    } else {
+        Box::new(ToDynTcpAcceptor(
+            listener
+                .try_bind()
+                .await
+                .map_err(|e| Error(format!("Starting listener: {e}")))?,
+        ))
+    };
 
     // Spawn cache pruning task if needed
     let config_prune = config.clone();
@@ -179,7 +198,7 @@ async fn result_main() -> Result<(), Error> {
         let _ = shutdown_tx.send(());
     });
 
-    let server = Server::new(acceptor);
+    let server = Server::new(DynTcpAcceptors::new(vec![acceptor]));
 
     tokio::select! {
         _ = server.serve(router) => {}
