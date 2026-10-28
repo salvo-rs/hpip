@@ -146,12 +146,15 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
     {
         let mut cached = super::get::cached_file_encoding(&config, &path, &etag, encoding);
         if cached.is_none()
-            && req
-                .headers()
-                .get("if-match")
-                .is_some_and(|value| value != "*")
+            && ["if-match", "if-none-match"].iter().any(|name| {
+                crate::util::entity_tag::request_tag_field(req, name)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|value| value.trim() != "*")
+            })
         {
-            // A specific strong precondition needs the actual selected coding.
+            // Specific tag conditions need the actual selected coding, even
+            // when this HEAD is the first request after the cache was lost.
             // Ordinary cold HEAD requests still avoid all encoding work.
             cached = Some(
                 super::get::encoded_file_job(

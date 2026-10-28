@@ -381,6 +381,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cold_head_if_none_match_resolves_the_selected_validator() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::write(dir.path().join("file.txt"), "compressible\n".repeat(2000)).unwrap();
+        let warm = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &[],
+        )));
+        let get = TestClient::get("http://localhost/file.txt")
+            .add_header("Accept-Encoding", "gzip", true)
+            .send(&warm)
+            .await;
+        let tag = get.headers()["etag"].to_str().unwrap();
+        for fields in [
+            vec![tag.to_owned()],
+            vec![format!("W/{tag}")],
+            vec![r#""other,*,tag""#.to_owned(), tag.to_owned()],
+        ] {
+            let cold = Service::new(crate::build_router(crate::test_support::config(
+                dir.path(),
+                &[],
+            )));
+            let mut request = TestClient::head("http://localhost/file.txt").add_header(
+                "Accept-Encoding",
+                "gzip",
+                true,
+            );
+            for value in fields {
+                request = request.add_header("If-None-Match", value, false);
+            }
+            let mut response = request.send(&cold).await;
+            assert_eq!(response.status_code, Some(StatusCode::NOT_MODIFIED));
+            assert_eq!(response.headers()["etag"], tag);
+            assert!(response.take_bytes(None).await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn if_range_requires_the_current_date_or_a_strong_entity_tag() {
         let dir = crate::test_support::TestDir::new();
         std::fs::write(dir.path().join("file.txt"), "fixture").unwrap();
