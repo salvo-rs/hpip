@@ -99,7 +99,7 @@ impl AppConfig {
             }
         }
 
-        let mut allowed_methods = vec!["OPTIONS", "GET", "HEAD", "TRACE"]
+        let mut allowed_methods = vec!["OPTIONS", "GET", "HEAD"]
             .into_iter()
             .map(String::from)
             .collect::<Vec<_>>();

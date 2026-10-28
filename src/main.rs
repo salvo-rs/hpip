@@ -241,6 +241,7 @@ fn build_router(config: Arc<AppConfig>) -> Router {
     fn add_methods(router: Router, webdav_level: options::WebDavLevel) -> Router {
         let mut r = router
             .get(handler::get::handle_get)
+            .head(handler::head::handle_head)
             .put(handler::put::handle_put)
             .delete(handler::delete::handle_delete)
             .post(handler::archive::handle_post_archive)
