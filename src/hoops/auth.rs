@@ -316,12 +316,13 @@ mod tests {
                 .send(&service)
                 .await;
             assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
-            let response = TestClient::get("http://localhost/collection/")
+            let mut response = TestClient::get("http://localhost/collection/")
                 .basic_auth("user", Some("pass"))
                 .add_header("Accept", accept, true)
                 .send(&service)
                 .await;
             assert_eq!(response.status_code, Some(StatusCode::OK));
+            assert!(!response.take_bytes(None).await.unwrap().is_empty());
         }
         for method in ["DELETE", "PROPFIND", "COPY", "MOVE"] {
             let mut request = TestClient::get("http://localhost/collection/")
