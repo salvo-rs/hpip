@@ -218,6 +218,21 @@ impl Options {
     }
 
     fn from_cli(cli: Cli) -> Result<Options, Error> {
+        if !cli.proxy.is_empty() || !cli.proxy_redir.is_empty() {
+            return Err(Error(
+                "Proxy header options are not implemented; remove --proxy and --proxy-redir".into(),
+            ));
+        }
+        if cli
+            .request_bandwidth
+            .as_deref()
+            .map(Self::bandwidth_parse)
+            .transpose()?
+            .flatten()
+            .is_some()
+        {
+            return Err(Error("Per-request bandwidth limiting is not implemented; remove --request-bandwidth or set it to 0".into()));
+        }
         let dir = &cli.dir;
         let dir_pb = std::fs::canonicalize(dir)
             .map_err(|_| Error(format!("Directory to host \"{}\" not found", dir)))?;
@@ -595,5 +610,28 @@ impl Options {
             })
             .map(|(hn, hd)| (hn.to_string(), hd.as_bytes().to_vec()))
             .ok_or_else(|| Error(format!("\"{}\" invalid header format", s)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_settings_that_cannot_be_enforced() {
+        let dir = crate::test_support::TestDir::new();
+        for flags in [
+            vec!["--proxy", "X-Forwarded-For:127.0.0.0/8"],
+            vec!["--proxy-redir", "X-Original-URL:127.0.0.0/8"],
+            vec!["--request-bandwidth", "1"],
+        ] {
+            assert!(
+                Options::parse_test(dir.path(), &flags)
+                    .unwrap_err()
+                    .0
+                    .contains("not implemented")
+            );
+        }
+        assert!(Options::parse_test(dir.path(), &["--request-bandwidth", "0"]).is_ok());
     }
 }

@@ -19,7 +19,6 @@ Quickly host files and directories over HTTP with support for WebDAV, compressio
 - **Range Requests** - Partial content serving for resumable downloads
 - **Symlink Control** - Follow, block, or sandbox symlinks
 - **Custom Headers** - Inject arbitrary HTTP headers
-- **Proxy Support** - X-Forwarded-For with CIDR whitelisting
 - **Cross-Platform** - Windows, macOS, and Linux
 
 ## Installation
@@ -116,8 +115,8 @@ hpip -A /path/to/files
 
 | Option | Description |
 |--------|-------------|
-| `--proxy <HEADER:CIDR>` | Trust X-Forwarded-For from CIDR range |
-| `--proxy-redir <HEADER:CIDR>` | Trust X-Original-URL from CIDR range |
+| `--proxy <HEADER:CIDR>` | Reserved; currently rejected because forwarding is not implemented |
+| `--proxy-redir <HEADER:CIDR>` | Reserved; currently rejected because redirect forwarding is not implemented |
 | `-m, --mime-type <EXT:MIME>` | Override MIME type for extension |
 | `-H, --header <NAME:VALUE>` | Add custom response header |
 
@@ -141,7 +140,7 @@ hpip -A /path/to/files
 
 | Option | Description |
 |--------|-------------|
-| `--request-bandwidth <BYTES/S>` | Limit per-request bandwidth (0 = unlimited) |
+| `--request-bandwidth <BYTES/S>` | Only 0 (unlimited) is supported; nonzero limits are rejected |
 
 ## Environment Variables
 
