@@ -352,21 +352,18 @@ impl Options {
                 } else {
                     ("$TEMP".to_string(), env::temp_dir())
                 };
-                let suffix = dir_pb
-                    .to_string_lossy()
-                    .replace(r"\\?\", "")
-                    .replace(':', "")
-                    .replace('\\', "/")
-                    .replace('/', "-");
-                let suffix = if suffix.len() >= 255 - 5 {
-                    format!("hpip-{}", blake3::hash(suffix.as_bytes()).to_hex())
-                } else {
-                    format!(
-                        "hpip{}{}",
-                        if suffix.starts_with('-') { "" } else { "-" },
-                        suffix
-                    )
-                };
+                static NEXT_INSTANCE: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| Error(format!("Creating temporary namespace: {e}")))?
+                    .as_nanos();
+                let suffix = format!(
+                    ".hpip-internal-{}-{}-{}",
+                    std::process::id(),
+                    timestamp,
+                    NEXT_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                );
                 (
                     format!(
                         "{}{}{}",
@@ -633,5 +630,21 @@ mod tests {
             );
         }
         assert!(Options::parse_test(dir.path(), &["--request-bandwidth", "0"]).is_ok());
+    }
+
+    #[test]
+    fn instance_cleanup_does_not_remove_another_instances_files() {
+        let dir = crate::test_support::TestDir::new();
+        let flags = ["-t", dir.path().to_str().unwrap()];
+        let first = Options::parse_test(dir.path(), &flags).unwrap();
+        let second = Options::parse_test(dir.path(), &flags).unwrap();
+        assert_ne!(first.temp_directory.1, second.temp_directory.1);
+        let guard = crate::InstanceTemp::create(&first.temp_directory.1).unwrap();
+        let other = crate::InstanceTemp::create(&second.temp_directory.1).unwrap();
+        std::fs::write(second.temp_directory.1.join("keep"), "other instance").unwrap();
+        drop(guard);
+        assert!(second.temp_directory.1.join("keep").is_file());
+        assert!(crate::InstanceTemp::create(&second.temp_directory.1).is_err());
+        drop(other);
     }
 }

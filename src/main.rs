@@ -47,6 +47,7 @@ fn actual_main() -> i32 {
 
 async fn result_main() -> Result<(), Error> {
     let mut opts = Options::parse()?;
+    let _instance_temp = InstanceTemp::create(&opts.temp_directory.1)?;
 
     if opts.generate_tls {
         opts.tls_data = Some(tls::generate_tls_data(&opts.temp_directory)?);
@@ -210,6 +211,32 @@ async fn result_main() -> Result<(), Error> {
 
     config.clean_temp_dirs(&opts.temp_directory, opts.generate_tls);
     Ok(())
+}
+
+/// Own only the directory created exclusively for this process instance.
+struct InstanceTemp(std::path::PathBuf);
+
+impl InstanceTemp {
+    fn create(path: &std::path::Path) -> Result<Self, Error> {
+        let builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        builder
+            .create(path)
+            .map_err(|e| Error(format!("Creating private temporary directory: {e}")))?;
+        Ok(Self(path.to_owned()))
+    }
+}
+
+impl Drop for InstanceTemp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Middleware that injects the AppConfig into the Depot.
