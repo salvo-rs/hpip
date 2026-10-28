@@ -67,12 +67,34 @@ pub async fn handle_propfind(req: &mut Request, depot: &mut Depot, res: &mut Res
         return;
     }
 
-    let depth = req
+    // Infinite-depth traversal is deliberately unsupported. A missing Depth
+    // header means infinity in WebDAV and receives the same finite-depth error.
+    let depth = match req
         .headers()
         .get("Depth")
-        .and_then(|v| v.to_str().ok())
-        .and_then(Depth::parse)
-        .unwrap_or(Depth::Zero);
+        .and_then(|value| value.to_str().ok())
+    {
+        Some("0") => Depth::Zero,
+        Some("1") => Depth::One,
+        None | Some("infinity") => {
+            res.status_code(StatusCode::FORBIDDEN);
+            res.headers_mut().insert(
+                salvo::http::header::CONTENT_TYPE,
+                "application/xml".parse().unwrap(),
+            );
+            res.write_body(r#"<?xml version="1.0" encoding="utf-8"?><D:error xmlns:D="DAV:"><D:propfind-finite-depth/></D:error>"#).ok();
+            return;
+        }
+        _ => {
+            set_error(
+                res,
+                StatusCode::BAD_REQUEST,
+                "400 Bad Request",
+                "Depth must be 0 or 1.",
+            );
+            return;
+        }
+    };
 
     let body_bytes = req
         .payload()
@@ -1391,4 +1413,57 @@ fn set_error(res: &mut Response, status: StatusCode, title: &str, msg: &str) {
     res.headers_mut()
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
     res.render(Text::Html(body));
+}
+
+#[cfg(test)]
+mod depth_limit_tests {
+    use salvo::prelude::*;
+    use salvo::test::{RequestBuilder, ResponseExt};
+
+    #[tokio::test]
+    async fn propfind_requires_finite_depth_before_traversing() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::create_dir(dir.path().join("child")).unwrap();
+        std::fs::write(dir.path().join("child/grandchild.txt"), b"data").unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &["-d"],
+        )));
+        for depth in ["infinity", "2", "invalid"] {
+            let mut response =
+                RequestBuilder::new("http://localhost/", "PROPFIND".parse().unwrap())
+                    .add_header("Depth", depth, true)
+                    .send(&service)
+                    .await;
+            assert_eq!(
+                response.status_code,
+                Some(if depth == "infinity" {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::BAD_REQUEST
+                })
+            );
+            if depth == "infinity" {
+                assert!(
+                    response
+                        .take_string()
+                        .await
+                        .unwrap()
+                        .contains("propfind-finite-depth")
+                );
+            }
+        }
+        let mut response = RequestBuilder::new("http://localhost/", "PROPFIND".parse().unwrap())
+            .add_header("Depth", "1", true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::MULTI_STATUS));
+        assert!(
+            !response
+                .take_string()
+                .await
+                .unwrap()
+                .contains("grandchild.txt")
+        );
+    }
 }
