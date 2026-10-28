@@ -14,42 +14,56 @@ pub fn is_actually_file<P: AsRef<Path>>(tp: &FileType, p: P) -> bool {
         || is_device(tp)
 }
 
-/// Check if the specified file is to be considered "binary" (not valid UTF-8 text).
+/// Detect NUL or invalid UTF-8 in a bounded sample, completing a trailing character.
 pub fn file_binary<P: AsRef<Path>>(path: P) -> bool {
     file_binary_impl(path.as_ref())
 }
 
 fn file_binary_impl(path: &Path) -> bool {
-    path.metadata()
-        .map(|m| {
-            is_device(&m.file_type())
-                || File::open(path)
-                    .map_err(|_| ())
-                    .and_then(|mut f| {
-                        let mut buf = [0u8; 2048];
-                        let mut remaining = &mut buf[..];
-                        while let Ok(rd) = f.read(remaining) {
-                            if rd == 0 || remaining[0..rd].contains(&b'\0') {
-                                return Err(());
-                            }
-                            if let Some(idx) = remaining[0..rd].iter().position(|&b| b == b'\n') {
-                                remaining = &mut remaining[idx..];
-                                let remaining_len = remaining.len();
-                                let _ = remaining;
-                                return str::from_utf8(&buf[0..buf.len() - remaining_len])
-                                    .map(|_| ())
-                                    .map_err(|_| ());
-                            }
-                            remaining = &mut remaining[rd..];
-                            if remaining.is_empty() {
-                                break;
-                            }
-                        }
-                        Err(())
-                    })
-                    .is_err()
-        })
-        .unwrap_or(true)
+    let Ok(metadata) = path.metadata() else {
+        return true;
+    };
+    // Do not open special files just to sniff their content: opening a FIFO can block.
+    if is_device(&metadata.file_type()) {
+        return true;
+    }
+    let Ok(mut file) = File::open(path) else {
+        return true;
+    };
+    const SAMPLE: usize = 2048;
+    let mut buffer = [0_u8; SAMPLE + 3];
+    let mut length = 0;
+    while length < SAMPLE {
+        match file.read(&mut buffer[length..SAMPLE]) {
+            Ok(0) => break,
+            Ok(read) => length += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return true,
+        }
+    }
+    if buffer[..length].contains(&0) {
+        return true;
+    }
+    match str::from_utf8(&buffer[..length]) {
+        Ok(_) => false,
+        Err(error) if error.error_len().is_none() && length == SAMPLE => {
+            // The sample may end inside one UTF-8 scalar. Read only its missing
+            // continuation bytes, never the rest of an arbitrarily large file.
+            let start = error.valid_up_to();
+            let width = match buffer[start] {
+                0xc2..=0xdf => 2,
+                0xe0..=0xef => 3,
+                0xf0..=0xf4 => 4,
+                _ => return true,
+            };
+            let end = start + width;
+            if file.read_exact(&mut buffer[length..end]).is_err() {
+                return true;
+            }
+            str::from_utf8(&buffer[..end]).is_err()
+        }
+        Err(_) => true,
+    }
 }
 
 /// Get the suffix for the icon to use to represent the given file.
@@ -123,5 +137,90 @@ pub fn file_length<P: AsRef<Path> + ?Sized>(meta: &Metadata, _path: &P) -> u64 {
         meta.len()
     } else {
         meta.len()
+    }
+}
+
+#[cfg(test)]
+mod mime_sample_tests {
+    use salvo::prelude::*;
+    use salvo::test::{RequestBuilder, ResponseExt, TestClient};
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    #[test]
+    fn valid_utf8_without_a_newline_is_text_and_invalid_bytes_stay_binary() {
+        let directory = TestDir::new();
+        let path = directory.path().join("sample");
+        for content in [b"".as_slice(), b"hello", "中文".as_bytes(), b"hello\n"] {
+            std::fs::write(&path, content).unwrap();
+            assert!(!file_binary(&path), "{content:?}");
+        }
+        for content in [
+            b"hello\0".as_slice(),
+            b"hello\xff",
+            b"hello\n\xff",
+            b"\xe4\xb8",
+        ] {
+            std::fs::write(&path, content).unwrap();
+            assert!(file_binary(&path), "{content:?}");
+        }
+    }
+
+    #[test]
+    fn a_sample_boundary_completes_one_utf8_scalar_but_rejects_incomplete_files() {
+        let directory = TestDir::new();
+        let path = directory.path().join("sample");
+        for (padding, character) in [(2047, "é"), (2047, "中"), (2045, "😀")] {
+            let mut content = vec![b'a'; padding];
+            content.extend(character.as_bytes());
+            content.extend(b"tail beyond sample");
+            std::fs::write(&path, content).unwrap();
+            assert!(!file_binary(&path));
+        }
+        for tail in [b"\xe4".as_slice(), b"\xe4xy"] {
+            let mut content = vec![b'a'; 2047];
+            content.extend(tail);
+            std::fs::write(&path, content).unwrap();
+            assert!(file_binary(&path));
+        }
+    }
+
+    #[tokio::test]
+    async fn extensionless_text_negotiates_for_get_and_head_without_changing_known_types() {
+        let directory = TestDir::new();
+        std::fs::write(directory.path().join("plain"), "hello").unwrap();
+        std::fs::write(directory.path().join("unicode"), "中文").unwrap();
+        std::fs::write(
+            directory.path().join("known.png"),
+            "text does not override the suffix",
+        )
+        .unwrap();
+        let service = Service::new(crate::build_router(config(directory.path(), &[])));
+        for path in ["plain", "unicode"] {
+            for method in ["GET", "HEAD"] {
+                let mut response = RequestBuilder::new(
+                    format!("http://localhost/{path}"),
+                    method.parse().unwrap(),
+                )
+                .add_header("Accept", "text/plain", true)
+                .send(&service)
+                .await;
+                assert_eq!(response.status_code, Some(StatusCode::OK));
+                assert_eq!(response.headers()["content-type"], "text/plain");
+                if method == "GET" {
+                    assert_eq!(
+                        response.take_string().await.unwrap(),
+                        std::fs::read_to_string(directory.path().join(path)).unwrap()
+                    );
+                }
+            }
+        }
+        let response = TestClient::get("http://localhost/known.png")
+            .add_header("Accept", "image/png", true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+        assert_eq!(response.headers()["content-type"], "image/png");
     }
 }
