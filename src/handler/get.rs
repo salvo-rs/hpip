@@ -281,7 +281,7 @@ async fn handle_get_file(
             .get(salvo::http::header::ACCEPT_ENCODING)
             .and_then(|v| v.to_str().ok())
         && let Some(encoding) = response_encoding(accept_enc)
-        && let Some(encoded_data) = encoded_file_job(config, req_p, &etag, encoding, &remote).await
+        && let Some(encoded) = encoded_file_job(config, req_p, &etag, encoding, &remote).await
     {
         res.status_code(if is_404 {
             StatusCode::NOT_FOUND
@@ -312,7 +312,11 @@ async fn handle_get_file(
             .insert(salvo::http::header::ACCEPT_RANGES, "bytes".parse().unwrap());
         res.headers_mut()
             .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-        res.write_body(encoded_data).ok();
+        res.headers_mut().insert(
+            salvo::http::header::CONTENT_LENGTH,
+            encoded.length.to_string().parse().unwrap(),
+        );
+        stream_file(res, tokio::fs::File::from_std(encoded.file), encoded.length);
         return;
     }
 
@@ -372,7 +376,7 @@ async fn encoded_file_job(
     etag: &str,
     encoding: EncodingType,
     remote: &str,
-) -> Option<Vec<u8>> {
+) -> Option<EncodedFile> {
     let work_config = config.clone();
     let path = path.to_path_buf();
     let etag = etag.to_owned();
@@ -390,7 +394,7 @@ fn try_encoded_file(
     etag: &str,
     encoding: EncodingType,
     remote: &str,
-) -> Option<Vec<u8>> {
+) -> Option<EncodedFile> {
     // Include the path because metadata tags can collide between different files.
     let index_key = format!("{}:{etag}", req_p.display());
     // Check if we have it cached
@@ -431,9 +435,9 @@ fn try_encoded_file(
         }
     };
     if let Some(path) = cached_path
-        && let Ok(data) = std::fs::read(path)
+        && let Some(encoded) = EncodedFile::open(&path)
     {
-        return Some(data);
+        return Some(encoded);
     }
 
     // Encode the file
@@ -483,13 +487,13 @@ fn try_encoded_file(
         );
 
         std::fs::rename(&pending.0, &resp_p).ok()?;
-        let data = std::fs::read(&resp_p).ok()?;
+        let encoded = EncodedFile::open(&resp_p)?;
         if !config.cache_file(cache_key, resp_p.clone(), resp_len) {
             let _ = std::fs::remove_file(&resp_p);
             return None;
         }
 
-        return Some(data);
+        return Some(encoded);
     }
 
     log_msg(
@@ -501,6 +505,20 @@ fn try_encoded_file(
         ),
     );
     None
+}
+
+/// Opening before releasing the job keeps the representation alive across eviction.
+struct EncodedFile {
+    file: std::fs::File,
+    length: u64,
+}
+
+impl EncodedFile {
+    fn open(path: &Path) -> Option<Self> {
+        let file = std::fs::File::open(path).ok()?;
+        let length = file.metadata().ok()?.len();
+        Some(Self { file, length })
+    }
 }
 
 struct PendingEncoding(PathBuf);
@@ -1088,7 +1106,7 @@ mod range_tests {
                 let compressed = task.join().unwrap();
                 let mut decoded = Vec::new();
                 std::io::Read::read_to_end(
-                    &mut flate2::read::GzDecoder::new(compressed.as_slice()),
+                    &mut flate2::read::GzDecoder::new(compressed.file),
                     &mut decoded,
                 )
                 .unwrap();
@@ -1157,5 +1175,70 @@ mod range_tests {
         assert!(body.find("Zdirectory").unwrap() < body.find("afile.txt").unwrap());
         assert!(!body.contains(".HPIP-UPLOAD-secret"));
         assert!(!body.contains(".hpip-internal-secret"));
+    }
+
+    #[tokio::test]
+    async fn cold_and_cached_compressed_responses_stream() {
+        let dir = crate::test_support::TestDir::new();
+        let data = "payload ".repeat(10_000);
+        std::fs::write(dir.path().join("data.txt"), &data).unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &[],
+        )));
+        for _ in 0..2 {
+            let mut response = TestClient::get("http://localhost/data.txt")
+                .add_header("Accept-Encoding", "gzip", true)
+                .send(&service)
+                .await;
+            assert_eq!(response.headers()["content-encoding"], "gzip");
+            assert!(response.body.is_channel());
+            assert_eq!(response.take_string().await.unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn opened_encoding_survives_cache_eviction() {
+        let dir = crate::test_support::TestDir::new();
+        let path = dir.path().join("data.txt");
+        let data = b"payload ".repeat(10_000);
+        std::fs::write(&path, &data).unwrap();
+        let config = crate::test_support::config(dir.path(), &["--encoded-filesystem", "4096"]);
+        let encoded = super::try_encoded_file(
+            &config,
+            &path,
+            "test",
+            crate::config::EncodingType::Gzip,
+            "test",
+        )
+        .unwrap();
+        let cached_path = config
+            .cache_fs
+            .read()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .0
+            .0
+            .clone();
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, [0; 4096]).unwrap();
+        assert!(config.cache_file(
+            (
+                blake3::hash(b"replacement"),
+                crate::config::EncodingType::Gzip
+            ),
+            replacement,
+            4096
+        ));
+        assert!(!cached_path.exists());
+        let mut decoded = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(encoded.file),
+            &mut decoded,
+        )
+        .unwrap();
+        assert_eq!(decoded, data);
     }
 }
