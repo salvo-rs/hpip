@@ -68,6 +68,12 @@ class AuditPolicyTests(unittest.TestCase):
         self.assertIn("RUSTSEC-2099-0001", rejected[0])
         self.assertIn("without advisory ID", rejected[1])
 
+    def test_empty_finding_objects_are_rejected_as_unknown_findings(self):
+        rejected = module.evaluate_report(report([{}], unsound=[{}]))
+        self.assertEqual(len(rejected), 2)
+        for item in rejected:
+            self.assertIn("without advisory ID: unknown package unknown version", item)
+
     def test_every_warning_category_fails_with_or_without_advisory_ids(self):
         no_advisory = {"package": {"name": "dependency", "version": "1.0.0"}}
         for category in ["unsound", "unmaintained", "notice", "yanked", "future-warning"]:
@@ -119,11 +125,47 @@ class AuditCommandTests(unittest.TestCase):
                 self.assertIn("audit error", errors)
 
     def test_invalid_json_and_incomplete_reports_fail(self):
-        for data in ["not json", "null", "[]", "{}", '{"vulnerabilities": {}}']:
+        for data in ["not json", "null", "[]", "{}", '{"vulnerabilities": {}}',
+                     '{"vulnerabilities": {"list": []}}']:
             with self.subTest(report=data):
                 result, _, errors = self.run_audit(data)
                 self.assertEqual(result, 1)
                 self.assertIn("Invalid dependency audit report", errors)
+
+    def test_report_and_sections_require_object_containers(self):
+        for value in [None, [], "", 0, False]:
+            for section in ["report", "vulnerabilities", "warnings"]:
+                data = value if section == "report" else {**report(), section: value}
+                with self.subTest(section=section, value=value):
+                    result, output, errors = self.run_audit(json.dumps(data))
+                    self.assertEqual(result, 1)
+                    self.assertEqual(output, "")
+                    self.assertIn("Invalid dependency audit report", errors)
+
+    def test_finding_collections_require_list_containers(self):
+        for value in [None, {}, "", 0, False]:
+            for section in ["vulnerabilities.list", "warnings.unsound"]:
+                data = report()
+                if section == "vulnerabilities.list":
+                    data["vulnerabilities"]["list"] = value
+                else:
+                    data["warnings"]["unsound"] = value
+                with self.subTest(section=section, value=value):
+                    result, output, errors = self.run_audit(json.dumps(data))
+                    self.assertEqual(result, 1)
+                    self.assertEqual(output, "")
+                    self.assertIn("Invalid dependency audit report", errors)
+
+    def test_each_finding_requires_an_object(self):
+        for value in [None, [], "", 0, False]:
+            for category in ["vulnerability", "unsound", "future-warning"]:
+                data = (report([value]) if category == "vulnerability"
+                        else report(**{category: [value]}))
+                with self.subTest(category=category, value=value):
+                    result, output, errors = self.run_audit(json.dumps(data))
+                    self.assertEqual(result, 1)
+                    self.assertEqual(output, "")
+                    self.assertIn("Invalid dependency audit report", errors)
 
 
 if __name__ == "__main__":

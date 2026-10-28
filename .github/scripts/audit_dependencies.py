@@ -7,11 +7,24 @@ import sys
 
 def evaluate_report(report):
     """Collect all findings, including unknown warnings and yanks without IDs."""
-    findings = [("vulnerability", finding) for finding in report["vulnerabilities"]["list"]]
-    for category, warnings in report.get("warnings", {}).items():
-        findings.extend((category, finding) for finding in warnings)
+    if not isinstance(report, dict):
+        raise ValueError("report must be an object")
+    vulnerabilities = report["vulnerabilities"]
+    warnings = report["warnings"]
+    if not isinstance(vulnerabilities, dict) or not isinstance(warnings, dict):
+        raise ValueError("vulnerabilities and warnings must be objects")
+    vulnerability_list = vulnerabilities["list"]
+    if not isinstance(vulnerability_list, list):
+        raise ValueError("vulnerabilities.list must be a list")
+    findings = [("vulnerability", finding) for finding in vulnerability_list]
+    for category, entries in warnings.items():
+        if not isinstance(entries, list):
+            raise ValueError(f"{category} warnings must be a list")
+        findings.extend((category, finding) for finding in entries)
     rejected = []
     for category, finding in findings:
+        if not isinstance(finding, dict):
+            raise ValueError(f"{category} finding must be an object")
         advisory = (finding.get("advisory") or {}).get("id")
         package = finding.get("package", {}).get("name", "unknown package")
         version = finding.get("package", {}).get("version", "unknown version")
