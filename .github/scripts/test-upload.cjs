@@ -53,4 +53,34 @@ test('upload progress uses its supplied event without a legacy global event', ()
   assert.equal(progress.max, 1024);
 });
 
-module.exports = { uploader };
+test('folder upload waits for delayed file discovery and every reader batch', () => {
+  const page = uploader();
+  const reads = [];
+  const files = [];
+  const folder = { isFile: false, fullPath: '/folder', createReader() { return { readEntries(ok, fail) { reads.push({ ok, fail }); } }; } };
+  page.body.listeners.drop({ preventDefault() {}, dataTransfer: { types: ['Files'], files: [{ name: 'folder' }], items: [{ kind: 'file', webkitGetAsEntry() { return folder; } }] } });
+  reads.shift().ok(['one.txt', 'two.txt'].map(name => ({ isFile: true, fullPath: '/folder/' + name, file(ok, fail) { files.push({ name, ok, fail }); } })));
+  const first = files.shift();
+  first.ok({ name: first.name });
+  page.complete(page.requests[0]);
+  assert.equal(page.reloads(), 0, 'a first completed file must not cancel undiscovered files');
+  const second = files.shift();
+  second.ok({ name: second.name });
+  page.complete(page.requests[1]);
+  assert.equal(page.reloads(), 0, 'the reader has not signaled its final batch');
+  reads.shift().ok([]);
+  assert.equal(page.reloads(), 1);
+  assert.deepEqual(page.requests.map(request => request.url), ['/base/folder/one.txt', '/base/folder/two.txt']);
+});
+
+test('folder discovery failure remains visible instead of reporting upload completion', () => {
+  const page = uploader();
+  let fail;
+  const folder = { isFile: false, fullPath: '/folder', createReader() { return { readEntries(ok, error) { fail = error; } }; } };
+  page.body.listeners.drop({ preventDefault() {}, dataTransfer: { types: ['Files'], files: [{ name: 'folder' }], items: [{ kind: 'file', webkitGetAsEntry() { return folder; } }] } });
+  assert.equal(typeof fail, 'function');
+  fail(new Error('permission denied'));
+  assert.equal(page.reloads(), 0);
+  const list = page.body.children.find(child => child.tagName === 'DL');
+  assert.match(list.children.at(-1).innerText, /folder.*permission denied/);
+});
