@@ -88,6 +88,15 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         if let Some(range_str) = range_header {
+            let tag = format!("\"{}\"", file_etag(&metadata));
+            let modified = file_time_modified(&metadata);
+            if crate::http_cache::not_modified(req, res, &tag, modified) {
+                return;
+            }
+            if !crate::http_cache::range_matches(req, &tag, modified) {
+                handle_get_file(req, res, &config, &req_p, false).await;
+                return;
+            }
             handle_get_file_range(req, res, &config, &req_p, &range_str);
             return;
         }
@@ -200,39 +209,6 @@ async fn handle_get_file(
     let modified = file_time_modified(&metadata);
     let flen = file_length(&metadata, &req_p);
 
-    // Check If-None-Match / If-Modified-Since for 304
-    if !is_404 {
-        if let Some(inm) = req.headers().get(salvo::http::header::IF_NONE_MATCH)
-            && let Ok(inm_str) = inm.to_str()
-            && inm_str.contains(&etag)
-        {
-            log_msg(config.log, &format!("{} Not Modified", remote));
-            res.status_code(StatusCode::NOT_MODIFIED);
-            res.headers_mut().insert(
-                salvo::http::header::ETAG,
-                format!("\"{}\"", etag).parse().unwrap(),
-            );
-            res.headers_mut()
-                .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-            return;
-        }
-        if let Some(ims) = req.headers().get(salvo::http::header::IF_MODIFIED_SINCE)
-            && let Ok(ims_str) = ims.to_str()
-            && let Ok(since) = chrono::DateTime::parse_from_rfc2822(ims_str)
-            && modified <= since.with_timezone(&chrono::Utc)
-        {
-            log_msg(config.log, &format!("{} Not Modified", remote));
-            res.status_code(StatusCode::NOT_MODIFIED);
-            res.headers_mut().insert(
-                salvo::http::header::ETAG,
-                format!("\"{}\"", etag).parse().unwrap(),
-            );
-            res.headers_mut()
-                .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-            return;
-        }
-    }
-
     log_msg(
         config.log,
         &format!(
@@ -258,6 +234,10 @@ async fn handle_get_file(
         && let Some(encoding) = response_encoding(accept_enc)
         && let Some(encoded_data) = try_encoded_file(config, req_p, &etag, encoding, &remote)
     {
+        let response_etag = format!("\"{}-{}\"", etag, encoding_name(encoding));
+        if !is_404 && crate::http_cache::not_modified(req, res, &response_etag, modified) {
+            return;
+        }
         res.status_code(if is_404 {
             StatusCode::NOT_FOUND
         } else {
@@ -271,10 +251,8 @@ async fn handle_get_file(
             salvo::http::header::CONTENT_ENCODING,
             encoding_name(encoding).parse().unwrap(),
         );
-        res.headers_mut().insert(
-            salvo::http::header::ETAG,
-            format!("\"{}\"", etag).parse().unwrap(),
-        );
+        res.headers_mut()
+            .insert(salvo::http::header::ETAG, response_etag.parse().unwrap());
         res.headers_mut().insert(
             salvo::http::header::LAST_MODIFIED,
             modified
@@ -292,6 +270,9 @@ async fn handle_get_file(
     }
 
     // Serve file without encoding
+    if !is_404 && crate::http_cache::not_modified(req, res, &format!("\"{}\"", etag), modified) {
+        return;
+    }
     let file_data = match tokio::fs::read(req_p).await {
         Ok(data) => data,
         Err(e) => {

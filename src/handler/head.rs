@@ -92,6 +92,14 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
         res.status_code(StatusCode::NOT_FOUND);
         return;
     };
+    if crate::http_cache::not_modified(
+        req,
+        res,
+        &format!("\"{}\"", file_etag(&metadata)),
+        file_time_modified(&metadata),
+    ) {
+        return;
+    }
     res.status_code(StatusCode::OK);
     res.headers_mut().insert(
         "content-type",

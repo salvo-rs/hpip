@@ -3,6 +3,7 @@ mod encoding;
 mod error;
 mod handler;
 mod hoops;
+mod http_cache;
 mod options;
 mod port;
 mod tls;

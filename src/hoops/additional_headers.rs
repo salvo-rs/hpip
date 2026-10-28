@@ -19,6 +19,11 @@ impl AdditionalHeadersHoop {
     ) {
         ctrl.call_next(req, depot, res).await;
 
+        if matches!(req.method().as_str(), "GET" | "HEAD") {
+            res.headers_mut()
+                .append("vary", "Accept, Accept-Encoding".parse().unwrap());
+        }
+
         if matches!(req.method().as_str(), "GET" | "HEAD")
             && res.status_code.is_some_and(|s| s.is_success())
             && !res.headers().contains_key("content-encoding")
