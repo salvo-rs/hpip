@@ -74,6 +74,10 @@ struct Cli {
     #[arg(short = 'w', long = "allow-write")]
     allow_write: bool,
 
+    /// Maximum upload size in bytes (suffixes K, M, G accepted). Default: 1G
+    #[arg(long = "max-upload-size", default_value = "1G")]
+    max_upload_size: String,
+
     /// Never generate dir listings. Default: false
     #[arg(short = 'l', long = "no-listings")]
     no_listings: bool,
@@ -185,6 +189,7 @@ pub struct Options {
     pub strip_extensions: bool,
     pub try_404: Option<PathBuf>,
     pub allow_writes: bool,
+    pub upload_limit: u64,
     pub encode_fs: bool,
     pub encoded_filesystem_limit: Option<u64>,
     pub encoded_generated_limit: Option<u64>,
@@ -371,6 +376,7 @@ impl Options {
             strip_extensions: cli.strip_extensions,
             try_404: cli.fallback_404.map(PathBuf::from),
             allow_writes: cli.allow_write,
+            upload_limit: Self::size_parse(&cli.max_upload_size)?,
             encode_fs: !cli.no_encode,
             encoded_filesystem_limit: cli
                 .encoded_filesystem

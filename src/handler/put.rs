@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use salvo::hyper::body::Body;
 use salvo::prelude::*;
 use tokio::io::AsyncWriteExt;
 
@@ -70,6 +72,8 @@ impl WriteConditions {
 #[derive(Debug)]
 enum UploadError {
     PreconditionFailed,
+    TooLarge,
+    BodyRead(std::io::Error),
     Io(std::io::Error),
 }
 
@@ -180,19 +184,16 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
         }
     };
 
-    // Read the body
-    let body_bytes = match req.payload().await {
-        Ok(data) => data.to_vec(),
-        Err(_) => {
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            res.render(Text::Html(error_html(
-                "503 Service Unavailable",
-                "File not created.",
-                "Failed to read request body",
-            )));
-            return;
-        }
-    };
+    if req
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > config.upload_limit)
+    {
+        res.status_code(StatusCode::PAYLOAD_TOO_LARGE);
+        return;
+    }
 
     // Get modification time from headers
     let mtime = req
@@ -205,7 +206,7 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
                 .get("x-oc-mtime")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok())
-                .map(|s| s * 1000)
+                .and_then(|s| s.checked_mul(1000))
         });
 
     let remote = req.remote_addr().to_string();
@@ -216,9 +217,10 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
     }
 
     // Write file
-    let result = write_file_conditional(&req_p, &body_bytes, &conditions).await;
+    let result =
+        write_request_file(&req_p, req.take_body(), &conditions, config.upload_limit).await;
     match result {
-        Ok(existent) => {
+        Ok((existent, uploaded_bytes)) => {
             if let Some(ms) = mtime {
                 let path = req_p.clone();
                 tokio::task::spawn_blocking(move || {
@@ -235,7 +237,7 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
                     remote,
                     if existent { "replaced" } else { "created" },
                     req_p.display(),
-                    body_bytes.len()
+                    uploaded_bytes
                 ),
             );
 
@@ -249,6 +251,16 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
         }
         Err(UploadError::PreconditionFailed) => {
             res.status_code(StatusCode::PRECONDITION_FAILED);
+        }
+        Err(UploadError::TooLarge) => {
+            res.status_code(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        Err(UploadError::BodyRead(error)) => {
+            res.status_code(if error.kind() == std::io::ErrorKind::TimedOut {
+                StatusCode::REQUEST_TIMEOUT
+            } else {
+                StatusCode::BAD_REQUEST
+            });
         }
         Err(UploadError::Io(e)) => {
             crate::config::log_msg(config.log, &format!("{} File not created. {}", remote, e));
@@ -311,13 +323,43 @@ impl Drop for PendingUpload {
     }
 }
 
-async fn write_file_conditional(
+async fn write_request_file(
     destination: &Path,
-    data: &[u8],
+    mut body: salvo::http::ReqBody,
     conditions: &WriteConditions,
-) -> Result<bool, UploadError> {
+    limit: u64,
+) -> Result<(bool, u64), UploadError> {
     let (pending, mut file) = PendingUpload::create(destination)?;
-    file.write_all(data).await?;
+    let mut length = 0_u64;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
+    loop {
+        let frame_deadline =
+            (tokio::time::Instant::now() + std::time::Duration::from_secs(30)).min(deadline);
+        let frame = tokio::time::timeout_at(
+            frame_deadline,
+            std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)),
+        )
+        .await
+        .map_err(|_| {
+            UploadError::BodyRead(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "upload body timed out",
+            ))
+        })?;
+        let Some(frame) = frame else {
+            break;
+        };
+        let frame = frame.map_err(UploadError::BodyRead)?;
+        if let Ok(bytes) = frame.into_data() {
+            length = length
+                .checked_add(bytes.len() as u64)
+                .ok_or(UploadError::TooLarge)?;
+            if length > limit {
+                return Err(UploadError::TooLarge);
+            }
+            file.write_all(&bytes).await?;
+        }
+    }
     file.flush().await?;
     file.sync_all().await?;
     let _commit_lock = UPLOAD_COMMIT_LOCK.lock().await;
@@ -344,7 +386,23 @@ async fn write_file_conditional(
                 UploadError::Io(error)
             }
         })?;
-    Ok(metadata.is_some())
+    Ok((metadata.is_some(), length))
+}
+
+#[cfg(test)]
+async fn write_file_conditional(
+    destination: &Path,
+    data: &[u8],
+    conditions: &WriteConditions,
+) -> Result<bool, UploadError> {
+    write_request_file(
+        destination,
+        salvo::http::ReqBody::Once(salvo::hyper::body::Bytes::copy_from_slice(data)),
+        conditions,
+        u64::MAX,
+    )
+    .await
+    .map(|(existed, _)| existed)
 }
 
 #[cfg(test)]
@@ -491,5 +549,97 @@ mod conditional_upload_tests {
         conditions.if_none_match = Some("W/\"tag\"".into());
         assert!(!conditions.allows(Some("tag")));
         assert!(!conditions.allows(None));
+    }
+}
+
+#[cfg(test)]
+mod streaming_upload_tests {
+    use std::task::{Context, Poll};
+
+    use salvo::hyper::body::{Bytes, Frame};
+    use salvo::test::TestClient;
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    #[tokio::test]
+    async fn uploads_larger_than_default_payload_limit_succeed() {
+        let directory = TestDir::new();
+        let service = Service::new(crate::build_router(config(directory.path(), &["-w"])));
+        let bytes = vec![b'x'; 128 * 1024];
+        let response = TestClient::put("http://localhost/large.bin")
+            .body(bytes.clone())
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::CREATED));
+        assert_eq!(
+            std::fs::read(directory.path().join("large.bin")).unwrap(),
+            bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_stream_preserves_destination_and_removes_staging() {
+        let directory = TestDir::new();
+        let destination = directory.path().join("file");
+        std::fs::write(&destination, b"original").unwrap();
+        let result = write_request_file(
+            &destination,
+            salvo::http::ReqBody::Once(Bytes::from_static(b"too large")),
+            &WriteConditions::default(),
+            4,
+        )
+        .await;
+        assert!(matches!(result, Err(UploadError::TooLarge)));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        let service = Service::new(crate::build_router(config(
+            directory.path(),
+            &["-w", "--max-upload-size", "4"],
+        )));
+        let response = TestClient::put("http://localhost/file")
+            .body("oversized")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+
+    struct InterruptedBody(bool);
+
+    impl Body for InterruptedBody {
+        type Data = Bytes;
+        type Error = salvo::BoxedError;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            if !self.0 {
+                self.0 = true;
+                Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"partial")))))
+            } else {
+                Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "interrupted",
+                )))))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_body_never_publishes_partial_content() {
+        let directory = TestDir::new();
+        let destination = directory.path().join("file");
+        std::fs::write(&destination, b"original").unwrap();
+        let body = salvo::http::ReqBody::Boxed {
+            inner: Box::pin(InterruptedBody(false)),
+            fuse_config: None,
+        };
+        assert!(matches!(
+            write_request_file(&destination, body, &WriteConditions::default(), 1024).await,
+            Err(UploadError::BodyRead(_))
+        ));
+        assert_eq!(std::fs::read(destination).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }
