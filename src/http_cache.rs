@@ -54,7 +54,7 @@ pub fn range_matches(req: &Request, etag: &str, modified: DateTime<Utc>) -> bool
     if value.starts_with('"') {
         return value == etag;
     }
-    DateTime::parse_from_rfc2822(value).is_ok_and(|date| modified.timestamp() <= date.timestamp())
+    DateTime::parse_from_rfc2822(value).is_ok_and(|date| modified.timestamp() == date.timestamp())
 }
 
 #[cfg(test)]
@@ -62,6 +62,44 @@ mod tests {
     use salvo::test::{ResponseExt, TestClient};
 
     use super::*;
+
+    #[tokio::test]
+    async fn if_range_requires_the_current_date_or_a_strong_entity_tag() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::write(dir.path().join("file.txt"), "fixture").unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &[],
+        )));
+        let full = TestClient::get("http://localhost/file.txt")
+            .send(&service)
+            .await;
+        let date = full.headers()["last-modified"].to_str().unwrap();
+        let tag = full.headers()["etag"].to_str().unwrap();
+        for validator in [date.to_owned(), tag.to_owned()] {
+            let mut response = TestClient::get("http://localhost/file.txt")
+                .add_header("Range", "bytes=0-2", true)
+                .add_header("If-Range", validator, true)
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::PARTIAL_CONTENT));
+            assert_eq!(response.take_string().await.unwrap(), "fix");
+        }
+        for validator in [
+            "Wed, 01 Jan 2031 00:00:00 GMT".to_owned(),
+            "Wed, 01 Jan 2020 00:00:00 GMT".to_owned(),
+            format!("W/{tag}"),
+            "invalid date".to_owned(),
+        ] {
+            let mut response = TestClient::get("http://localhost/file.txt")
+                .add_header("Range", "bytes=0-2", true)
+                .add_header("If-Range", validator, true)
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::OK));
+            assert_eq!(response.take_string().await.unwrap(), "fixture");
+        }
+    }
 
     #[tokio::test]
     async fn preconditions_use_exact_tags_and_ignore_dates_when_tags_are_present() {
