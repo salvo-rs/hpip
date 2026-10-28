@@ -437,7 +437,7 @@ pub(super) fn file_encoding_candidate(
     {
         return None;
     }
-    response_encoding(req.headers().get("accept-encoding")?.to_str().ok()?)
+    response_encoding(&request_accept_encoding(req)?)
 }
 
 /// None means the coding requires reading the source to determine its gain.
@@ -995,12 +995,9 @@ fn try_encode_generated_response(
     config: &AppConfig,
     body: &str,
 ) -> Option<(Vec<u8>, EncodingType)> {
-    let accept_enc = req
-        .headers()
-        .get(salvo::http::header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())?;
+    let accept_enc = request_accept_encoding(req)?;
 
-    let encoding = response_encoding(accept_enc)?;
+    let encoding = response_encoding(&accept_enc)?;
     let hash = blake3::hash(body.as_bytes());
     let cache_key = (hash, encoding);
     // Fixed stripes bound coordination metadata while coalescing identical work.
