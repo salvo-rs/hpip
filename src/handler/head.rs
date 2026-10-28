@@ -141,20 +141,32 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
     let etag = file_etag(&metadata);
     let mut response_etag = Some(format!("\"{etag}\""));
     let mut length = Some(file_length(&metadata, &path));
+    let identity_allowed = crate::encoding::request_accept_encoding(req)
+        .is_none_or(|accept| crate::encoding::identity_acceptable(&accept));
     if let Some(encoding) =
         super::get::file_encoding_candidate(req, &config, &path, length.unwrap())
     {
         let mut cached = super::get::cached_file_encoding(&config, &path, &etag, encoding);
-        if cached.is_none()
-            && ["if-match", "if-none-match"].iter().any(|name| {
-                crate::util::entity_tag::request_tag_field(req, name)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|value| value.trim() != "*")
-            })
-        {
+        let specific_tag = ["if-match", "if-none-match"].iter().any(|name| {
+            crate::util::entity_tag::request_tag_field(req, name)
+                .ok()
+                .flatten()
+                .is_some_and(|value| value.trim() != "*")
+        });
+        let conditional_without_identity = !identity_allowed
+            && [
+                "if-match",
+                "if-none-match",
+                "if-modified-since",
+                "if-unmodified-since",
+            ]
+            .iter()
+            .any(|name| req.headers().contains_key(*name));
+        if cached.is_none() && (specific_tag || conditional_without_identity) {
             // Specific tag conditions need the actual selected coding, even
             // when this HEAD is the first request after the cache was lost.
+            // Resolve wildcard/date conditions too when identity cannot be sent,
+            // since a coding failure must win over a conditional 304 or 412.
             // Ordinary cold HEAD requests still avoid all encoding work.
             cached = Some(
                 super::get::encoded_file_job(
@@ -184,6 +196,12 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
                 depot.insert_typed(UnresolvedFileEncoding);
             }
         }
+    }
+    // Resolve a known identity-only negotiation failure before any condition.
+    // Ordinary cold HEADs may still omit fields whose coding requires body reads.
+    if length.is_some() && !res.headers().contains_key("content-encoding") && !identity_allowed {
+        res.status_code(StatusCode::NOT_ACCEPTABLE);
+        return;
     }
     if crate::http_cache::preconditions(
         req,

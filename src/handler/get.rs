@@ -303,6 +303,12 @@ async fn serve_open_file(
     let modified = file_time_modified(&metadata);
     let flen = file_length(&metadata, &req_p);
     let encoding = file_encoding_candidate(req, config, req_p, flen);
+    let identity_allowed =
+        request_accept_encoding(req).is_none_or(|accept| identity_acceptable(&accept));
+    if !is_404 && encoding.is_none() && !identity_allowed {
+        res.status_code(StatusCode::NOT_ACCEPTABLE);
+        return;
+    }
 
     // Byte ranges currently cover identity files only. Ignore Range when a
     // coding was selected instead of changing the representation or its validator.
@@ -382,6 +388,12 @@ async fn serve_open_file(
     }
 
     // Serve file without encoding
+    // Negotiation failure takes precedence over both validators and Range.
+    // A rejected/failed compression job can also leave identity as the only result.
+    if !is_404 && !identity_allowed {
+        res.status_code(StatusCode::NOT_ACCEPTABLE);
+        return;
+    }
     if !is_404
         && crate::http_cache::preconditions(req, res, Some(&format!("\"{}\"", etag)), modified)
     {
