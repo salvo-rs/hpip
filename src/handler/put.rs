@@ -270,7 +270,8 @@ impl PendingUpload {
                             | libc::O_EXCL
                             | libc::O_CLOEXEC
                             | libc::O_NOFOLLOW,
-                        0o600 as libc::mode_t,
+                        // C varargs need an int-width value; macOS mode_t is u16.
+                        0o600 as libc::c_uint,
                     )
                 };
                 if fd >= 0 {
