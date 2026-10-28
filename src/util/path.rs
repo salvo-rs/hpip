@@ -14,6 +14,57 @@ pub fn percent_decode(s: &str) -> Option<Cow<'_, str>> {
         .ok()
 }
 
+/// Decode one URL component without allowing it to change the path hierarchy.
+pub fn decode_path_component(component: &str) -> Option<Cow<'_, str>> {
+    let bytes = component.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len()
+                || !bytes[i + 1].is_ascii_hexdigit()
+                || !bytes[i + 2].is_ascii_hexdigit()
+            {
+                return None;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let decoded = percent_decode(component)?;
+    if decoded.is_empty()
+        || matches!(decoded.as_ref(), "." | "..")
+        || decoded.contains(['/', '\\', ':', '\0'])
+        || decoded.to_ascii_lowercase().starts_with(".hpip-upload-")
+    {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        if decoded.ends_with(['.', ' ']) {
+            return None;
+        }
+        let basename = decoded.split('.').next()?.to_ascii_uppercase();
+        if matches!(basename.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (basename.len() == 4
+                && (basename.starts_with("COM") || basename.starts_with("LPT"))
+                && matches!(basename.as_bytes()[3], b'1'..=b'9'))
+        {
+            return None;
+        }
+    }
+    Some(decoded)
+}
+
+/// Return the same decoded components used by filesystem resolution.
+pub fn decoded_url_path(path: &str) -> Option<String> {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| decode_path_component(segment).map(Cow::into_owned))
+        .collect::<Option<Vec<_>>>()
+        .map(|segments| segments.join("/"))
+}
+
 /// Percent-encode the last character if it's white space
 pub fn encode_tail_if_trimmed(mut s: Cow<str>) -> Cow<str> {
     if let Some(c) = s.as_bytes().last().copied()
@@ -135,10 +186,11 @@ pub fn resolve_path(
     let mut abs = true;
 
     for pp in url_segments.iter().filter(|p| !p.is_empty()) {
-        if let Some(pp) = percent_decode(pp) {
+        if let Some(pp) = decode_path_component(pp) {
             cur.push(&*pp);
         } else {
             err = true;
+            break;
         }
         while let Ok(newlink) = cur.read_link() {
             sk = true;
@@ -162,4 +214,94 @@ pub fn resolve_path(
     }
 
     (cur, sk, err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn all_filesystem_methods_reject_parent_components() {
+        use salvo::prelude::*;
+        use salvo::test::TestClient;
+
+        use crate::test_support::{TestDir, config};
+
+        let fixture = TestDir::new();
+        let hosted = fixture.path().join("served");
+        fs::create_dir(&hosted).unwrap();
+        fs::write(fixture.path().join("outside.txt"), "outside").unwrap();
+        let service = Service::new(crate::build_router(config(
+            &hosted,
+            &["-w", "-d", "-A", "-e"],
+        )));
+        for method in ["GET", "PUT", "DELETE", "PROPFIND", "MKCOL", "COPY", "MOVE"] {
+            let mut request = TestClient::get("http://localhost/").build();
+            *request.method_mut() = method.parse().unwrap();
+            // Set the URI after URL construction so no client normalizes it.
+            *request.uri_mut() = "/%2e%2e/outside.txt".parse().unwrap();
+            let response = service.handle(request).await;
+            assert_eq!(
+                response.status_code,
+                Some(StatusCode::BAD_REQUEST),
+                "{method}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(fixture.path().join("outside.txt")).unwrap(),
+            "outside"
+        );
+    }
+
+    #[test]
+    fn rejects_components_that_escape_or_change_path_hierarchy() {
+        let root = std::env::temp_dir().join("hpip-resolver-test-root");
+        for segment in [
+            "..",
+            "%2e%2e",
+            ".",
+            "%2fetc",
+            "a%2fb",
+            "a%5cb",
+            "C%3a",
+            "a%00b",
+            "%ff",
+            "%",
+            "%2",
+            "%zz",
+            ".hpip-upload-123",
+            ".HPIP-UPLOAD-456",
+        ] {
+            let (resolved, _, invalid) = resolve_path(&root, &[segment], true);
+            assert!(invalid, "accepted invalid component {segment}");
+            assert_eq!(resolved, root);
+        }
+    }
+
+    #[test]
+    fn retains_single_components_and_decodes_exactly_once() {
+        let root = std::env::temp_dir().join("hpip-resolver-test-root");
+        let (resolved, _, invalid) = resolve_path(&root, &["dir", "a%2520b.txt"], true);
+        assert!(!invalid);
+        assert_eq!(resolved, root.join("dir").join("a%20b.txt"));
+        assert_eq!(
+            decoded_url_path("//dir/a%20b.txt/"),
+            Some("dir/a b.txt".into())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_windows_device_names_and_trimmed_aliases() {
+        for component in [
+            "NUL",
+            "aux.txt",
+            "COM1.log",
+            "LPT9",
+            "private.",
+            "private%20",
+        ] {
+            assert!(decode_path_component(component).is_none(), "{component}");
+        }
+    }
 }

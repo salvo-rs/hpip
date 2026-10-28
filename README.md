@@ -84,6 +84,9 @@ hpip -A /path/to/files
 | Option | Description |
 |--------|-------------|
 | `-w, --allow-write` | Enable PUT/DELETE for file upload and deletion |
+| `--max-upload-size <SIZE>` | Maximum upload size (default `1G`, suffixes K/M/G accepted) |
+
+Uploads stream to a private staging file and become visible at their destination only after successful completion. Requests larger than the configured limit return HTTP 413. An upload must finish within 15 minutes and must not stall for more than 30 seconds between body frames; interrupted uploads preserve an existing destination.
 
 ### Symlinks
 

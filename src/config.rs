@@ -34,6 +34,7 @@ pub struct AppConfig {
     pub global_auth_data: Option<(String, Option<String>)>,
     pub path_auth_data: BTreeMap<String, Option<(String, Option<String>)>>,
     pub writes_temp_dir: Option<(String, PathBuf)>,
+    pub upload_limit: u64,
     pub encoded_temp_dir: Option<(String, PathBuf)>,
     #[allow(dead_code)]
     pub proxies: BTreeMap<IpCidr, String>,
@@ -154,6 +155,7 @@ impl AppConfig {
                 opts.allow_writes,
                 "writes",
             ),
+            upload_limit: opts.upload_limit,
             encoded_temp_dir: AppConfig::temp_subdir(
                 &opts.temp_directory,
                 opts.encode_fs,
