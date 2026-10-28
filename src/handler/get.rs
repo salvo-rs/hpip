@@ -1169,11 +1169,24 @@ mod range_tests {
         assert_eq!(response.take_string().await.unwrap(), "available");
         let response = TestClient::get("http://localhost/").send(&service).await;
         assert_eq!(response.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+        let mut response = TestClient::get("http://localhost/")
+            .add_header("Accept", "application/x-tar", true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+        assert!(!response.take_bytes(None).await.unwrap().is_empty());
+        let archive_permits = config
+            .archive_jobs
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
         let response = TestClient::get("http://localhost/")
             .add_header("Accept", "application/x-tar", true)
             .send(&service)
             .await;
         assert_eq!(response.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+        drop(archive_permits);
         drop(permits);
     }
 
