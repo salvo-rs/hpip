@@ -4,52 +4,68 @@ permissions:
   contents: read
 
 on:
+  workflow_call:
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
-      - "**.rs"
+      - "**/*.rs"
       - "**/Cargo.toml"
-      - ".github/workflows/**"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "rustfmt.toml"
+      - "assets/**"
+      - "install.*"
+      - ".github/**"
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
-      - "**.rs"
+      - "**/*.rs"
       - "**/Cargo.toml"
-      - ".github/workflows/**"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "rustfmt.toml"
+      - "assets/**"
+      - "install.*"
+      - ".github/**"
 
 jobs:
   test:
-    name: Test (stable) - x86_64-pc-windows-msvc
+    name: Rust 1.99 checks - x86_64-pc-windows-msvc
     runs-on: windows-latest
-
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/build-environment
       - uses: dtolnay/rust-toolchain@stable
-
-      - name: Check build
-        run: cargo check --all-targets
-
-      - name: Check release build
-        run: cargo check --all-targets --release
-
+        with:
+          toolchain: 1.99.0
+          components: clippy
+      - name: Verify Cargo output directory
+        shell: pwsh
+        run: |
+          $metadata = cargo +1.99.0 metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
+          foreach ($directory in @($metadata.target_directory, $metadata.build_directory)) {
+            if (-not $directory) { continue }
+            $actual = [IO.Path]::GetFullPath($directory).Replace('\', '/')
+            if (-not $actual.StartsWith('D:/BuildCache/hpip-ci/', [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Cargo output must remain on D: $actual"
+            }
+          }
+      - name: Check all targets
+        run: cargo +1.99.0 check --locked --all-targets
+      - name: Strict Clippy
+        run: cargo +1.99.0 clippy --locked --all-targets -- -D warnings
       - name: Run tests
         timeout-minutes: 20
-        run: cargo test --no-fail-fast -- --nocapture
-
-  build:
-    name: Build release binary
-    runs-on: windows-latest
-    needs: [test]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-
+        run: cargo +1.99.0 test --locked --all-targets
+      - name: Validate Windows installer
+        shell: pwsh
+        run: ./.github/scripts/test-install.ps1
       - name: Build release
-        run: cargo build --release
-
+        run: cargo +1.99.0 build --locked --release --target x86_64-pc-windows-msvc
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: hpip-windows-x86_64
-          path: target/release/hpip.exe
+          name: hpip-x86_64-pc-windows-msvc
+          path: ${{ env.CARGO_TARGET_DIR }}/x86_64-pc-windows-msvc/release/hpip.exe
+          if-no-files-found: error

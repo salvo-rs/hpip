@@ -8,9 +8,12 @@ on:
     branches:
       - main
     paths:
-      - "**.rs"
+      - "**/*.rs"
       - "**/Cargo.toml"
-      - ".github/workflows/**"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "assets/**"
+      - ".github/**"
 
 jobs:
   coverage:
@@ -18,13 +21,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/build-environment
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
 
       - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
+        run: cargo +1.99.0 install --locked cargo-tarpaulin
 
       - name: Generate coverage
-        run: cargo tarpaulin --out xml
+        run: cargo +1.99.0 tarpaulin --locked --out xml
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7

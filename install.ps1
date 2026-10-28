@@ -43,6 +43,24 @@ function Get-InstallDirectory {
     return $dir
 }
 
+function Test-ArchiveChecksum {
+    param([string]$ArchivePath, [string]$ChecksumsPath, [string]$ArchiveName)
+    $expected = @(
+        Get-Content -LiteralPath $ChecksumsPath | ForEach-Object {
+            if ($_ -match '^([a-fA-F0-9]{64})[ \t]+\*?(.+)$' -and $Matches[2] -ceq $ArchiveName) {
+                $Matches[1]
+            }
+        }
+    )
+    if ($expected.Count -ne 1) {
+        throw "Release checksum is missing or ambiguous for $ArchiveName"
+    }
+    $actual = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash
+    if (-not [String]::Equals($actual, $expected[0], [StringComparison]::OrdinalIgnoreCase)) {
+        throw "SHA256 verification failed for $ArchiveName"
+    }
+}
+
 function Install-Hpip {
     $target = "x86_64-pc-windows-msvc"
 
@@ -67,6 +85,9 @@ function Install-Hpip {
 
         Write-Host "Downloading $Binary $Version for $target..."
         Invoke-WebRequest -Uri $url -OutFile $archivePath -UseBasicParsing
+        $checksumsPath = Join-Path $tmpDir 'SHA256SUMS'
+        Invoke-WebRequest -Uri "https://github.com/$Repo/releases/download/$Version/SHA256SUMS" -OutFile $checksumsPath -UseBasicParsing
+        Test-ArchiveChecksum -ArchivePath $archivePath -ChecksumsPath $checksumsPath -ArchiveName $archiveName
 
         Write-Host "Extracting to $installPath..."
         Expand-Archive -Path $archivePath -DestinationPath $tmpDir -Force
@@ -75,7 +96,12 @@ function Install-Hpip {
         Copy-Item -Path $exePath -Destination (Join-Path $installPath "$Binary.exe") -Force
     }
     finally {
-        Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+        $resolvedTemp = [IO.Path]::GetFullPath($tmpDir)
+        $tempParent = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+        if ($resolvedTemp.StartsWith($tempParent, [StringComparison]::OrdinalIgnoreCase) -and
+            [IO.Path]::GetFileName($resolvedTemp) -match '^[0-9a-fA-F-]{36}$') {
+            Remove-Item -LiteralPath $resolvedTemp -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 
     # Add to user PATH if not already present
@@ -92,4 +118,6 @@ function Install-Hpip {
     Write-Host "Successfully installed $Binary $Version to $installPath\$Binary.exe"
 }
 
-Install-Hpip
+if ($MyInvocation.InvocationName -ne '.') {
+    Install-Hpip
+}

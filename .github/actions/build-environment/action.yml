@@ -1,0 +1,23 @@
+name: Configure build directories
+description: Keep Windows builds and temporary files on D
+runs:
+  using: composite
+  steps:
+    - name: Configure Windows directories
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $taskRoot = 'D:/BuildCache/hpip-ci'
+        New-Item -ItemType Directory -Force "$taskRoot/target", "$taskRoot/tmp", "$taskRoot/tests" | Out-Null
+        "CARGO_TARGET_DIR=$taskRoot/target" >> $env:GITHUB_ENV
+        "TEMP=$taskRoot/tmp" >> $env:GITHUB_ENV
+        "TMP=$taskRoot/tmp" >> $env:GITHUB_ENV
+        "HPIP_TEST_ROOT=$taskRoot/tests" >> $env:GITHUB_ENV
+    - name: Configure Unix directories
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        mkdir -p "$GITHUB_WORKSPACE/target" "$GITHUB_WORKSPACE/.ci-tmp"
+        echo "CARGO_TARGET_DIR=$GITHUB_WORKSPACE/target" >> "$GITHUB_ENV"
+        echo "TMPDIR=$GITHUB_WORKSPACE/.ci-tmp" >> "$GITHUB_ENV"
+        echo "HPIP_TEST_ROOT=$GITHUB_WORKSPACE/.ci-tmp" >> "$GITHUB_ENV"

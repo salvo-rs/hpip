@@ -4,68 +4,68 @@ permissions:
   contents: read
 
 on:
+  workflow_call:
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
-      - "**.rs"
+      - "**/*.rs"
       - "**/Cargo.toml"
-      - ".github/workflows/**"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "rustfmt.toml"
+      - "assets/**"
+      - "install.*"
+      - ".github/**"
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
-      - "**.rs"
+      - "**/*.rs"
       - "**/Cargo.toml"
-      - ".github/workflows/**"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "rustfmt.toml"
+      - "assets/**"
+      - "install.*"
+      - ".github/**"
 
 jobs:
   test:
+    name: Rust 1.99 checks - ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
-
-    name: Test (stable) - ${{ matrix.target }}
-    runs-on: macos-latest
-
+        include:
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Check build
-        run: cargo check --all-targets
-
-      - name: Check release build
-        run: cargo check --all-targets --release
-
-      - name: Run tests
-        timeout-minutes: 20
-        run: cargo test --no-fail-fast -- --nocapture
-
-  build:
-    name: Build release - ${{ matrix.target }}
-    runs-on: macos-latest
-    needs: [test]
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
-
-    steps:
-      - uses: actions/checkout@v7
+      - uses: ./.github/actions/build-environment
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.99.0
+          components: clippy
           targets: ${{ matrix.target }}
-
+      - name: Verify Cargo output directory
+        run: |
+          actual=$(cargo +1.99.0 metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+          test "$actual" = "$CARGO_TARGET_DIR"
+      - name: Check all targets
+        run: cargo +1.99.0 check --locked --all-targets --target ${{ matrix.target }}
+      - name: Strict Clippy
+        run: cargo +1.99.0 clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
+      - name: Run tests
+        timeout-minutes: 20
+        run: cargo +1.99.0 test --locked --all-targets --target ${{ matrix.target }}
+      - name: Validate Unix installer
+        run: bash .github/scripts/test-install.sh
       - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
-
+        run: cargo +1.99.0 build --locked --release --target ${{ matrix.target }}
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: hpip-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/hpip
+          path: ${{ env.CARGO_TARGET_DIR }}/${{ matrix.target }}/release/hpip
+          if-no-files-found: error
