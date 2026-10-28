@@ -1,0 +1,23 @@
+name: Dependency security
+
+on:
+  pull_request:
+    paths: ["Cargo.toml", "Cargo.lock", ".github/scripts/audit_dependencies.py", ".github/workflows/security-audit.yml"]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - run: cargo install cargo-audit --locked
+      - run: python3 .github/scripts/audit_dependencies.py
