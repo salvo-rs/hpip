@@ -6,6 +6,7 @@ pub mod os;
 pub mod path;
 pub mod time;
 pub mod webdav;
+pub mod write_conditions;
 
 pub use display::*;
 pub use file::*;

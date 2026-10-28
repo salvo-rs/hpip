@@ -3,6 +3,7 @@ use std::sync::Arc;
 use salvo::prelude::*;
 
 use crate::config::AppConfig;
+use crate::util::write_conditions::{MUTATION_LOCK, WriteConditions};
 use crate::util::*;
 
 #[handler]
@@ -77,14 +78,34 @@ pub async fn handle_delete(req: &mut Request, depot: &mut Depot, res: &mut Respo
         return;
     }
 
-    let result = if is_file {
-        tokio::fs::remove_file(&req_p_clone).await
-    } else {
-        tokio::fs::remove_dir_all(&req_p_clone).await
+    let conditions = match WriteConditions::from_request(req) {
+        Ok(conditions) => conditions,
+        Err(status) => {
+            res.status_code(status);
+            return;
+        }
     };
+    let Some(job) = config.spawn_blocking(move || {
+        let _mutation_lock = MUTATION_LOCK.blocking_lock();
+        if !conditions.allows_path(&req_p_clone)? {
+            return Ok(false);
+        }
+        if is_file {
+            std::fs::remove_file(&req_p_clone)?;
+        } else {
+            std::fs::remove_dir_all(&req_p_clone)?;
+        }
+        Ok::<_, std::io::Error>(true)
+    }) else {
+        res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+        return;
+    };
+    let result = job
+        .await
+        .unwrap_or_else(|error| Err(std::io::Error::other(error)));
 
     match result {
-        Ok(()) => {
+        Ok(true) => {
             crate::config::log_msg(
                 config.log,
                 &format!(
@@ -97,12 +118,15 @@ pub async fn handle_delete(req: &mut Request, depot: &mut Depot, res: &mut Respo
                     } else {
                         "directory"
                     },
-                    req_p_clone.display()
+                    req_p.display()
                 ),
             );
             res.status_code(StatusCode::NO_CONTENT);
             res.headers_mut()
                 .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
+        }
+        Ok(false) => {
+            res.status_code(StatusCode::PRECONDITION_FAILED);
         }
         Err(e) => {
             res.status_code(StatusCode::INTERNAL_SERVER_ERROR);

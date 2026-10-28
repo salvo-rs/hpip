@@ -12,6 +12,7 @@ use xml::{EmitterConfig as XmlEmitterConfig, ParserConfig as XmlParserConfig};
 
 use crate::config::{AppConfig, log_msg};
 use crate::util::webdav::*;
+use crate::util::write_conditions::{MUTATION_LOCK, WriteConditions};
 use crate::util::*;
 
 fn default_xml_parser_config() -> XmlParserConfig {
@@ -1439,6 +1440,25 @@ fn copy_move_work(req: &mut Request, config: &Arc<AppConfig>, res: &mut Response
             }
         }
     }
+    let conditions = match WriteConditions::from_request(req) {
+        Ok(conditions) => conditions,
+        Err(status) => {
+            res.status_code(status);
+            return;
+        }
+    };
+    let _mutation_lock = MUTATION_LOCK.blocking_lock();
+    match conditions.allows_path(&req_p) {
+        Ok(true) => {}
+        Ok(false) => {
+            res.status_code(StatusCode::PRECONDITION_FAILED);
+            return;
+        }
+        Err(_) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            return;
+        }
+    }
     if dest_p.exists() {
         if !overwrite {
             res.status_code(StatusCode::PRECONDITION_FAILED);
@@ -2108,5 +2128,116 @@ mod blocking_admission_tests {
                 .unwrap(),
             before
         );
+    }
+}
+
+#[cfg(test)]
+mod mutation_precondition_tests {
+    use salvo::test::{RequestBuilder, TestClient};
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    #[tokio::test]
+    async fn failed_conditions_leave_every_write_method_and_destination_unchanged() {
+        for method in ["DELETE", "COPY", "MOVE"] {
+            let directory = TestDir::new();
+            let source = directory.path().join("source.txt");
+            let destination = directory.path().join("destination.txt");
+            fs::write(&source, b"source bytes").unwrap();
+            fs::write(&destination, b"destination bytes").unwrap();
+            let service =
+                Service::new(crate::build_router(config(directory.path(), &["-w", "-d"])));
+            let etag = format!("\"{}\"", file_etag(&fs::metadata(&source).unwrap()));
+            for (header, value) in [
+                ("If-Match", "\"stale-tag\"".to_owned()),
+                ("If-Match", format!("W/{etag}")),
+                ("If-None-Match", "*".to_owned()),
+                ("If-None-Match", format!("W/{etag}")),
+                (
+                    "If-Unmodified-Since",
+                    "Thu, 01 Jan 1970 00:00:00 GMT".to_owned(),
+                ),
+            ] {
+                let response = RequestBuilder::new(
+                    "http://localhost/source.txt",
+                    salvo::http::Method::from_bytes(method.as_bytes()).unwrap(),
+                )
+                .add_header("Destination", "/destination.txt", true)
+                .add_header(header, value, true)
+                .send(&service)
+                .await;
+                assert_eq!(
+                    response.status_code,
+                    Some(StatusCode::PRECONDITION_FAILED),
+                    "{method} {header}"
+                );
+                assert_eq!(fs::read(&source).unwrap(), b"source bytes");
+                assert_eq!(fs::read(&destination).unwrap(), b"destination bytes");
+            }
+            let response = RequestBuilder::new(
+                "http://localhost/source.txt",
+                salvo::http::Method::from_bytes(method.as_bytes()).unwrap(),
+            )
+            .add_header("Destination", "/destination.txt", true)
+            .add_header("If-Match", etag, true)
+            .add_header("If-Unmodified-Since", "Thu, 01 Jan 1970 00:00:00 GMT", true)
+            .send(&service)
+            .await;
+            assert!(
+                response.status_code.unwrap().is_success(),
+                "matching If-Match must supersede the date: {method}"
+            );
+            assert_eq!(source.exists(), method == "COPY");
+            if method != "DELETE" {
+                assert_eq!(fs::read(&destination).unwrap(), b"source bytes");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn put_and_delete_share_the_version_check_and_mutation_boundary() {
+        let directory = TestDir::new();
+        let source = directory.path().join("source.txt");
+        fs::write(&source, b"original").unwrap();
+        let etag = format!("\"{}\"", file_etag(&fs::metadata(&source).unwrap()));
+        let service = Service::new(crate::build_router(config(directory.path(), &["-w"])));
+        let put = TestClient::put("http://localhost/source.txt")
+            .add_header("If-Match", &etag, true)
+            .body("new longer bytes");
+        let delete =
+            RequestBuilder::new("http://localhost/source.txt", salvo::http::Method::DELETE)
+                .add_header("If-Match", &etag, true);
+        let (put, delete) = tokio::join!(put.send(&service), delete.send(&service));
+        let statuses = [put.status_code.unwrap(), delete.status_code.unwrap()];
+        assert_eq!(
+            statuses.iter().filter(|status| status.is_success()).count(),
+            1
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|&&status| status == StatusCode::PRECONDITION_FAILED)
+                .count(),
+            1
+        );
+        if source.exists() {
+            assert_eq!(fs::read(source).unwrap(), b"new longer bytes");
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_put_uses_the_same_date_policy() {
+        let directory = TestDir::new();
+        let source = directory.path().join("source.txt");
+        fs::write(&source, b"original").unwrap();
+        let service = Service::new(crate::build_router(config(directory.path(), &["-w"])));
+        let response = TestClient::put("http://localhost/source.txt")
+            .add_header("If-Unmodified-Since", "Thu, 01 Jan 1970 00:00:00 GMT", true)
+            .body("replacement")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::PRECONDITION_FAILED));
+        assert_eq!(fs::read(source).unwrap(), b"original");
     }
 }
