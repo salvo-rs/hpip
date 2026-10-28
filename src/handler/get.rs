@@ -1,10 +1,10 @@
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
+use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use salvo::prelude::*;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::config::{AppConfig, EncodingType, log_msg};
 use crate::encoding::*;
@@ -88,7 +88,7 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         if let Some(range_str) = range_header {
-            handle_get_file_range(req, res, &config, &req_p, &range_str);
+            handle_get_file_range(req, res, &config, &req_p, &range_str).await;
             return;
         }
         handle_get_file(req, res, &config, &req_p, false).await;
@@ -464,7 +464,7 @@ fn try_encoded_file(
     None
 }
 
-fn handle_get_file_range(
+async fn handle_get_file_range(
     req: &mut Request,
     res: &mut Response,
     config: &AppConfig,
@@ -484,81 +484,12 @@ fn handle_get_file_range(
     let etag = file_etag(&metadata);
     let modified = file_time_modified(&metadata);
 
-    // Parse "bytes=N-M" range header
-    if !range_str.starts_with("bytes=") {
+    let Some((from, to)) = parse_byte_range(range_str, flen) else {
         res.status_code(StatusCode::RANGE_NOT_SATISFIABLE);
-        res.render(Text::Html(error_html(
-            "416 Range Not Satisfiable",
-            "Custom ranges are unsupported.",
-            "",
-        )));
-        return;
-    }
-
-    let range_spec = &range_str[6..];
-    // Only support single range
-    if range_spec.contains(',') {
-        res.status_code(StatusCode::RANGE_NOT_SATISFIABLE);
-        res.render(Text::Html(error_html(
-            "416 Range Not Satisfiable",
-            "More than one range is unsupported.",
-            "",
-        )));
-        return;
-    }
-
-    let (from, to) = if let Some(pos) = range_spec.find('-') {
-        let from_str = &range_spec[..pos];
-        let to_str = &range_spec[pos + 1..];
-
-        if from_str.is_empty() {
-            // suffix range: -N
-            let n: u64 = match to_str.parse() {
-                Ok(n) => n,
-                Err(_) => {
-                    res.status_code(StatusCode::RANGE_NOT_SATISFIABLE);
-                    return;
-                }
-            };
-            if n > flen {
-                res.status_code(StatusCode::RANGE_NOT_SATISFIABLE);
-                return;
-            }
-            (flen - n, flen - 1)
-        } else if to_str.is_empty() {
-            // open-ended: N-
-            let from: u64 = match from_str.parse() {
-                Ok(n) => n,
-                Err(_) => {
-                    res.status_code(StatusCode::RANGE_NOT_SATISFIABLE);
-                    return;
-                }
-            };
-            if from >= flen {
-                res.status_code(StatusCode::NO_CONTENT);
-                return;
-            }
-            (from, flen - 1)
-        } else {
-            // closed: N-M
-            let from: u64 = match from_str.parse() {
-                Ok(n) => n,
-                Err(_) => {
-                    res.status_code(StatusCode::RANGE_NOT_SATISFIABLE);
-                    return;
-                }
-            };
-            let to: u64 = match to_str.parse() {
-                Ok(n) => n,
-                Err(_) => {
-                    res.status_code(StatusCode::RANGE_NOT_SATISFIABLE);
-                    return;
-                }
-            };
-            (from, to)
-        }
-    } else {
-        res.status_code(StatusCode::RANGE_NOT_SATISFIABLE);
+        res.headers_mut().insert(
+            salvo::http::header::CONTENT_RANGE,
+            format!("bytes */{flen}").parse().unwrap(),
+        );
         return;
     };
 
@@ -574,28 +505,17 @@ fn handle_get_file_range(
         ),
     );
 
-    let content_len = to + 1 - from;
-    let mut f = match File::open(req_p) {
-        Ok(f) => f,
+    let content_len = to - from + 1;
+    let mut file = match tokio::fs::File::open(req_p).await {
+        Ok(file) => file,
         Err(_) => {
             res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
             return;
         }
     };
-
-    if f.seek(SeekFrom::Start(from)).is_err() {
+    if file.seek(std::io::SeekFrom::Start(from)).await.is_err() {
         res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
         return;
-    }
-
-    let mut buf = vec![0u8; content_len as usize];
-    if f.read_exact(&mut buf).is_err() {
-        // Read what we can
-        buf.clear();
-        f.seek(SeekFrom::Start(from)).ok();
-        let mut temp = Vec::new();
-        f.take(content_len).read_to_end(&mut temp).ok();
-        buf = temp;
     }
 
     res.status_code(StatusCode::PARTIAL_CONTENT);
@@ -627,7 +547,58 @@ fn handle_get_file_range(
         .insert(salvo::http::header::ACCEPT_RANGES, "bytes".parse().unwrap());
     res.headers_mut()
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-    res.write_body(buf).ok();
+    stream_file(res, file, content_len);
+}
+
+/// Normalize one byte range before doing arithmetic or allocating buffers.
+fn parse_byte_range(header: &str, length: u64) -> Option<(u64, u64)> {
+    if length == 0 {
+        return None;
+    }
+    let spec = header.strip_prefix("bytes=")?;
+    let (first, last) = spec.split_once('-')?;
+    if first.is_empty() {
+        let suffix = last.parse::<u64>().ok()?;
+        (suffix != 0).then(|| (length.saturating_sub(suffix), length - 1))
+    } else {
+        let start = first.parse::<u64>().ok()?;
+        let end = if last.is_empty() {
+            length - 1
+        } else {
+            last.parse::<u64>().ok()?.min(length - 1)
+        };
+        (start < length && start <= end).then_some((start, end))
+    }
+}
+
+/// The channel has backpressure; a request retains at most a small file chunk.
+fn stream_file(res: &mut Response, mut file: tokio::fs::File, mut remaining: u64) {
+    let mut sender = res.channel();
+    tokio::spawn(async move {
+        while remaining != 0 && !sender.is_closed() {
+            let mut chunk = vec![0; remaining.min(64 * 1024) as usize];
+            match file.read(&mut chunk).await {
+                Ok(0) => {
+                    sender.send_error(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "file shortened during transfer",
+                    ));
+                    break;
+                }
+                Ok(count) => {
+                    chunk.truncate(count);
+                    remaining -= count as u64;
+                    if sender.send_data(chunk).await.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    sender.send_error(error);
+                    break;
+                }
+            }
+        }
+    });
 }
 
 fn handle_get_dir(
@@ -995,4 +966,64 @@ fn try_encode_generated_response(
     }
 
     Some((enc_resp, encoding))
+}
+
+#[cfg(test)]
+mod range_tests {
+    use salvo::prelude::*;
+    use salvo::test::{ResponseExt, TestClient};
+
+    use super::parse_byte_range;
+
+    #[test]
+    fn normalizes_ranges_without_overflow() {
+        for (header, expected) in [
+            ("bytes=0-8", Some((0, 5))),
+            ("bytes=-20", Some((0, 5))),
+            ("bytes=1-", Some((1, 5))),
+            ("bytes=0-18446744073709551615", Some((0, 5))),
+            ("bytes=18446744073709551615-", None),
+            ("bytes=5-1", None),
+            ("bytes=10-", None),
+            ("bytes=-0", None),
+            ("bytes=0-1,2-3", None),
+            ("bytes=0-18446744073709551616", None),
+        ] {
+            assert_eq!(parse_byte_range(header, 6), expected, "{header}");
+        }
+        assert_eq!(parse_byte_range("bytes=0-", 0), None);
+    }
+
+    #[tokio::test]
+    async fn range_responses_match_normalized_file_bytes() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::write(dir.path().join("data.txt"), b"abcdef").unwrap();
+        std::fs::write(dir.path().join("empty.txt"), b"").unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &[],
+        )));
+        for header in ["bytes=0-8", "bytes=-20", "bytes=0-18446744073709551615"] {
+            let mut response = TestClient::get("http://localhost/data.txt")
+                .add_header("Range", header, true)
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::PARTIAL_CONTENT));
+            assert_eq!(response.headers()["content-range"], "bytes 0-5/6");
+            assert_eq!(response.headers()["content-length"], "6");
+            assert!(response.body.is_channel());
+            assert_eq!(response.take_bytes(None).await.unwrap(), "abcdef");
+        }
+        for path in ["data.txt", "empty.txt"] {
+            let response = TestClient::get(format!("http://localhost/{path}"))
+                .add_header("Range", "bytes=10-", true)
+                .send(&service)
+                .await;
+            assert_eq!(
+                response.status_code,
+                Some(StatusCode::RANGE_NOT_SATISFIABLE)
+            );
+            assert!(response.headers().contains_key("content-range"));
+        }
+    }
 }
