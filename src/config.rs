@@ -192,12 +192,18 @@ impl AppConfig {
     }
 
     /// Long response streams must not consume the short metadata/mutation pool.
+    #[cfg(test)]
     pub fn spawn_archive<F, R>(&self, work: F) -> Option<tokio::task::JoinHandle<R>>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
         self.spawn_in_pool(&self.archive_jobs, work)
+    }
+
+    /// Reserve the same bounded archive capacity before deciding a conditional response.
+    pub fn reserve_archive_job(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.admit_in_pool(&self.archive_jobs)
     }
 
     fn spawn_in_pool<F, R>(
@@ -209,6 +215,17 @@ impl AppConfig {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
+        let permit = self.admit_in_pool(pool)?;
+        Some(tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        }))
+    }
+
+    fn admit_in_pool(
+        &self,
+        pool: &std::sync::Arc<tokio::sync::Semaphore>,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
         if !self.accepting_blocking_jobs.load(AtomicOrdering::SeqCst) {
             return None;
         }
@@ -216,10 +233,7 @@ impl AppConfig {
         if !self.accepting_blocking_jobs.load(AtomicOrdering::SeqCst) {
             return None;
         }
-        Some(tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            work()
-        }))
+        Some(permit)
     }
 
     /// Stop admission and wait for already admitted work before deleting its files.

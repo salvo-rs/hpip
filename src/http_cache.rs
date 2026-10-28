@@ -12,6 +12,34 @@ pub fn preconditions(
     etag: Option<&str>,
     modified: DateTime<Utc>,
 ) -> bool {
+    evaluate_preconditions(req, res, etag, Some(modified))
+}
+
+/// Evaluate conditions for an existing generated representation without a stable
+/// validator. A source file's ETag or timestamp cannot identify JSON or an archive.
+pub fn unversioned_preconditions(req: &Request, res: &mut Response) -> bool {
+    if !res.status_code.is_some_and(|status| status.is_success()) {
+        return false;
+    }
+    if matches!(req.method().as_str(), "GET" | "HEAD")
+        && !res.headers().contains_key("content-encoding")
+        && crate::encoding::request_accept_encoding(req)
+            .is_some_and(|accept| !crate::encoding::identity_acceptable(&accept))
+    {
+        res.status_code(StatusCode::NOT_ACCEPTABLE);
+        res.headers_mut().remove("content-length");
+        res.body(salvo::http::ResBody::None);
+        return true;
+    }
+    evaluate_preconditions(req, res, None, None)
+}
+
+fn evaluate_preconditions(
+    req: &Request,
+    res: &mut Response,
+    etag: Option<&str>,
+    modified: Option<DateTime<Utc>>,
+) -> bool {
     let matches_tag_field = |value: &str, weak| {
         match EntityTagList::parse(value) {
             // This function is called only after selecting an existing resource;
@@ -24,32 +52,40 @@ pub fn preconditions(
     let failed = match request_tag_field(req, "if-match") {
         Ok(Some(value)) => !matches_tag_field(&value, false),
         Err(_) => true,
-        Ok(None) => request_date(req, "if-unmodified-since")
-            .is_some_and(|date| modified.timestamp() > date.timestamp()),
+        Ok(None) => modified.is_some_and(|modified| {
+            request_date(req, "if-unmodified-since")
+                .is_some_and(|date| modified.timestamp() > date.timestamp())
+        }),
     };
     let matches = match request_tag_field(req, "if-none-match") {
         Ok(Some(value)) => matches_tag_field(&value, true),
         Err(_) => false,
-        Ok(None) => request_date(req, "if-modified-since")
-            .is_some_and(|since| modified.timestamp() <= since.timestamp()),
+        Ok(None) => modified.is_some_and(|modified| {
+            request_date(req, "if-modified-since")
+                .is_some_and(|since| modified.timestamp() <= since.timestamp())
+        }),
     };
     if failed || matches {
-        res.status_code(if failed {
-            StatusCode::PRECONDITION_FAILED
-        } else {
-            StatusCode::NOT_MODIFIED
-        });
+        res.status_code(
+            if failed || !matches!(req.method().as_str(), "GET" | "HEAD") {
+                StatusCode::PRECONDITION_FAILED
+            } else {
+                StatusCode::NOT_MODIFIED
+            },
+        );
         if let Some(etag) = etag {
             res.headers_mut().insert("etag", etag.parse().unwrap());
         }
-        res.headers_mut().insert(
-            "last-modified",
-            modified
-                .format("%a, %d %b %Y %T GMT")
-                .to_string()
-                .parse()
-                .unwrap(),
-        );
+        if let Some(modified) = modified {
+            res.headers_mut().insert(
+                "last-modified",
+                modified
+                    .format("%a, %d %b %Y %T GMT")
+                    .to_string()
+                    .parse()
+                    .unwrap(),
+            );
+        }
         res.headers_mut().remove("content-length");
         if res.status_code == Some(StatusCode::PRECONDITION_FAILED) {
             // The default error catcher can create a new, unencoded body.
@@ -79,6 +115,38 @@ mod tests {
     use salvo::test::{ResponseExt, TestClient};
 
     use super::*;
+
+    #[tokio::test]
+    async fn generated_coding_metadata_is_cleared_on_failure_but_retained_on_304() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::write(dir.path().join("file.txt"), "fixture").unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &[],
+        )));
+        for method in ["GET", "HEAD"] {
+            let mut response =
+                salvo::test::RequestBuilder::new("http://localhost/", method.parse().unwrap())
+                    .add_header("Accept-Encoding", "gzip", true)
+                    .add_header("If-Match", "\"stale\"", true)
+                    .send(&service)
+                    .await;
+            assert_eq!(response.status_code, Some(StatusCode::PRECONDITION_FAILED));
+            assert!(!response.headers().contains_key("content-encoding"));
+            if method == "GET" {
+                assert!(response.take_string().await.unwrap().contains("412"));
+            }
+            let mut response =
+                salvo::test::RequestBuilder::new("http://localhost/", method.parse().unwrap())
+                    .add_header("Accept-Encoding", "gzip", true)
+                    .add_header("If-None-Match", "*", true)
+                    .send(&service)
+                    .await;
+            assert_eq!(response.status_code, Some(StatusCode::NOT_MODIFIED));
+            assert_eq!(response.headers()["content-encoding"], "gzip");
+            assert!(response.take_bytes(None).await.unwrap().is_empty());
+        }
+    }
 
     #[tokio::test]
     async fn conditional_failures_do_not_describe_the_encoded_success_body() {
@@ -117,6 +185,175 @@ mod tests {
             .await;
         assert_eq!(response.status_code, Some(StatusCode::NOT_MODIFIED));
         assert_eq!(response.headers()["content-encoding"], "gzip");
+    }
+
+    #[tokio::test]
+    async fn generated_representations_apply_existence_conditions_without_file_validators() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::write(dir.path().join("file.txt"), "fixture").unwrap();
+        let config = crate::test_support::config(dir.path(), &["-A"]);
+        let service = Service::new(crate::build_router(config.clone()));
+        let file = TestClient::get("http://localhost/file.txt")
+            .send(&service)
+            .await;
+        let file_tag = file.headers()["etag"].to_str().unwrap();
+        for media in [
+            "application/json",
+            "application/x-tar",
+            "application/zip",
+            "text/html",
+        ] {
+            for method in ["GET", "HEAD"] {
+                for (name, value, status) in [
+                    ("If-Match", "*", StatusCode::OK),
+                    ("If-None-Match", "*", StatusCode::NOT_MODIFIED),
+                    ("If-Match", file_tag, StatusCode::PRECONDITION_FAILED),
+                    ("If-None-Match", file_tag, StatusCode::OK),
+                    (
+                        "If-Modified-Since",
+                        "Wed, 01 Jan 2031 00:00:00 GMT",
+                        StatusCode::OK,
+                    ),
+                    (
+                        "If-Unmodified-Since",
+                        "Wed, 01 Jan 2020 00:00:00 GMT",
+                        StatusCode::OK,
+                    ),
+                ] {
+                    let mut response = salvo::test::RequestBuilder::new(
+                        "http://localhost/",
+                        method.parse().unwrap(),
+                    )
+                    .add_header("Accept", media, true)
+                    .add_header(name, value, true)
+                    .send(&service)
+                    .await;
+                    assert_eq!(
+                        response.status_code,
+                        Some(status),
+                        "{media} {method} {name}"
+                    );
+                    assert!(!response.headers().contains_key("etag"));
+                    assert!(!response.headers().contains_key("last-modified"));
+                    let body = response.take_bytes(None).await.unwrap();
+                    if status == StatusCode::NOT_MODIFIED
+                        || (method == "HEAD" && status.is_success())
+                    {
+                        assert!(body.is_empty());
+                    }
+                }
+            }
+        }
+        assert_eq!(config.archive_jobs.available_permits(), 4);
+        let form = "vendor=http\narchive=yes-i-really-want-one\ntype=tar\n";
+        let response = TestClient::post("http://localhost/")
+            .add_header("Content-Type", "text/plain", true)
+            .add_header("If-None-Match", "*", true)
+            .body(form)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::PRECONDITION_FAILED));
+        assert_eq!(config.archive_jobs.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn generated_conditions_preserve_auth_missing_negotiation_and_worker_failures() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::write(dir.path().join("file.txt"), "fixture").unwrap();
+        let config = crate::test_support::config(dir.path(), &["-A"]);
+        let service = Service::new(crate::build_router(config.clone()));
+        let private = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &["-A", "--auth", "user:pass"],
+        )));
+        let private_tree = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &["-A", "--path-auth", "file.txt=user:pass"],
+        )));
+        for media in ["application/json", "application/x-tar", "application/zip"] {
+            for method in ["GET", "HEAD"] {
+                for (target, path, encoding, status) in [
+                    (&private, "/", "identity", StatusCode::UNAUTHORIZED),
+                    (&service, "/missing", "identity", StatusCode::NOT_FOUND),
+                    (&service, "/", "*;q=0", StatusCode::NOT_ACCEPTABLE),
+                ] {
+                    let response = salvo::test::RequestBuilder::new(
+                        format!("http://localhost{path}"),
+                        method.parse().unwrap(),
+                    )
+                    .add_header("Accept", media, true)
+                    .add_header("Accept-Encoding", encoding, true)
+                    .add_header("If-None-Match", "*", true)
+                    .send(target)
+                    .await;
+                    assert_eq!(
+                        response.status_code,
+                        Some(status),
+                        "{media} {method} {path}"
+                    );
+                }
+            }
+        }
+        for media in ["application/x-tar", "application/zip"] {
+            for method in ["GET", "HEAD"] {
+                let response =
+                    salvo::test::RequestBuilder::new("http://localhost/", method.parse().unwrap())
+                        .add_header("Accept", media, true)
+                        .add_header("If-None-Match", "*", true)
+                        .send(&private_tree)
+                        .await;
+                assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+            }
+        }
+        let _metadata = config
+            .blocking_jobs
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let _archives = config
+            .archive_jobs
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        for media in ["application/json", "application/x-tar", "application/zip"] {
+            let get = TestClient::get("http://localhost/")
+                .add_header("Accept", media, true)
+                .add_header("If-None-Match", "*", true)
+                .send(&service)
+                .await;
+            assert_eq!(
+                get.status_code,
+                Some(StatusCode::SERVICE_UNAVAILABLE),
+                "{media}"
+            );
+            let mut head = TestClient::head("http://localhost/")
+                .add_header("Accept", media, true)
+                .add_header("If-None-Match", "*", true)
+                .send(&service)
+                .await;
+            assert_eq!(head.status_code, Some(StatusCode::NOT_MODIFIED), "{media}");
+            assert!(head.take_bytes(None).await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn json_snapshot_entry_limits_take_precedence_over_existence_conditions() {
+        let dir = crate::test_support::TestDir::new();
+        for index in 0..=crate::util::metadata::MAX_METADATA_ENTRIES {
+            std::fs::write(dir.path().join(index.to_string()), "").unwrap();
+        }
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &[],
+        )));
+        let response = TestClient::get("http://localhost/")
+            .add_header("Accept", "application/json", true)
+            .add_header("If-None-Match", "*", true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::INSUFFICIENT_STORAGE));
     }
 
     #[tokio::test]

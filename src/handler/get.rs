@@ -45,6 +45,7 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
     match super::representation::select(req, &config, &req_p) {
         super::representation::Representation::Json => {
             super::rfsapi::handle_rfsapi_inner(req, res, &config).await;
+            crate::http_cache::unversioned_preconditions(req, res);
             return;
         }
         super::representation::Representation::Archive(kind) => {
@@ -146,6 +147,7 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
                 res.status_code(StatusCode::SERVICE_UNAVAILABLE);
             }
         }
+        crate::http_cache::unversioned_preconditions(req, res);
     }
 }
 
