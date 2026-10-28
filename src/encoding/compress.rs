@@ -5,57 +5,89 @@ use std::path::Path;
 use brotli::enc::BrotliCompress as brotli_compress;
 use brotli::enc::backward_references::BrotliEncoderParams;
 use flate2::Compression;
-use flate2::write::{DeflateEncoder, GzEncoder};
+use flate2::write::{GzEncoder, ZlibEncoder};
 
 use crate::config::EncodingType;
 
-/// Find best supported encoding to use from Accept-Encoding header value, or None for identity.
-pub fn response_encoding(accept: &str) -> Option<EncodingType> {
-    // Parse Accept-Encoding header, pick best supported encoding
-    // Priority: brotli > gzip > deflate (when quality allows)
-    let mut best: Option<(EncodingType, f32)> = None;
-
+pub fn identity_acceptable(accept: &str) -> bool {
+    let mut identity = None;
+    let mut wildcard = None;
     for part in accept.split(',') {
-        let part = part.trim();
-        let (enc_name, quality) = if let Some((name, q_str)) = part.split_once(";q=") {
-            (name.trim(), q_str.trim().parse::<f32>().unwrap_or(1.0))
-        } else {
-            (part, 1.0)
-        };
-
-        if quality == 0.0 {
-            continue;
-        }
-
-        let enc_type = match enc_name {
-            "br" => Some(EncodingType::Brotli),
-            "gzip" => Some(EncodingType::Gzip),
-            "deflate" => Some(EncodingType::Deflate),
-            _ => None,
-        };
-
-        if let Some(enc) = enc_type {
-            let priority = match enc {
-                EncodingType::Brotli => 3.0,
-                EncodingType::Gzip => 2.0,
-                EncodingType::Deflate => 1.0,
-            };
-            let score = quality * 10.0 + priority;
-            if best.as_ref().is_none_or(|b| {
-                score
-                    > b.1 * 10.0
-                        + match b.0 {
-                            EncodingType::Brotli => 3.0,
-                            EncodingType::Gzip => 2.0,
-                            EncodingType::Deflate => 1.0,
-                        }
-            }) {
-                best = Some((enc, quality));
+        let mut fields = part.split(';');
+        let name = fields.next().unwrap_or("").trim();
+        let mut quality = 1.0_f32;
+        for parameter in fields {
+            if let Some((key, value)) = parameter.trim().split_once('=')
+                && key.trim().eq_ignore_ascii_case("q")
+            {
+                quality = value
+                    .trim()
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|q| q.is_finite() && (0.0..=1.0).contains(q))
+                    .unwrap_or(0.0);
             }
         }
+        if name.eq_ignore_ascii_case("identity") {
+            identity = Some(quality);
+        }
+        if name == "*" {
+            wildcard = Some(quality);
+        }
     }
+    identity.unwrap_or_else(|| if wildcard == Some(0.0) { 0.0 } else { 1.0 }) > 0.0
+}
 
-    best.map(|(enc, _)| enc)
+/// Find best supported encoding to use from Accept-Encoding header value, or None for identity.
+pub fn response_encoding(accept: &str) -> Option<EncodingType> {
+    let preferences: Vec<_> = accept
+        .split(',')
+        .map(|part| {
+            let mut fields = part.split(';');
+            let name = fields.next().unwrap_or("").trim().to_ascii_lowercase();
+            let mut quality = 1.0_f32;
+            for parameter in fields {
+                if let Some((key, value)) = parameter.trim().split_once('=')
+                    && key.trim().eq_ignore_ascii_case("q")
+                {
+                    quality = value
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|q| q.is_finite() && (0.0..=1.0).contains(q))
+                        .unwrap_or(0.0);
+                }
+            }
+            (name, quality)
+        })
+        .collect();
+    let wildcard = preferences
+        .iter()
+        .find(|(name, _)| name == "*")
+        .map(|(_, q)| *q);
+    // Keep server preference only for equal quality values; explicit exclusions beat '*'.
+    let mut best = None;
+    for (name, encoding) in [
+        ("br", EncodingType::Brotli),
+        ("gzip", EncodingType::Gzip),
+        ("deflate", EncodingType::Deflate),
+    ] {
+        let quality = preferences
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, q)| *q)
+            .or(wildcard)
+            .unwrap_or(0.0);
+        if quality > 0.0 && best.as_ref().is_none_or(|(_, q)| quality > *q) {
+            best = Some((encoding, quality));
+        }
+    }
+    let identity = preferences
+        .iter()
+        .find(|(n, _)| n == "identity")
+        .map(|(_, q)| *q);
+    best.filter(|(_, q)| identity.is_none_or(|identity| *q >= identity))
+        .map(|(enc, _)| enc)
 }
 
 /// Encode a string slice using a specified encoding.
@@ -133,14 +165,14 @@ fn encode_file_gzip(inf: File, outf: File) -> bool {
 
 // Deflate
 fn encode_str_deflate(dt: &str) -> Option<Vec<u8>> {
-    let mut cmp = DeflateEncoder::new(Vec::new(), Compression::default());
+    let mut cmp = ZlibEncoder::new(Vec::new(), Compression::default());
     cmp.write_all(dt.as_bytes())
         .ok()
         .and_then(|_| cmp.finish().ok())
 }
 
 fn encode_file_deflate(inf: File, outf: File) -> bool {
-    let mut cmp = DeflateEncoder::new(
+    let mut cmp = ZlibEncoder::new(
         BufWriter::with_capacity(1024 * 1024, outf),
         Compression::default(),
     );
@@ -171,4 +203,39 @@ fn encode_file_brotli(inf: File, outf: File) -> bool {
         &brotli_params(),
     )
     .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+
+    use super::*;
+
+    #[test]
+    fn respects_quality_before_server_preference() {
+        assert_eq!(
+            response_encoding("br;q=0.9, gzip;q=1"),
+            Some(EncodingType::Gzip)
+        );
+        assert_eq!(
+            response_encoding("GZIP ; q = 0.7, br;q=0.1"),
+            Some(EncodingType::Gzip)
+        );
+        assert_eq!(
+            response_encoding("br;q=0, *;q=0.5"),
+            Some(EncodingType::Gzip)
+        );
+        assert_eq!(response_encoding("gzip;q=NaN,br;q=2,deflate;q=-1"), None);
+        assert_eq!(response_encoding("gzip;q=0.1,identity;q=1"), None);
+    }
+
+    #[test]
+    fn deflate_is_a_zlib_wrapped_stream() {
+        let compressed = encode_str_deflate("HTTP deflate fixture").unwrap();
+        let mut output = String::new();
+        flate2::read::ZlibDecoder::new(&compressed[..])
+            .read_to_string(&mut output)
+            .unwrap();
+        assert_eq!(output, "HTTP deflate fixture");
+    }
 }
