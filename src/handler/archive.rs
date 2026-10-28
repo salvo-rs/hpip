@@ -256,6 +256,11 @@ async fn serve_archive(
 
     let allow_encoding = config.encoded_temp_dir.is_some();
 
+    let Some(permit) = config.reserve_archive_job() else {
+        res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+        return;
+    };
+
     res.status_code(StatusCode::OK);
     res.headers_mut().insert(
         salvo::http::header::CONTENT_TYPE,
@@ -270,30 +275,29 @@ async fn serve_archive(
     res.headers_mut()
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
 
+    if crate::http_cache::unversioned_preconditions(req, res) {
+        return;
+    }
+
     let sender = res.channel();
     let runtime = tokio::runtime::Handle::current();
-    if config
-        .spawn_archive(move || {
-            let mut writer = ArchiveWriter {
-                sender,
-                runtime,
-                started: Instant::now(),
-                stall_timeout: Duration::from_secs(30),
-                total_timeout: Duration::from_secs(15 * 60),
-            };
-            let result = match archive_type {
-                ArchiveType::Tar => write_tar_body(&req_p, &mut writer),
-                ArchiveType::Zip => write_zip_body(&req_p, allow_encoding, &mut writer),
-            };
-            if let Err(error) = result {
-                writer.sender.send_error(error);
-            }
-        })
-        .is_none()
-    {
-        res.body(salvo::http::ResBody::None);
-        res.status_code(StatusCode::SERVICE_UNAVAILABLE);
-    }
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut writer = ArchiveWriter {
+            sender,
+            runtime,
+            started: Instant::now(),
+            stall_timeout: Duration::from_secs(30),
+            total_timeout: Duration::from_secs(15 * 60),
+        };
+        let result = match archive_type {
+            ArchiveType::Tar => write_tar_body(&req_p, &mut writer),
+            ArchiveType::Zip => write_zip_body(&req_p, allow_encoding, &mut writer),
+        };
+        if let Err(error) = result {
+            writer.sender.send_error(error);
+        }
+    });
 }
 
 /// Bridge synchronous archive writers to a backpressured response channel.

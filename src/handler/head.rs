@@ -50,6 +50,7 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
         );
         res.headers_mut()
             .insert("content-type", "application/json".parse().unwrap());
+        crate::http_cache::unversioned_preconditions(req, res);
         return;
     }
     if let super::representation::Representation::Archive(kind) = representation {
@@ -67,6 +68,7 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
         res.status_code(StatusCode::OK);
         res.headers_mut()
             .insert("content-type", kind.default_mime().parse().unwrap());
+        crate::http_cache::unversioned_preconditions(req, res);
         return;
     }
 
@@ -138,6 +140,7 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
                     crate::encoding::encoding_name(encoding).parse().unwrap(),
                 );
             }
+            crate::http_cache::unversioned_preconditions(req, res);
             return;
         }
     }
