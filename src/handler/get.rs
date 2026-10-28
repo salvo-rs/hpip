@@ -269,6 +269,9 @@ async fn serve_open_file(
             .headers()
             .get(salvo::http::header::RANGE)
             .and_then(|header| header.to_str().ok())
+            // Ignore unsupported units and multipart ranges rather than claiming
+            // that the current representation cannot satisfy them.
+            .filter(|range| range.starts_with("bytes=") && !range.contains(','))
             .map(str::to_owned)
     {
         let tag = format!("\"{etag}\"");

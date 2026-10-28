@@ -86,6 +86,40 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn unsupported_ranges_fall_back_to_a_full_conditional_response() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::write(dir.path().join("file.txt"), "fixture").unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &[],
+        )));
+        for range in ["items=0-2", "bytes=0-1,3-4"] {
+            let mut response = TestClient::get("http://localhost/file.txt")
+                .add_header("Range", range, true)
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::OK));
+            assert!(!response.headers().contains_key("content-range"));
+            assert_eq!(response.take_string().await.unwrap(), "fixture");
+            let response = TestClient::get("http://localhost/file.txt")
+                .add_header("Range", range, true)
+                .add_header("If-None-Match", "*", true)
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::NOT_MODIFIED));
+        }
+        let response = TestClient::get("http://localhost/file.txt")
+            .add_header("Range", "bytes=99-", true)
+            .send(&service)
+            .await;
+        assert_eq!(
+            response.status_code,
+            Some(StatusCode::RANGE_NOT_SATISFIABLE)
+        );
+        assert_eq!(response.headers()["content-range"], "bytes */7");
+    }
+
+    #[tokio::test]
     async fn failed_read_preconditions_precede_cache_and_range_responses() {
         let dir = crate::test_support::TestDir::new();
         std::fs::write(dir.path().join("file.txt"), "fixture").unwrap();
