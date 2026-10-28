@@ -104,7 +104,7 @@ window.addEventListener("DOMContentLoaded", function() {
         file_upload_text.data = remaining_files;
       } else {
         progress_line.innerText = request.response;
-        file_upload.outerHTML = req_url + "<br />" + request.response;
+        file_upload.disabled = true;
       }
     });
 

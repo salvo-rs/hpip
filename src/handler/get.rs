@@ -217,7 +217,7 @@ async fn handle_get_file(
         Err(e) => {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 res.status_code(StatusCode::FORBIDDEN);
-                res.render(Text::Html(error_html(
+                res.render(Text::Html(error_html_text(
                     "403 Forbidden",
                     format!("Can't access {}.", req_p.display()),
                     "",
@@ -864,7 +864,7 @@ fn handle_dir_listing(
         Ok(rd) => rd,
         Err(_) => {
             res.status_code(StatusCode::FORBIDDEN);
-            res.render(Text::Html(error_html(
+            res.render(Text::Html(error_html_text(
                 "403 Forbidden",
                 format!("Can't access {}.", url_path),
                 "",
