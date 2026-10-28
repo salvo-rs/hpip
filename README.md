@@ -207,6 +207,10 @@ byte budgets and entry limits; `--encoded-prune` controls expiration independent
 of those capacity limits. Temporary state belongs to one server instance and is
 cleaned after graceful request and worker shutdown.
 
+JSON directory metadata and WebDAV PROPFIND snapshots use the bounded worker
+pool. Each directory snapshot is limited to 10,000 entries and each serialized
+metadata response to 16 MiB; exceeding either budget returns HTTP 507.
+
 Symlinks are followed by default. Use `-s` to block them or `-r` to restrict their
 targets to the hosted directory. These options do not establish an operating
 system sandbox against another process changing the filesystem concurrently.

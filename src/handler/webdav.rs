@@ -178,9 +178,24 @@ pub async fn handle_propfind(req: &mut Request, depot: &mut Depot, res: &mut Res
     let ua = req
         .headers()
         .get(salvo::http::header::USER_AGENT)
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
 
-    match write_propfind_output(&config, &url, &req_p, &props, ua, depth) {
+    let work_config = config.clone();
+    let Some(job) = config.spawn_blocking(move || {
+        write_propfind_output(&work_config, &url, &req_p, &props, ua.as_deref(), depth)
+    }) else {
+        res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+        return;
+    };
+    let result = match job.await {
+        Ok(result) => result,
+        Err(_) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            return;
+        }
+    };
+    match result {
         Ok(xml_bytes) => {
             res.status_code(StatusCode::MULTI_STATUS);
             res.headers_mut().insert(
@@ -192,10 +207,19 @@ pub async fn handle_propfind(req: &mut Request, depot: &mut Depot, res: &mut Res
             res.write_body(xml_bytes).ok();
         }
         Err(e) => {
+            let over_budget = matches!(&e, xml::writer::Error::Io(error) if error.kind() == IoErrorKind::FileTooLarge);
             set_error(
                 res,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "500 Internal Server Error",
+                if over_budget {
+                    StatusCode::INSUFFICIENT_STORAGE
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+                if over_budget {
+                    "507 Insufficient Storage"
+                } else {
+                    "500 Internal Server Error"
+                },
                 &format!("XML error: {}", e),
             );
         }
@@ -209,7 +233,7 @@ fn write_propfind_output(
     variant: &PropfindVariant,
     ua: Option<&str>,
     depth: Depth,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, xml::writer::Error> {
     let props: &[&[XmlName]] = match variant {
         PropfindVariant::AllProp => {
             if client_microsoft(ua) {
@@ -224,7 +248,9 @@ fn write_propfind_output(
 
     let just_names = matches!(variant, PropfindVariant::PropName);
 
-    let mut out = initialise_xml_output().map_err(|e| e.to_string())?;
+    let mut out = initialise_xml_output_with(crate::util::metadata::MetadataBuffer::new(
+        crate::util::metadata::MAX_METADATA_BYTES,
+    ))?;
 
     // Build namespace-aware start element
     let mut start = XmlWEvent::start_element("D:multistatus")
@@ -232,16 +258,14 @@ fn write_propfind_output(
     for &(prefix, namespace) in &WEBDAV_XML_NAMESPACES[1..] {
         start = start.ns(prefix, namespace);
     }
-    out.write(start).map_err(|e| e.to_string())?;
+    out.write(start)?;
 
-    let meta = path.metadata().map_err(|e| e.to_string())?;
+    let meta = path.metadata()?;
 
     if let PropfindVariant::Props(custom) = variant {
-        write_propfind_response_custom(config, &mut out, url, path, &meta, custom, just_names)
-            .map_err(|e| e.to_string())?;
+        write_propfind_response_custom(config, &mut out, url, path, &meta, custom, just_names)?;
     } else {
-        write_propfind_response(config, &mut out, url, path, &meta, props, just_names)
-            .map_err(|e| e.to_string())?;
+        write_propfind_response(config, &mut out, url, path, &meta, props, just_names)?;
     }
 
     if meta.is_dir() {
@@ -255,8 +279,7 @@ fn write_propfind_output(
                 custom,
                 just_names,
                 depth,
-            )
-            .map_err(|e| e.to_string())?;
+            )?;
         } else {
             write_propfind_recursive(
                 config,
@@ -266,14 +289,12 @@ fn write_propfind_output(
                 props,
                 just_names,
                 depth,
-            )
-            .map_err(|e| e.to_string())?;
+            )?;
         }
     }
 
-    out.write(XmlWEvent::end_element())
-        .map_err(|e| e.to_string())?;
-    Ok(out.into_inner())
+    out.write(XmlWEvent::end_element())?;
+    Ok(out.into_inner().into_bytes())
 }
 
 fn write_propfind_response<W: Write>(
@@ -424,12 +445,7 @@ fn write_propfind_recursive<W: Write>(
     let mut links_left = MAX_SYMLINKS;
 
     if let Some(next_depth) = depth.lower() {
-        let entries: Vec<_> = root_path
-            .read_dir()
-            .into_iter()
-            .flatten()
-            .flatten()
-            .collect();
+        let entries = crate::util::metadata::directory_entries(root_path)?;
         for f in entries {
             if is_internal_name(&f.file_name()) {
                 continue;
@@ -495,12 +511,7 @@ fn write_propfind_recursive_custom<W: Write>(
     let mut links_left = MAX_SYMLINKS;
 
     if let Some(next_depth) = depth.lower() {
-        let entries: Vec<_> = root_path
-            .read_dir()
-            .into_iter()
-            .flatten()
-            .flatten()
-            .collect();
+        let entries = crate::util::metadata::directory_entries(root_path)?;
         for f in entries {
             if is_internal_name(&f.file_name()) {
                 continue;
@@ -701,7 +712,11 @@ fn write_start_prop_element<W: Write>(
 }
 
 fn initialise_xml_output() -> Result<XmlWriter<Vec<u8>>, xml::writer::Error> {
-    let mut out = XmlWriter::new_with_config(vec![], default_xml_emitter_config());
+    initialise_xml_output_with(vec![])
+}
+
+fn initialise_xml_output_with<W: Write>(output: W) -> Result<XmlWriter<W>, xml::writer::Error> {
+    let mut out = XmlWriter::new_with_config(output, default_xml_emitter_config());
     out.write(XmlWEvent::StartDocument {
         version: XmlVersion::Version10,
         encoding: Some("utf-8"),

@@ -62,7 +62,29 @@ pub async fn handle_rfsapi(req: &mut Request, depot: &mut Depot, res: &mut Respo
 }
 
 /// Inner implementation that can be called directly with a config reference.
-pub async fn handle_rfsapi_inner(req: &mut Request, res: &mut Response, config: &AppConfig) {
+pub async fn handle_rfsapi_inner(req: &mut Request, res: &mut Response, config: &Arc<AppConfig>) {
+    let uri = req.uri().clone();
+    let remote = req.remote_addr().to_string();
+    let work_config = config.clone();
+    let Some(job) = config.spawn_blocking(move || {
+        let mut request = Request::new();
+        *request.uri_mut() = uri;
+        let mut response = Response::new();
+        handle_rfsapi_snapshot(&mut request, &mut response, &work_config, &remote);
+        response
+    }) else {
+        res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+        return;
+    };
+    match job.await {
+        Ok(response) => *res = response,
+        Err(_) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+}
+
+fn handle_rfsapi_snapshot(req: &mut Request, res: &mut Response, config: &AppConfig, remote: &str) {
     let url_path_raw = req.uri().path().to_string();
     let segments: Vec<&str> = url_path_raw.split('/').filter(|s| !s.is_empty()).collect();
     let (req_p, symlink, url_err) = resolve_path(
@@ -87,8 +109,6 @@ pub async fn handle_rfsapi_inner(req: &mut Request, res: &mut Response, config: 
         return;
     }
 
-    let remote = req.remote_addr().to_string();
-
     let metadata = match req_p.metadata() {
         Ok(m) => m,
         Err(_) => {
@@ -100,9 +120,9 @@ pub async fn handle_rfsapi_inner(req: &mut Request, res: &mut Response, config: 
     let is_file = is_actually_file(&metadata.file_type(), &req_p);
 
     if is_file {
-        handle_get_raw_fs_file(req, res, config, &req_p, &remote);
+        handle_get_raw_fs_file(req, res, config, &req_p, remote);
     } else {
-        handle_get_raw_fs_dir(req, res, config, &req_p, &remote, &url_path_raw);
+        handle_get_raw_fs_dir(req, res, config, &req_p, remote, &url_path_raw);
     }
 }
 
@@ -136,7 +156,7 @@ fn handle_get_raw_fs_file(
     );
     res.headers_mut()
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-    res.render(Text::Json(serde_json::to_string(&data).unwrap_or_default()));
+    render_snapshot(res, &data);
 }
 
 fn handle_get_raw_fs_dir(
@@ -161,11 +181,19 @@ fn handle_get_raw_fs_dir(
         || url_path_raw == "/"
         || url_path_raw.is_empty();
 
-    let files: Vec<RawFileData> = req_p
-        .read_dir()
+    let entries = match crate::util::metadata::directory_entries(req_p) {
+        Ok(entries) => entries,
+        Err(error) => {
+            res.status_code(if error.kind() == std::io::ErrorKind::FileTooLarge {
+                StatusCode::INSUFFICIENT_STORAGE
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            });
+            return;
+        }
+    };
+    let files: Vec<RawFileData> = entries
         .into_iter()
-        .flatten()
-        .filter_map(|p| p.ok())
         .filter(|entry| !is_internal_name(&entry.file_name()))
         .filter(|f| {
             let fp = f.path();
@@ -206,5 +234,67 @@ fn handle_get_raw_fs_dir(
     );
     res.headers_mut()
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-    res.render(Text::Json(serde_json::to_string(&data).unwrap_or_default()));
+    render_snapshot(res, &data);
+}
+
+fn render_snapshot(res: &mut Response, data: &FilesetData) {
+    let mut output =
+        crate::util::metadata::MetadataBuffer::new(crate::util::metadata::MAX_METADATA_BYTES);
+    match serde_json::to_writer(&mut output, data) {
+        Ok(()) => res.body(output.into_bytes()),
+        Err(error) => res.status_code(
+            if error.io_error_kind() == Some(std::io::ErrorKind::FileTooLarge) {
+                StatusCode::INSUFFICIENT_STORAGE
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            },
+        ),
+    };
+}
+#[cfg(test)]
+mod snapshot_tests {
+    use salvo::test::{RequestBuilder, TestClient};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn metadata_routes_share_bounded_admission_and_resume_when_capacity_returns() {
+        let directory = crate::test_support::TestDir::new();
+        std::fs::write(directory.path().join("file.txt"), b"fixture").unwrap();
+        let config = crate::test_support::config(directory.path(), &["-d"]);
+        let permits = config
+            .blocking_jobs
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let service = Service::new(crate::build_router(config));
+        let json = TestClient::get("http://localhost/")
+            .add_header("Accept", "application/json", true)
+            .send(&service)
+            .await;
+        let xml = RequestBuilder::new(
+            "http://localhost/",
+            salvo::http::Method::from_bytes(b"PROPFIND").unwrap(),
+        )
+        .add_header("Depth", "1", true)
+        .send(&service)
+        .await;
+        assert_eq!(json.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(xml.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+        drop(permits);
+        let json = TestClient::get("http://localhost/")
+            .add_header("Accept", "application/json", true)
+            .send(&service)
+            .await;
+        let xml = RequestBuilder::new(
+            "http://localhost/",
+            salvo::http::Method::from_bytes(b"PROPFIND").unwrap(),
+        )
+        .add_header("Depth", "1", true)
+        .send(&service)
+        .await;
+        assert_eq!(json.status_code, Some(StatusCode::OK));
+        assert_eq!(xml.status_code, Some(StatusCode::MULTI_STATUS));
+    }
 }
