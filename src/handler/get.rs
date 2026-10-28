@@ -292,8 +292,8 @@ async fn handle_get_file(
     }
 
     // Serve file without encoding
-    let file_data = match tokio::fs::read(req_p).await {
-        Ok(data) => data,
+    let file = match tokio::fs::File::open(req_p).await {
+        Ok(file) => file,
         Err(e) => {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 res.status_code(StatusCode::FORBIDDEN);
@@ -338,7 +338,7 @@ async fn handle_get_file(
     );
     res.headers_mut()
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-    res.write_body(file_data).ok();
+    stream_file(res, file, flen);
 }
 
 fn try_encoded_file(
@@ -1025,5 +1025,21 @@ mod range_tests {
             );
             assert!(response.headers().contains_key("content-range"));
         }
+    }
+
+    #[tokio::test]
+    async fn large_download_uses_a_channel_and_preserves_contents() {
+        let dir = crate::test_support::TestDir::new();
+        let data = vec![42; 3 * 1024 * 1024 + 7];
+        std::fs::write(dir.path().join("data.bin"), &data).unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &["-e"],
+        )));
+        let mut response = TestClient::get("http://localhost/data.bin")
+            .send(&service)
+            .await;
+        assert!(response.body.is_channel());
+        assert_eq!(response.take_bytes(None).await.unwrap().as_ref(), data);
     }
 }
