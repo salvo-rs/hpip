@@ -83,6 +83,109 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn coding_negotiation_failures_precede_file_conditions_and_ranges() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::write(dir.path().join("small.txt"), "small").unwrap();
+        std::fs::write(dir.path().join("empty.txt"), "").unwrap();
+        std::fs::write(
+            dir.path().join("image.png"),
+            "blacklisted coding\n".repeat(2000),
+        )
+        .unwrap();
+        let mut state = 0x8b56_e3c9_u32;
+        let noise: Vec<_> = (0..8192)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        std::fs::write(dir.path().join("noise.txt"), noise).unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &[],
+        )));
+        for path in ["small.txt", "empty.txt", "image.png", "noise.txt"] {
+            for method in ["GET", "HEAD"] {
+                for condition in [
+                    None,
+                    Some(("If-None-Match", "*")),
+                    Some(("If-Match", r#""obsolete""#)),
+                    Some(("If-Modified-Since", "Wed, 01 Jan 2031 00:00:00 GMT")),
+                ] {
+                    for range in [None, Some("bytes=0-1")] {
+                        let mut request = salvo::test::RequestBuilder::new(
+                            format!("http://localhost/{path}"),
+                            method.parse().unwrap(),
+                        )
+                        .add_header(
+                            "Accept-Encoding",
+                            "gzip,identity;q=0",
+                            true,
+                        );
+                        if let Some((name, value)) = condition {
+                            request = request.add_header(name, value, true);
+                        }
+                        if let Some(value) = range {
+                            request = request.add_header("Range", value, true);
+                        }
+                        let mut response = request.send(&service).await;
+                        assert_eq!(
+                            response.status_code,
+                            Some(StatusCode::NOT_ACCEPTABLE),
+                            "{path} {method} {condition:?} {range:?}"
+                        );
+                        assert!(!response.headers().contains_key("etag"));
+                        assert!(!response.headers().contains_key("content-range"));
+                        // A 406 may carry the framework's ordinary error page.
+                        response.take_bytes(None).await.unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn each_cold_head_resolves_negotiation_before_wildcard_and_date_conditions() {
+        let dir = crate::test_support::TestDir::new();
+        let mut state = 0x8b56_e3c9_u32;
+        let noise: Vec<_> = (0..8192)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        std::fs::write(dir.path().join("noise.txt"), noise).unwrap();
+        for (name, value) in [
+            ("If-Match", "*"),
+            ("If-None-Match", "*"),
+            ("If-Modified-Since", "Wed, 01 Jan 2031 00:00:00 GMT"),
+            ("If-Unmodified-Since", "Wed, 01 Jan 2020 00:00:00 GMT"),
+        ] {
+            // Each scenario has a fresh cache and no preceding GET.
+            let cold = Service::new(crate::build_router(crate::test_support::config(
+                dir.path(),
+                &[],
+            )));
+            let response = TestClient::head("http://localhost/noise.txt")
+                .add_header("Accept-Encoding", "gzip,identity;q=0", true)
+                .add_header(name, value, true)
+                .send(&cold)
+                .await;
+            assert_eq!(
+                response.status_code,
+                Some(StatusCode::NOT_ACCEPTABLE),
+                "{name}"
+            );
+            assert!(!response.headers().contains_key("etag"));
+            assert!(!response.headers().contains_key("content-encoding"));
+        }
+    }
+
+    #[tokio::test]
     async fn repeated_tag_field_lines_protect_reads_and_mutations() {
         let dir = crate::test_support::TestDir::new();
         let path = dir.path().join("file.txt");
