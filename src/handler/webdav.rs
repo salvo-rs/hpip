@@ -927,6 +927,59 @@ fn apply_proppatch(path: &Path, actionables: &ProppatchActionables) -> std::io::
     Ok(())
 }
 
+/// Revalidate the current namespace while excluding this server's other mutations.
+/// A path resolved before receiving the body is only a name, not a pinned object.
+fn commit_proppatch(
+    req: &Request,
+    config: &Arc<AppConfig>,
+    conditions: &WriteConditions,
+    actionables: &ProppatchActionables,
+    apply: bool,
+) -> std::io::Result<Option<Response>> {
+    let _guard = MUTATION_LOCK.blocking_lock();
+    if let Some(response) = crate::hoops::auth::check_auth(req, config) {
+        return Ok(Some(response));
+    }
+    let segments: Vec<_> = req
+        .uri()
+        .path()
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let (path, symlink, invalid) = resolve_path(
+        &config.hosted_directory.1,
+        &segments,
+        config.follow_symlinks,
+    );
+    let mut response = Response::new();
+    if invalid {
+        set_error(
+            &mut response,
+            StatusCode::BAD_REQUEST,
+            "400 Bad Request",
+            "Percent-encoding decoded to invalid UTF-8.",
+        );
+        return Ok(Some(response));
+    }
+    if !path.exists() || config.is_symlink_denied(symlink, &path) {
+        set_error(
+            &mut response,
+            StatusCode::NOT_FOUND,
+            "404 Not Found",
+            "The requested entity doesn't exist.",
+        );
+        return Ok(Some(response));
+    }
+    if !conditions.allows_path(&path)? {
+        response.status_code(StatusCode::PRECONDITION_FAILED);
+        return Ok(Some(response));
+    }
+    if apply {
+        apply_proppatch(&path, actionables)?;
+    }
+    Ok(None)
+}
+
 #[handler]
 pub async fn handle_proppatch(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
@@ -974,6 +1027,11 @@ pub async fn handle_proppatch(req: &mut Request, depot: &mut Depot, res: &mut Re
         return;
     }
 
+    let mut snapshot = Request::new();
+    *snapshot.uri_mut() = req.uri().clone();
+    *snapshot.method_mut() = req.method().clone();
+    *snapshot.headers_mut() = req.headers().clone();
+    *snapshot.remote_addr_mut() = req.remote_addr().clone();
     let Some(body_bytes) = control_body(req, res).await else {
         return;
     };
@@ -1014,26 +1072,19 @@ pub async fn handle_proppatch(req: &mut Request, depot: &mut Depot, res: &mut Re
     };
     let (actionables, mut statuses) = prepare_proppatch(&props);
     let apply = statuses.iter().all(|status| *status == StatusCode::OK);
-    let path = req_p.clone();
+    let work_config = config.clone();
     let Some(job) = config.spawn_blocking(move || {
-        let _guard = MUTATION_LOCK.blocking_lock();
-        if !conditions.allows_path(&path)? {
-            return Ok(false);
-        }
-        if apply {
-            apply_proppatch(&path, &actionables)?;
-        }
-        Ok(true)
+        commit_proppatch(&snapshot, &work_config, &conditions, &actionables, apply)
     }) else {
         res.status_code(StatusCode::SERVICE_UNAVAILABLE);
         return;
     };
     match job.await.unwrap_or_else(|error| Err(IoError::other(error))) {
-        Ok(false) => {
-            res.status_code(StatusCode::PRECONDITION_FAILED);
+        Ok(Some(response)) => {
+            *res = response;
             return;
         }
-        Ok(true) => {}
+        Ok(None) => {}
         Err(error) => {
             log_msg(config.log, &format!("PROPPATCH failed: {error}"));
             statuses.fill(if error.kind() == IoErrorKind::PermissionDenied {
@@ -2022,6 +2073,205 @@ mod proppatch_tests {
         )
         .add_header("Content-Type", "application/xml", true)
         .body(body.to_owned())
+    }
+
+    #[tokio::test]
+    async fn commit_keeps_request_credentials_and_rejects_stale_conditions() {
+        let directory = TestDir::new();
+        let path = directory.path().join("file");
+        fs::write(&path, b"fixture").unwrap();
+        let service = Service::new(crate::build_router(config(
+            directory.path(),
+            &["-w", "-d", "--auth", "user:pass"],
+        )));
+        let body = r#"<D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:"><D:set><D:prop><Z:Win32LastModifiedTime>2020-09-13T12:26:40Z</Z:Win32LastModifiedTime></D:prop></D:set></D:propertyupdate>"#;
+        let mut response = request(body)
+            .basic_auth("user", Some("pass"))
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::MULTI_STATUS));
+        assert!(response.take_string().await.unwrap().contains("200 OK"));
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        let response = request(body)
+            .basic_auth("user", Some("pass"))
+            .add_header("If-Match", r#""obsolete""#, true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::PRECONDITION_FAILED));
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), before);
+    }
+
+    #[test]
+    fn commit_rechecks_existence_after_namespace_changes() {
+        let directory = TestDir::new();
+        let path = directory.path().join("file");
+        fs::write(&path, b"fixture").unwrap();
+        let config = config(directory.path(), &["-w", "-d"]);
+        let snapshot = request("").build();
+        assert!(crate::hoops::auth::check_auth(&snapshot, &config).is_none());
+        {
+            let _guard = MUTATION_LOCK.blocking_lock();
+            crate::util::namespace::rename_no_replace(&path, &directory.path().join("retired"))
+                .unwrap();
+        }
+        let response = commit_proppatch(
+            &snapshot,
+            &config,
+            &WriteConditions::default(),
+            &ProppatchActionables::default(),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status_code, Some(StatusCode::NOT_FOUND));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_revalidates_authorization_and_symlink_policy_after_namespace_publication() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        for policy in ["auth", "no-follow", "sandbox"] {
+            let directory = TestDir::new();
+            let root = directory.path().join("served");
+            fs::create_dir_all(root.join("active")).unwrap();
+            fs::create_dir(root.join("prepared")).unwrap();
+            fs::create_dir(root.join("private")).unwrap();
+            fs::write(root.join("active/file"), b"initial resource").unwrap();
+            let target = if policy == "sandbox" {
+                directory.path().join("outside")
+            } else {
+                root.join("private/file")
+            };
+            fs::write(&target, b"unchanged resource").unwrap();
+            symlink(&target, root.join("prepared/file")).unwrap();
+            let flags = match policy {
+                "auth" => vec!["-w", "-d", "--path-auth", "private=user:pass"],
+                "no-follow" => vec!["-w", "-d", "-s"],
+                _ => vec!["-w", "-d", "-r"],
+            };
+            let config = config(&root, &flags);
+            let snapshot =
+                RequestBuilder::new("http://localhost/active/file", "PROPPATCH".parse().unwrap())
+                    .build();
+            assert!(crate::hoops::auth::check_auth(&snapshot, &config).is_none());
+            let (initial, link, invalid) = resolve_path(
+                &config.hosted_directory.1,
+                &["active", "file"],
+                config.follow_symlinks,
+            );
+            assert!(!invalid && initial.exists() && !config.is_symlink_denied(link, &initial));
+            let before = fs::metadata(&target).unwrap();
+            // Model a separate authorized namespace operation between the early
+            // check and commit, using the same publication helpers and lock.
+            {
+                let _guard = MUTATION_LOCK.blocking_lock();
+                crate::util::namespace::rename_no_replace(
+                    &root.join("active"),
+                    &root.join("retired"),
+                )
+                .unwrap();
+                crate::util::namespace::copy_no_replace(
+                    &root.join("prepared"),
+                    &root.join("active"),
+                    true,
+                )
+                .unwrap();
+            }
+            let response = commit_proppatch(
+                &snapshot,
+                &config,
+                &WriteConditions::default(),
+                &ProppatchActionables {
+                    Win32LastModifiedTime: Some(1_600_000_000_000),
+                    executable: Some(true),
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                response.status_code,
+                Some(if policy == "auth" {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::NOT_FOUND
+                }),
+                "{policy}"
+            );
+            let after = fs::metadata(&target).unwrap();
+            assert_eq!(
+                after.modified().unwrap(),
+                before.modified().unwrap(),
+                "{policy}"
+            );
+            assert_eq!(
+                after.permissions().mode(),
+                before.permissions().mode(),
+                "{policy}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_applies_properties_to_the_freshly_resolved_authorized_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDir::new();
+        fs::create_dir(directory.path().join("active")).unwrap();
+        fs::create_dir(directory.path().join("prepared")).unwrap();
+        let original = directory.path().join("original");
+        fs::write(&original, b"original").unwrap();
+        symlink(&original, directory.path().join("active/file")).unwrap();
+        fs::write(directory.path().join("prepared/file"), b"replacement").unwrap();
+        let config = config(directory.path(), &["-w", "-d"]);
+        let snapshot =
+            RequestBuilder::new("http://localhost/active/file", "PROPPATCH".parse().unwrap())
+                .build();
+        let (initial, ..) = resolve_path(&config.hosted_directory.1, &["active", "file"], true);
+        assert_eq!(initial, original);
+        let before = fs::metadata(&original).unwrap().modified().unwrap();
+        {
+            let _guard = MUTATION_LOCK.blocking_lock();
+            crate::util::namespace::rename_no_replace(
+                &directory.path().join("active"),
+                &directory.path().join("retired"),
+            )
+            .unwrap();
+            crate::util::namespace::copy_no_replace(
+                &directory.path().join("prepared"),
+                &directory.path().join("active"),
+                true,
+            )
+            .unwrap();
+        }
+        assert!(
+            commit_proppatch(
+                &snapshot,
+                &config,
+                &WriteConditions::default(),
+                &ProppatchActionables {
+                    Win32LastModifiedTime: Some(1_600_000_000_000),
+                    ..Default::default()
+                },
+                true
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(fs::metadata(original).unwrap().modified().unwrap(), before);
+        assert_eq!(
+            fs::metadata(directory.path().join("active/file"))
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+            1_600_000_000_000
+        );
     }
 
     #[tokio::test]
