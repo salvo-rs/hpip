@@ -47,7 +47,9 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
     if config.archives
         && let Some(kind) = crate::handler::archive::try_get_accept_archive(req)
     {
-        if let Some(response) = crate::hoops::auth::check_tree_auth(req, config, req.uri().path()) {
+        if let Some(response) =
+            crate::hoops::auth::check_tree_auth_async(req, config, req.uri().path()).await
+        {
             *res = response;
             res.body(salvo::http::ResBody::None);
             return;

@@ -30,7 +30,7 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
     if config.archives
         && let Some(archive_type) = crate::handler::archive::try_get_accept_archive(req)
     {
-        crate::handler::archive::serve_archive_from_get(req, res, &config, archive_type);
+        crate::handler::archive::serve_archive_from_get(req, res, &config, archive_type).await;
         return;
     }
 

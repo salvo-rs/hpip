@@ -140,7 +140,7 @@ pub async fn handle_post_archive(req: &mut Request, depot: &mut Depot, res: &mut
         }
     };
 
-    serve_archive(req, res, &config, at);
+    serve_archive(req, res, &config, at).await;
 }
 
 /// Handle GET requests with Accept header for archives
@@ -157,17 +157,24 @@ pub fn try_get_accept_archive(req: &Request) -> Option<ArchiveType> {
 }
 
 /// Serve an archive from a GET request with Accept header
-pub fn serve_archive_from_get(
+pub async fn serve_archive_from_get(
     req: &Request,
     res: &mut Response,
-    config: &AppConfig,
+    config: &Arc<AppConfig>,
     archive_type: ArchiveType,
 ) {
-    serve_archive(req, res, config, archive_type);
+    serve_archive(req, res, config, archive_type).await;
 }
 
-fn serve_archive(req: &Request, res: &mut Response, config: &AppConfig, archive_type: ArchiveType) {
-    if let Some(response) = crate::hoops::auth::check_tree_auth(req, config, req.uri().path()) {
+async fn serve_archive(
+    req: &Request,
+    res: &mut Response,
+    config: &Arc<AppConfig>,
+    archive_type: ArchiveType,
+) {
+    if let Some(response) =
+        crate::hoops::auth::check_tree_auth_async(req, config, req.uri().path()).await
+    {
         *res = response;
         return;
     }

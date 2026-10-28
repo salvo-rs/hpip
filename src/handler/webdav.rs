@@ -96,7 +96,8 @@ pub async fn handle_propfind(req: &mut Request, depot: &mut Depot, res: &mut Res
     };
 
     if depth != Depth::Zero
-        && let Some(response) = crate::hoops::auth::check_tree_auth(req, &config, &url_path_raw)
+        && let Some(response) =
+            crate::hoops::auth::check_tree_auth_async(req, &config, &url_path_raw).await
     {
         *res = response;
         return;
