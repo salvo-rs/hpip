@@ -1,4 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(not(unix), test))]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -185,7 +187,12 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
 /// An upload is never visible at its destination until the complete file is ready.
 /// The guard also removes unfinished files when the request future is cancelled.
 struct PendingUpload {
+    #[cfg(not(unix))]
     path: PathBuf,
+    #[cfg(unix)]
+    parent: std::fs::File,
+    #[cfg(unix)]
+    name: std::ffi::CString,
 }
 
 impl PendingUpload {
@@ -194,33 +201,123 @@ impl PendingUpload {
         let parent = destination.parent().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "upload has no parent")
         })?;
+        #[cfg(unix)]
+        let parent = {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Searching a writable directory need not grant permission to list it.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let access = libc::O_PATH;
+            #[cfg(target_vendor = "apple")]
+            let access = libc::O_SEARCH;
+            #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+            let access = libc::O_RDONLY;
+            std::fs::File::options()
+                .read(true)
+                .custom_flags(access | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(parent)?
+        };
         loop {
             let id = NEXT_UPLOAD.fetch_add(1, Ordering::Relaxed);
-            let path = parent.join(format!(".hpip-upload-{}-{id}", std::process::id()));
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
+            let name = format!(".hpip-upload-{}-{id}", std::process::id());
             #[cfg(unix)]
             {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
+                use std::os::fd::{AsRawFd, FromRawFd};
+                let name = std::ffi::CString::new(name).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "upload name contains NUL",
+                    )
+                })?;
+                // The directory descriptor and NUL-terminated name live through the call.
+                let fd = unsafe {
+                    libc::openat(
+                        parent.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_WRONLY
+                            | libc::O_CREAT
+                            | libc::O_EXCL
+                            | libc::O_CLOEXEC
+                            | libc::O_NOFOLLOW,
+                        0o600 as libc::mode_t,
+                    )
+                };
+                if fd >= 0 {
+                    // A successful openat transfers this new descriptor to File exactly once.
+                    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+                    return Ok((Self { parent, name }, tokio::fs::File::from_std(file)));
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
             }
-            match options.open(&path) {
-                Ok(file) => return Ok((Self { path }, tokio::fs::File::from_std(file))),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
+            #[cfg(not(unix))]
+            {
+                let path = parent.join(name);
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                match options.open(&path) {
+                    Ok(file) => return Ok((Self { path }, tokio::fs::File::from_std(file))),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
             }
         }
     }
 
     async fn commit(self, destination: &Path) -> std::io::Result<()> {
-        // Both paths are on the same filesystem. Rename replaces atomically;
-        // never fall back to copying over the live destination.
-        tokio::fs::rename(&self.path, destination).await
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            let destination =
+                std::ffi::CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "upload destination contains NUL",
+                    )
+                })?;
+            tokio::task::spawn_blocking(move || {
+                // Anchor the source entry even if MOVE renamed its parent while the
+                // body was arriving. The destination still names the requested URL.
+                // Both C strings and the owned source directory descriptor remain live.
+                let result = unsafe {
+                    libc::renameat(
+                        self.parent.as_raw_fd(),
+                        self.name.as_ptr(),
+                        libc::AT_FDCWD,
+                        destination.as_ptr(),
+                    )
+                };
+                if result == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        }
+        #[cfg(not(unix))]
+        {
+            // Both paths are on the same filesystem. Rename replaces atomically;
+            // never fall back to copying over the live destination.
+            tokio::fs::rename(&self.path, destination).await
+        }
     }
 }
 
 impl Drop for PendingUpload {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // The descriptor outlives cleanup, including after its directory moves.
+            unsafe {
+                libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0);
+            }
+        }
+        #[cfg(not(unix))]
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -303,6 +400,53 @@ mod upload_tests {
         drop(file);
         drop(pending);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_upload_is_removed_after_its_parent_moves() {
+        let dir = fixture();
+        let parent = dir.join("parent");
+        let moved = dir.join("moved");
+        std::fs::create_dir(&parent).unwrap();
+        let (pending, mut file) = PendingUpload::create(&parent.join("file")).unwrap();
+        file.write_all(b"unfinished").await.unwrap();
+        std::fs::rename(&parent, &moved).unwrap();
+        drop(file);
+        drop(pending);
+        assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_publication_is_removed_after_its_parent_moves() {
+        let dir = fixture();
+        let parent = dir.join("parent");
+        let moved = dir.join("moved");
+        std::fs::create_dir(&parent).unwrap();
+        let destination = parent.join("file");
+        let (pending, mut file) = PendingUpload::create(&destination).unwrap();
+        file.write_all(b"complete but unpublished").await.unwrap();
+        drop(file);
+        std::fs::rename(&parent, &moved).unwrap();
+        assert!(pending.commit(&destination).await.is_err());
+        assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[tokio::test]
+    async fn uploads_do_not_require_directory_listing_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fixture();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let created = PendingUpload::create(&dir.join("file"));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (pending, file) = created.unwrap();
+        drop(file);
+        drop(pending);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
