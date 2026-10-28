@@ -831,14 +831,30 @@ pub async fn handle_proppatch(req: &mut Request, depot: &mut Depot, res: &mut Re
         &format!("{} requested PROPPATCH on {}", remote, req_p.display()),
     );
 
-    set_times(
+    if let Err(error) = set_times(
         &req_p,
         actionables.Win32LastModifiedTime,
         actionables.Win32LastAccessTime,
         actionables.Win32CreationTime,
-    );
-    if let Some(ex) = actionables.executable {
-        set_executable(&req_p, ex);
+    ) {
+        set_error(
+            res,
+            StatusCode::CONFLICT,
+            "409 Conflict",
+            &error.to_string(),
+        );
+        return;
+    }
+    if let Some(ex) = actionables.executable
+        && let Err(error) = set_executable(&req_p, ex)
+    {
+        set_error(
+            res,
+            StatusCode::CONFLICT,
+            "409 Conflict",
+            &error.to_string(),
+        );
+        return;
     }
 
     let url = req.uri().to_string();

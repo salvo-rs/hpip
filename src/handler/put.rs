@@ -217,19 +217,16 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
     }
 
     // Write file
-    let result =
-        write_request_file(&req_p, req.take_body(), &conditions, config.upload_limit).await;
+    let result = write_request_file(
+        &req_p,
+        req.take_body(),
+        &conditions,
+        config.upload_limit,
+        mtime,
+    )
+    .await;
     match result {
         Ok((existent, uploaded_bytes)) => {
-            if let Some(ms) = mtime {
-                let path = req_p.clone();
-                tokio::task::spawn_blocking(move || {
-                    set_mtime(&path, ms);
-                })
-                .await
-                .ok();
-            }
-
             crate::config::log_msg(
                 config.log,
                 &format!(
@@ -328,6 +325,7 @@ async fn write_request_file(
     mut body: salvo::http::ReqBody,
     conditions: &WriteConditions,
     limit: u64,
+    mtime: Option<u64>,
 ) -> Result<(bool, u64), UploadError> {
     let (pending, mut file) = PendingUpload::create(destination)?;
     let mut length = 0_u64;
@@ -361,6 +359,12 @@ async fn write_request_file(
         }
     }
     file.flush().await?;
+    if let Some(ms) = mtime {
+        let handle = file.try_clone().await?.into_std().await;
+        tokio::task::spawn_blocking(move || set_mtime_f(&handle, ms))
+            .await
+            .map_err(std::io::Error::other)??;
+    }
     file.sync_all().await?;
     let _commit_lock = UPLOAD_COMMIT_LOCK.lock().await;
     let metadata = match tokio::fs::metadata(destination).await {
@@ -400,6 +404,7 @@ async fn write_file_conditional(
         salvo::http::ReqBody::Once(salvo::hyper::body::Bytes::copy_from_slice(data)),
         conditions,
         u64::MAX,
+        None,
     )
     .await
     .map(|(existed, _)| existed)
@@ -556,6 +561,29 @@ mod conditional_upload_tests {
 mod streaming_upload_tests {
     use std::task::{Context, Poll};
 
+    #[tokio::test]
+    async fn requested_timestamp_is_applied_before_upload_publication() {
+        let directory = TestDir::new();
+        let service = Service::new(crate::build_router(config(directory.path(), &["-w"])));
+        let response = TestClient::put("http://localhost/timed.txt")
+            .add_header("x-last-modified", "1600000000123", true)
+            .body("timestamp fixture")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::CREATED));
+        let modified = std::fs::metadata(directory.path().join("timed.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+            1_600_000_000_123
+        );
+    }
+
     use salvo::hyper::body::{Bytes, Frame};
     use salvo::test::TestClient;
 
@@ -588,6 +616,7 @@ mod streaming_upload_tests {
             salvo::http::ReqBody::Once(Bytes::from_static(b"too large")),
             &WriteConditions::default(),
             4,
+            None,
         )
         .await;
         assert!(matches!(result, Err(UploadError::TooLarge)));
@@ -636,7 +665,7 @@ mod streaming_upload_tests {
             fuse_config: None,
         };
         assert!(matches!(
-            write_request_file(&destination, body, &WriteConditions::default(), 1024).await,
+            write_request_file(&destination, body, &WriteConditions::default(), 1024, None).await,
             Err(UploadError::BodyRead(_))
         ));
         assert_eq!(std::fs::read(destination).unwrap(), b"original");
