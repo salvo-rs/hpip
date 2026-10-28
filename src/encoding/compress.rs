@@ -155,13 +155,19 @@ fn encode_str_gzip(dt: &str) -> Option<Vec<u8>> {
 }
 
 fn encode_file_gzip(inf: File, outf: File) -> bool {
-    let mut cmp = GzEncoder::new(
-        BufWriter::with_capacity(1024 * 1024, outf),
-        Compression::default(),
-    );
-    io::copy(&mut BufReader::with_capacity(1024 * 1024, inf), &mut cmp)
-        .and_then(|_| cmp.finish())
-        .is_ok()
+    write_gzip(inf, outf).is_ok()
+}
+
+fn write_gzip(input: impl io::Read, output: impl Write) -> io::Result<()> {
+    let mut output = BufWriter::with_capacity(1024 * 1024, output);
+    let mut encoder = GzEncoder::new(&mut output, Compression::default());
+    io::copy(
+        &mut BufReader::with_capacity(1024 * 1024, input),
+        &mut encoder,
+    )?;
+    encoder.finish()?;
+    // Finishing the encoder does not flush the outer writer. Drop ignores errors.
+    output.flush()
 }
 
 // Deflate
@@ -173,13 +179,18 @@ fn encode_str_deflate(dt: &str) -> Option<Vec<u8>> {
 }
 
 fn encode_file_deflate(inf: File, outf: File) -> bool {
-    let mut cmp = ZlibEncoder::new(
-        BufWriter::with_capacity(1024 * 1024, outf),
-        Compression::default(),
-    );
-    io::copy(&mut BufReader::with_capacity(1024 * 1024, inf), &mut cmp)
-        .and_then(|_| cmp.finish())
-        .is_ok()
+    write_deflate(inf, outf).is_ok()
+}
+
+fn write_deflate(input: impl io::Read, output: impl Write) -> io::Result<()> {
+    let mut output = BufWriter::with_capacity(1024 * 1024, output);
+    let mut encoder = ZlibEncoder::new(&mut output, Compression::default());
+    io::copy(
+        &mut BufReader::with_capacity(1024 * 1024, input),
+        &mut encoder,
+    )?;
+    encoder.finish()?;
+    output.flush()
 }
 
 // Brotli
@@ -198,12 +209,17 @@ fn encode_str_brotli(dt: &str) -> Option<Vec<u8>> {
 }
 
 fn encode_file_brotli(inf: File, outf: File) -> bool {
+    write_brotli(inf, outf).is_ok()
+}
+
+fn write_brotli(input: impl io::Read, output: impl Write) -> io::Result<()> {
+    let mut output = BufWriter::with_capacity(1024 * 1024, output);
     brotli_compress(
-        &mut BufReader::with_capacity(1024 * 1024, inf),
-        &mut BufWriter::with_capacity(1024 * 1024, outf),
+        &mut BufReader::with_capacity(1024 * 1024, input),
+        &mut output,
         &brotli_params(),
-    )
-    .is_ok()
+    )?;
+    output.flush()
 }
 
 #[cfg(test)]
@@ -211,6 +227,56 @@ mod tests {
     use std::io::Read;
 
     use super::*;
+
+    struct FailedDisk;
+
+    impl Write for FailedDisk {
+        fn write(&mut self, _data: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("simulated full disk"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn file_encoders_propagate_the_final_buffered_write_failure() {
+        let input = b"small compressible content that fits the output buffer";
+        for result in [
+            write_gzip(&input[..], FailedDisk),
+            write_deflate(&input[..], FailedDisk),
+            write_brotli(&input[..], FailedDisk),
+        ] {
+            assert_eq!(result.unwrap_err().to_string(), "simulated full disk");
+        }
+    }
+
+    #[test]
+    fn buffered_file_encodings_are_complete_and_decodable() {
+        let input = b"complete encoded fixture";
+        let mut encoded = Vec::new();
+        write_gzip(&input[..], &mut encoded).unwrap();
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(&encoded[..])
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, input);
+        encoded.clear();
+        decoded.clear();
+        write_deflate(&input[..], &mut encoded).unwrap();
+        flate2::read::ZlibDecoder::new(&encoded[..])
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, input);
+        encoded.clear();
+        decoded.clear();
+        write_brotli(&input[..], &mut encoded).unwrap();
+        brotli::Decompressor::new(&encoded[..], 4096)
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, input);
+    }
 
     #[test]
     fn respects_quality_before_server_preference() {
