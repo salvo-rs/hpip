@@ -35,7 +35,12 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
 
     // These GET representations inspect the original resource; extension and
     // default-index selection applies only to ordinary file responses.
-    if crate::handler::rfsapi::wants_rfsapi(req) {
+    let representation = super::representation::select(req, &config, &path);
+    if representation == super::representation::Representation::NotAcceptable {
+        res.status_code(StatusCode::NOT_ACCEPTABLE);
+        return;
+    }
+    if representation == super::representation::Representation::Json {
         res.status_code(
             if !path.exists() || config.is_symlink_denied(symlink, &path) {
                 StatusCode::NOT_FOUND
@@ -47,9 +52,7 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
             .insert("content-type", "application/json".parse().unwrap());
         return;
     }
-    if config.archives
-        && let Some(kind) = crate::handler::archive::try_get_accept_archive(req)
-    {
+    if let super::representation::Representation::Archive(kind) = representation {
         if let Some(response) =
             crate::hoops::auth::check_tree_auth_async(req, &config, req.uri().path()).await
         {

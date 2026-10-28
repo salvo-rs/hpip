@@ -29,19 +29,6 @@ pub enum ArchiveType {
 }
 
 impl ArchiveType {
-    pub fn from_mime(mime: &str) -> Option<ArchiveType> {
-        let lower = mime.to_ascii_lowercase();
-        if !lower.starts_with("application/") {
-            return None;
-        }
-        let sub = &lower["application/".len()..];
-        match sub {
-            "x-tar" | "tar" => Some(ArchiveType::Tar),
-            "zip" | "x-zip-compressed" => Some(ArchiveType::Zip),
-            _ => None,
-        }
-    }
-
     pub fn default_mime(self) -> &'static str {
         match self {
             ArchiveType::Tar => "application/x-tar",
@@ -141,19 +128,6 @@ pub async fn handle_post_archive(req: &mut Request, depot: &mut Depot, res: &mut
     };
 
     serve_archive(req, res, &config, at).await;
-}
-
-/// Handle GET requests with Accept header for archives
-pub fn try_get_accept_archive(req: &Request) -> Option<ArchiveType> {
-    req.headers()
-        .get(salvo::http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|accept| {
-            accept
-                .split(',')
-                .map(|s| s.trim().split(';').next().unwrap_or("").trim())
-                .find_map(ArchiveType::from_mime)
-        })
 }
 
 /// Serve an archive from a GET request with Accept header

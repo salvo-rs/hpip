@@ -20,20 +20,6 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
         return;
     }
 
-    // Check for RFSAPI (Accept: application/json)
-    if crate::handler::rfsapi::wants_rfsapi(req) {
-        crate::handler::rfsapi::handle_rfsapi_inner(req, res, &config).await;
-        return;
-    }
-
-    // Check for archive request via Accept header
-    if config.archives
-        && let Some(archive_type) = crate::handler::archive::try_get_accept_archive(req)
-    {
-        crate::handler::archive::serve_archive_from_get(req, res, &config, archive_type).await;
-        return;
-    }
-
     let url_path_raw = req.uri().path().to_string();
     let decoded_path = percent_encoding::percent_decode_str(&url_path_raw)
         .decode_utf8()
@@ -54,6 +40,22 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
     if url_err {
         handle_invalid_url(req, res, &config);
         return;
+    }
+
+    match super::representation::select(req, &config, &req_p) {
+        super::representation::Representation::Json => {
+            super::rfsapi::handle_rfsapi_inner(req, res, &config).await;
+            return;
+        }
+        super::representation::Representation::Archive(kind) => {
+            super::archive::serve_archive_from_get(req, res, &config, kind).await;
+            return;
+        }
+        super::representation::Representation::NotAcceptable => {
+            res.status_code(StatusCode::NOT_ACCEPTABLE);
+            return;
+        }
+        super::representation::Representation::File => {}
     }
 
     // Strip extensions: if file doesn't exist and has no extension, try with index extensions
