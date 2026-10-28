@@ -1005,18 +1005,36 @@ pub async fn handle_proppatch(req: &mut Request, depot: &mut Depot, res: &mut Re
         &format!("{} requested PROPPATCH on {}", remote, req_p.display()),
     );
 
-    let (actionables, mut statuses) = prepare_proppatch(&props);
-    if statuses.iter().all(|status| *status == StatusCode::OK) {
-        let path = req_p.clone();
-        let Some(job) = config.spawn_blocking(move || {
-            let _guard = crate::util::write_conditions::MUTATION_LOCK.blocking_lock();
-            apply_proppatch(&path, &actionables)
-        }) else {
-            res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+    let conditions = match WriteConditions::from_request(req) {
+        Ok(conditions) => conditions,
+        Err(status) => {
+            res.status_code(status);
             return;
-        };
-        let result = job.await.unwrap_or_else(|error| Err(IoError::other(error)));
-        if let Err(error) = result {
+        }
+    };
+    let (actionables, mut statuses) = prepare_proppatch(&props);
+    let apply = statuses.iter().all(|status| *status == StatusCode::OK);
+    let path = req_p.clone();
+    let Some(job) = config.spawn_blocking(move || {
+        let _guard = MUTATION_LOCK.blocking_lock();
+        if !conditions.allows_path(&path)? {
+            return Ok(false);
+        }
+        if apply {
+            apply_proppatch(&path, &actionables)?;
+        }
+        Ok(true)
+    }) else {
+        res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+        return;
+    };
+    match job.await.unwrap_or_else(|error| Err(IoError::other(error))) {
+        Ok(false) => {
+            res.status_code(StatusCode::PRECONDITION_FAILED);
+            return;
+        }
+        Ok(true) => {}
+        Err(error) => {
             log_msg(config.log, &format!("PROPPATCH failed: {error}"));
             statuses.fill(if error.kind() == IoErrorKind::PermissionDenied {
                 StatusCode::FORBIDDEN
@@ -1247,9 +1265,30 @@ pub async fn handle_mkcol(req: &mut Request, depot: &mut Depot, res: &mut Respon
         return;
     }
 
-    match fs::create_dir(&req_p) {
-        Ok(()) => {
+    let conditions = match WriteConditions::from_request(req) {
+        Ok(conditions) => conditions,
+        Err(status) => {
+            res.status_code(status);
+            return;
+        }
+    };
+    let Some(job) = config.spawn_blocking(move || {
+        let _guard = MUTATION_LOCK.blocking_lock();
+        if !conditions.allows_path(&req_p)? {
+            return Ok(false);
+        }
+        fs::create_dir(&req_p)?;
+        Ok(true)
+    }) else {
+        res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+        return;
+    };
+    match job.await.unwrap_or_else(|error| Err(IoError::other(error))) {
+        Ok(true) => {
             res.status_code(StatusCode::CREATED);
+        }
+        Ok(false) => {
+            res.status_code(StatusCode::PRECONDITION_FAILED);
         }
         Err(e) => match e.kind() {
             IoErrorKind::NotFound => {
@@ -1605,6 +1644,115 @@ fn set_error(res: &mut Response, status: StatusCode, title: &str, msg: &str) {
     res.headers_mut()
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
     res.render(Text::Html(body));
+}
+
+#[cfg(test)]
+mod remaining_mutation_condition_tests {
+    use salvo::test::RequestBuilder;
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    const UPDATE: &str = r#"<D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:"><D:set><D:prop><Z:Win32LastModifiedTime>2020-09-13T12:26:40Z</Z:Win32LastModifiedTime></D:prop></D:set></D:propertyupdate>"#;
+
+    #[tokio::test]
+    async fn mkcol_checks_version_conditions_before_creating_a_collection() {
+        let fixture = TestDir::new();
+        let service = Service::new(crate::build_router(config(fixture.path(), &["-w", "-d"])));
+        let response = RequestBuilder::new("http://localhost/collection", "MKCOL".parse().unwrap())
+            .add_header("If-Match", "*", true)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::PRECONDITION_FAILED));
+        assert!(!fixture.path().join("collection").exists());
+        for expected in [StatusCode::CREATED, StatusCode::PRECONDITION_FAILED] {
+            let response =
+                RequestBuilder::new("http://localhost/collection", "MKCOL".parse().unwrap())
+                    .add_header("If-None-Match", "*", true)
+                    .send(&service)
+                    .await;
+            assert_eq!(response.status_code, Some(expected));
+        }
+        assert!(fixture.path().join("collection").is_dir());
+    }
+
+    #[tokio::test]
+    async fn stale_property_conditions_leave_data_and_timestamps_unchanged() {
+        let fixture = TestDir::new();
+        let path = fixture.path().join("file");
+        fs::write(&path, b"original data").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let before = metadata.modified().unwrap();
+        let tag = format!("\"{}\"", file_etag(&metadata));
+        let service = Service::new(crate::build_router(config(fixture.path(), &["-w", "-d"])));
+        for (header, value) in [
+            ("If-Match", "\"stale\"".to_owned()),
+            ("If-Match", format!("W/{tag}")),
+            ("If-None-Match", "*".to_owned()),
+            (
+                "If-Unmodified-Since",
+                "Thu, 01 Jan 1970 00:00:00 GMT".to_owned(),
+            ),
+        ] {
+            let response =
+                RequestBuilder::new("http://localhost/file", "PROPPATCH".parse().unwrap())
+                    .add_header(header, value, true)
+                    .body(UPDATE)
+                    .send(&service)
+                    .await;
+            assert_eq!(response.status_code, Some(StatusCode::PRECONDITION_FAILED));
+            assert_eq!(fs::read(&path).unwrap(), b"original data");
+            assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+        }
+        let response = RequestBuilder::new("http://localhost/file", "PROPPATCH".parse().unwrap())
+            .add_header("If-Match", tag, true)
+            .add_header("If-Unmodified-Since", "Thu, 01 Jan 1970 00:00:00 GMT", true)
+            .body(UPDATE)
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::MULTI_STATUS));
+        assert_ne!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+        assert_eq!(fs::read(&path).unwrap(), b"original data");
+    }
+
+    #[tokio::test]
+    async fn mkcol_requires_bounded_worker_capacity_and_the_mutation_lock() {
+        let fixture = TestDir::new();
+        let config = config(fixture.path(), &["-w", "-d"]);
+        let service = Service::new(crate::build_router(config.clone()));
+        let permits = config
+            .blocking_jobs
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let response = RequestBuilder::new("http://localhost/collection", "MKCOL".parse().unwrap())
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!fixture.path().join("collection").exists());
+        drop(permits);
+        let guard = MUTATION_LOCK.lock().await;
+        let request = tokio::spawn(async move {
+            RequestBuilder::new("http://localhost/collection", "MKCOL".parse().unwrap())
+                .send(&service)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while config.blocking_jobs.available_permits() == 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!request.is_finished());
+        assert!(!fixture.path().join("collection").exists());
+        drop(guard);
+        assert_eq!(
+            request.await.unwrap().status_code,
+            Some(StatusCode::CREATED)
+        );
+    }
 }
 
 #[cfg(test)]
