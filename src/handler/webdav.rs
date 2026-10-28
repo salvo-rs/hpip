@@ -28,6 +28,11 @@ fn default_xml_emitter_config() -> XmlEmitterConfig {
 }
 
 const CONTROL_BODY_LIMIT: usize = 64 * 1024;
+const HREF_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 async fn control_body(req: &mut Request, res: &mut Response) -> Option<Vec<u8>> {
     control_body_with_timeout(req, res, std::time::Duration::from_secs(30)).await
@@ -168,7 +173,7 @@ pub async fn handle_propfind(req: &mut Request, depot: &mut Depot, res: &mut Res
         ),
     );
 
-    let url = req.uri().to_string();
+    let url = req.uri().path().to_string();
     let ua = req
         .headers()
         .get(salvo::http::header::USER_AGENT)
@@ -282,7 +287,7 @@ fn write_propfind_response<W: Write>(
     out.write(XmlWEvent::start_element("D:response"))?;
 
     out.write(XmlWEvent::start_element("D:href"))?;
-    out.write(XmlWEvent::characters(&escape_specials(url)))?;
+    out.write(XmlWEvent::characters(url))?;
     out.write(XmlWEvent::end_element())?;
 
     let prop_count: usize = props.iter().map(|pp| pp.len()).sum();
@@ -348,7 +353,7 @@ fn write_propfind_response_custom<W: Write>(
     out.write(XmlWEvent::start_element("D:response"))?;
 
     out.write(XmlWEvent::start_element("D:href"))?;
-    out.write(XmlWEvent::characters(&escape_specials(url)))?;
+    out.write(XmlWEvent::characters(url))?;
     out.write(XmlWEvent::end_element())?;
 
     let mut failed_props = Vec::with_capacity(props.len());
@@ -429,7 +434,13 @@ fn write_propfind_recursive<W: Write>(
                 continue;
             }
             root_url.truncate(root_url_orig_len);
-            root_url.push_str(&f.file_name().to_string_lossy());
+            root_url.push_str(
+                &percent_encoding::utf8_percent_encode(
+                    &f.file_name().to_string_lossy(),
+                    HREF_SEGMENT,
+                )
+                .to_string(),
+            );
 
             let mut path = f.path();
             let mut symlink = false;
@@ -494,7 +505,13 @@ fn write_propfind_recursive_custom<W: Write>(
                 continue;
             }
             root_url.truncate(root_url_orig_len);
-            root_url.push_str(&f.file_name().to_string_lossy());
+            root_url.push_str(
+                &percent_encoding::utf8_percent_encode(
+                    &f.file_name().to_string_lossy(),
+                    HREF_SEGMENT,
+                )
+                .to_string(),
+            );
 
             let mut path = f.path();
             let mut symlink = false;
@@ -1580,6 +1597,76 @@ fn set_error(res: &mut Response, status: StatusCode, title: &str, msg: &str) {
     res.headers_mut()
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
     res.render(Text::Html(body));
+}
+
+#[cfg(test)]
+mod href_tests {
+    use salvo::test::{RequestBuilder, ResponseExt, TestClient};
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    #[tokio::test]
+    async fn collection_hrefs_round_trip_encoded_names_without_queries() {
+        let directory = TestDir::new();
+        let parent = directory.path().join("space % directory");
+        fs::create_dir(&parent).unwrap();
+        let names = [
+            "child space.txt",
+            "literal%20.txt",
+            "hash#.txt",
+            "amp&.txt",
+            "中文.txt",
+        ];
+        for name in names {
+            fs::write(parent.join(name), name).unwrap();
+        }
+        let service = Service::new(crate::build_router(config(directory.path(), &["-d"])));
+        for body in [
+            "",
+            r#"<D:propfind xmlns:D="DAV:"><D:prop><D:getcontentlength/></D:prop></D:propfind>"#,
+        ] {
+            let mut response = RequestBuilder::new(
+                "http://localhost/space%20%25%20directory/?not-a-path=secret",
+                "PROPFIND".parse().unwrap(),
+            )
+            .add_header("Depth", "1", true)
+            .body(body)
+            .send(&service)
+            .await;
+            assert_eq!(response.status_code, Some(StatusCode::MULTI_STATUS));
+            let xml = response.take_string().await.unwrap();
+            let mut in_href = false;
+            let mut hrefs = Vec::new();
+            for event in XmlReader::from_str(&xml) {
+                match event.unwrap() {
+                    XmlREvent::StartElement { name, .. } if name.local_name == "href" => {
+                        in_href = true
+                    }
+                    XmlREvent::EndElement { name } if name.local_name == "href" => in_href = false,
+                    XmlREvent::Characters(value) if in_href => hrefs.push(value),
+                    _ => {}
+                }
+            }
+            assert_eq!(hrefs.len(), names.len() + 1);
+            for href in &hrefs {
+                assert!(href.starts_with("/space%20%25%20directory/"), "{href}");
+                assert!(!href.contains('?'), "query leaked into {href}");
+                assert!(
+                    !href.contains("%2520directory"),
+                    "double encoding in {href}"
+                );
+                let result = TestClient::get(format!("http://localhost{href}"))
+                    .send(&service)
+                    .await;
+                assert_eq!(result.status_code, Some(StatusCode::OK), "{href}");
+            }
+            for name in names {
+                let suffix = percent_encoding::utf8_percent_encode(name, HREF_SEGMENT).to_string();
+                assert!(hrefs.iter().any(|href| href.ends_with(&suffix)), "{name}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
