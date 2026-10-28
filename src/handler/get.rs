@@ -273,7 +273,7 @@ async fn serve_open_file(
     {
         let tag = format!("\"{etag}\"");
         if crate::http_cache::range_matches(req, &tag, modified) {
-            if crate::http_cache::not_modified(req, res, Some(&tag), modified) {
+            if crate::http_cache::preconditions(req, res, Some(&tag), modified) {
                 return;
             }
             handle_get_file_range(req, res, config, req_p, file, metadata, &range).await;
@@ -297,7 +297,7 @@ async fn serve_open_file(
             encoded_file_job(config, &file, req_p, &etag, encoding, &remote).await
     {
         let response_etag = format!("\"{}-{}\"", etag, encoding_name(encoding));
-        if !is_404 && crate::http_cache::not_modified(req, res, Some(&response_etag), modified) {
+        if !is_404 && crate::http_cache::preconditions(req, res, Some(&response_etag), modified) {
             return;
         }
         res.status_code(if is_404 {
@@ -337,7 +337,7 @@ async fn serve_open_file(
 
     // Serve file without encoding
     if !is_404
-        && crate::http_cache::not_modified(req, res, Some(&format!("\"{}\"", etag)), modified)
+        && crate::http_cache::preconditions(req, res, Some(&format!("\"{}\"", etag)), modified)
     {
         return;
     }
@@ -422,7 +422,7 @@ pub(super) fn cached_file_encoding(
     }
 }
 
-async fn encoded_file_job(
+pub(super) async fn encoded_file_job(
     config: &Arc<AppConfig>,
     source: &tokio::fs::File,
     path: &Path,
