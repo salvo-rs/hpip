@@ -110,6 +110,12 @@ Write operations also require `-w`. PROPFIND supports explicit `Depth: 0` and
 `Depth: 1`; infinite depth is rejected. Cross-filesystem MOVE fails safely rather
 than copying and deleting the source. Uploads use staged atomic replacement.
 
+COPY prepares the complete result privately before replacing a destination, so
+read or write failures preserve its previous contents. Nonempty destination
+collections remain unsupported. If a directory replacement and its restoration
+both fail, the original is retained under a private `.hpip-upload-copy-*`
+directory for local administrator recovery; enabled request logs record its path.
+
 ### Security
 
 | Option | Description |

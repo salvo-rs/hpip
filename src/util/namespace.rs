@@ -68,7 +68,10 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-struct CopyStaging(PathBuf);
+struct CopyStaging {
+    path: PathBuf,
+    retain_for_recovery: bool,
+}
 
 impl CopyStaging {
     fn create(destination: &Path) -> io::Result<Self> {
@@ -82,8 +85,21 @@ impl CopyStaging {
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            match fs::create_dir(&directory) {
-                Ok(()) => return Ok(Self(directory)),
+            let builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            let builder = {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = builder;
+                builder.mode(0o700);
+                builder
+            };
+            match builder.create(&directory) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path: directory,
+                        retain_for_recovery: false,
+                    });
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
             }
@@ -93,13 +109,36 @@ impl CopyStaging {
 
 impl Drop for CopyStaging {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        if !self.retain_for_recovery {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
 
 /// Copy privately and expose the complete file/collection only if the target
 /// name is still absent. Failed publication never changes the source.
 pub fn copy_no_replace(from: &Path, to: &Path, recursive: bool) -> io::Result<()> {
+    copy_with(from, to, recursive, false, |source, target| {
+        fs::copy(source, target).map(|_| ())
+    })
+}
+
+/// Prepare the entire copy before replacing an existing destination. Ordinary
+/// file replacement is atomic; directory/type replacements use a recoverable
+/// backup while the caller holds the server's mutation lock.
+pub fn copy_replace(from: &Path, to: &Path, recursive: bool) -> io::Result<()> {
+    copy_with(from, to, recursive, true, |source, target| {
+        fs::copy(source, target).map(|_| ())
+    })
+}
+
+fn copy_with(
+    from: &Path,
+    to: &Path,
+    recursive: bool,
+    overwrite: bool,
+    copy_file: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
     let metadata = fs::metadata(from)?;
     if !metadata.is_file() && !metadata.is_dir() {
         return Err(io::Error::new(
@@ -107,10 +146,27 @@ pub fn copy_no_replace(from: &Path, to: &Path, recursive: bool) -> io::Result<()
             "only files and directories can be copied",
         ));
     }
-    let staging = CopyStaging::create(to)?;
-    let entry = staging.0.join("entry");
+    if metadata.is_dir() && recursive {
+        let source = from.canonicalize()?;
+        let target = to
+            .parent()
+            .ok_or_else(|| io::Error::other("destination has no parent"))?
+            .canonicalize()?
+            .join(
+                to.file_name()
+                    .ok_or_else(|| io::Error::other("destination has no name"))?,
+            );
+        if target.starts_with(&source) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot copy a collection into itself",
+            ));
+        }
+    }
+    let mut staging = CopyStaging::create(to)?;
+    let entry = staging.path.join("entry");
     if metadata.is_file() {
-        fs::copy(from, &entry)?;
+        copy_file(from, &entry)?;
     } else if recursive {
         let errors = super::webdav::copy_dir(from, &entry)?;
         if !errors.is_empty() {
@@ -121,12 +177,142 @@ pub fn copy_no_replace(from: &Path, to: &Path, recursive: bool) -> io::Result<()
     } else {
         fs::create_dir(&entry)?;
     }
-    rename_no_replace(&entry, to)
+    if !overwrite {
+        return rename_no_replace(&entry, to);
+    }
+    match fs::symlink_metadata(to) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => rename_no_replace(&entry, to),
+        Err(error) => Err(error),
+        Ok(existing) if metadata.is_file() && existing.is_file() => fs::rename(&entry, to),
+        Ok(_) => publish_with_backup(&mut staging, &entry, to, rename_no_replace),
+    }
+}
+
+fn publish_with_backup(
+    staging: &mut CopyStaging,
+    entry: &Path,
+    destination: &Path,
+    rename: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let backup = staging.path.join("original");
+    rename(destination, &backup)?;
+    if let Err(publish_error) = rename(entry, destination) {
+        if let Err(restore_error) = rename(&backup, destination) {
+            // Never delete the only remaining copy of the original destination.
+            staging.retain_for_recovery = true;
+            return Err(io::Error::other(format!(
+                "copy publication failed ({publish_error}); restoration failed ({restore_error}); original retained at {}",
+                backup.display()
+            )));
+        }
+        return Err(publish_error);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacing_a_hardlink_never_truncates_the_source() {
+        let fixture = crate::test_support::TestDir::new();
+        let source = fixture.path().join("source");
+        let target = fixture.path().join("target");
+        fs::write(&source, b"important original data").unwrap();
+        fs::hard_link(&source, &target).unwrap();
+        copy_replace(&source, &target, false).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), b"important original data");
+        assert_eq!(fs::read(&target).unwrap(), b"important original data");
+    }
+
+    #[test]
+    fn partial_copy_failure_preserves_existing_destination_and_cleans_staging() {
+        let fixture = crate::test_support::TestDir::new();
+        let source = fixture.path().join("source");
+        let target = fixture.path().join("target");
+        fs::write(&source, b"new data").unwrap();
+        fs::write(&target, b"old destination").unwrap();
+        let result = copy_with(&source, &target, true, true, |_, staged| {
+            fs::write(staged, b"partial")?;
+            Err(io::Error::other("simulated read or write failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"old destination");
+        assert_eq!(fs::read(&source).unwrap(), b"new data");
+        assert_eq!(fs::read_dir(fixture.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn failed_directory_publication_restores_the_complete_original() {
+        let fixture = crate::test_support::TestDir::new();
+        let target = fixture.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("original-file"), b"old collection").unwrap();
+        let mut staging = CopyStaging::create(&target).unwrap();
+        let entry = staging.path.join("entry");
+        fs::create_dir(&entry).unwrap();
+        fs::write(entry.join("new-file"), b"new collection").unwrap();
+        let result = publish_with_backup(&mut staging, &entry, &target, |from, to| {
+            if from == entry {
+                Err(io::Error::other("publication failed"))
+            } else {
+                rename_no_replace(from, to)
+            }
+        });
+        assert!(result.is_err());
+        drop(staging);
+        assert_eq!(
+            fs::read(target.join("original-file")).unwrap(),
+            b"old collection"
+        );
+        assert!(!target.join("new-file").exists());
+        assert_eq!(fs::read_dir(fixture.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_restoration_retains_recoverable_original_instead_of_deleting_it() {
+        let fixture = crate::test_support::TestDir::new();
+        let target = fixture.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("original-file"), b"recover me").unwrap();
+        let mut staging = CopyStaging::create(&target).unwrap();
+        let retained = staging.path.clone();
+        let entry = retained.join("entry");
+        fs::write(&entry, b"new copy").unwrap();
+        let result = publish_with_backup(&mut staging, &entry, &target, |from, to| {
+            if from == entry {
+                fs::write(to, b"concurrent entry")?;
+                Err(io::Error::other("publication failed"))
+            } else {
+                rename_no_replace(from, to)
+            }
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("original retained at")
+        );
+        drop(staging);
+        assert_eq!(
+            fs::read(retained.join("original/original-file")).unwrap(),
+            b"recover me"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"concurrent entry");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_staging_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = crate::test_support::TestDir::new();
+        let staging = CopyStaging::create(&fixture.path().join("target")).unwrap();
+        assert_eq!(
+            fs::metadata(&staging.path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
 
     fn competing_publications(is_move: bool, directory: bool) {
         let fixture = crate::test_support::TestDir::new();
