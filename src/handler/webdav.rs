@@ -1007,12 +1007,9 @@ pub async fn handle_proppatch(req: &mut Request, depot: &mut Depot, res: &mut Re
 
     let (actionables, mut statuses) = prepare_proppatch(&props);
     if statuses.iter().all(|status| *status == StatusCode::OK) {
-        static PROPERTY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let path = req_p.clone();
         let Some(job) = config.spawn_blocking(move || {
-            let _guard = PROPERTY_LOCK
-                .lock()
-                .map_err(|_| IoError::other("property lock poisoned"))?;
+            let _guard = crate::util::write_conditions::MUTATION_LOCK.blocking_lock();
             apply_proppatch(&path, &actionables)
         }) else {
             res.status_code(StatusCode::SERVICE_UNAVAILABLE);
@@ -1892,6 +1889,37 @@ mod proppatch_tests {
         )
         .add_header("Content-Type", "application/xml", true)
         .body(body.to_owned())
+    }
+
+    #[tokio::test]
+    async fn property_changes_wait_for_the_conditional_mutation_boundary() {
+        let directory = TestDir::new();
+        let path = directory.path().join("file");
+        fs::write(&path, b"fixture").unwrap();
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        let config = config(directory.path(), &["-w", "-d"]);
+        let service = Service::new(crate::build_router(config.clone()));
+        let guard = crate::util::write_conditions::MUTATION_LOCK.lock().await;
+        let task = tokio::spawn(async move {
+            request(r#"<D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:"><D:set><D:prop><Z:Win32LastModifiedTime>2020-09-13T12:26:40Z</Z:Win32LastModifiedTime></D:prop></D:set></D:propertyupdate>"#)
+                .send(&service)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while config.blocking_jobs.available_permits() == 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!task.is_finished());
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+        drop(guard);
+        assert_eq!(
+            task.await.unwrap().status_code,
+            Some(StatusCode::MULTI_STATUS)
+        );
+        assert_ne!(fs::metadata(&path).unwrap().modified().unwrap(), before);
     }
 
     #[tokio::test]
