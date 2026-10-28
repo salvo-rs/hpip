@@ -10,6 +10,9 @@ use cidr::IpCidr;
 
 use crate::options::{LogLevel, Options, WebDavLevel};
 
+pub const MAX_CACHE_ENTRIES: usize = 4096;
+pub const NEGATIVE_CACHE_TTL_NS: u64 = 300 * 1_000_000_000;
+
 pub type CacheT<Cnt> = HashMap<(blake3::Hash, EncodingType), (Cnt, AtomicU64)>;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -195,6 +198,57 @@ impl AppConfig {
         }))
     }
 
+    pub fn remember_hash(&self, key: String, hash: blake3::Hash) {
+        let mut index = self.cache_fs_files.write().unwrap();
+        if index.len() >= MAX_CACHE_ENTRIES && !index.contains_key(&key) {
+            // Metadata tags are only an optimization; dropping them is always safe.
+            index.clear();
+        }
+        index.insert(key, hash);
+    }
+
+    pub fn cache_negative(&self, key: (blake3::Hash, EncodingType)) {
+        let mut cache = self.cache_fs.write().unwrap();
+        if cache.len() >= MAX_CACHE_ENTRIES {
+            let oldest_negative = cache
+                .iter()
+                .filter(|(_, ((_, present, _), _))| !present)
+                .min_by_key(|(_, (_, atime))| atime.load(AtomicOrdering::Relaxed))
+                .map(|(key, _)| *key);
+            if let Some(key) = oldest_negative {
+                cache.remove(&key);
+            } else {
+                return;
+            }
+        }
+        cache.insert(
+            key,
+            (
+                (PathBuf::new(), false, 0),
+                AtomicU64::new(crate::util::precise_time_ns()),
+            ),
+        );
+    }
+
+    fn expire_negative_at(&self, now: u64) {
+        let mut indices = self.cache_fs_files.write().unwrap();
+        let mut cache = self.cache_fs.write().unwrap();
+        let ttl = self
+            .encoded_prune
+            .map(|seconds| seconds.saturating_mul(1_000_000_000))
+            .unwrap_or(NEGATIVE_CACHE_TTL_NS)
+            .min(NEGATIVE_CACHE_TTL_NS);
+        let mut removed = std::collections::HashSet::new();
+        cache.retain(|(hash, _), ((_, present, _), atime)| {
+            let retain = *present || now.saturating_sub(atime.load(AtomicOrdering::Relaxed)) <= ttl;
+            if !retain {
+                removed.insert(*hash);
+            }
+            retain
+        });
+        indices.retain(|_, hash| !removed.contains(hash));
+    }
+
     /// Admit one completed cache file while holding the same lock as eviction.
     pub fn cache_file(&self, key: (blake3::Hash, EncodingType), path: PathBuf, size: u64) -> bool {
         if size > self.encoded_filesystem_limit {
@@ -202,13 +256,16 @@ impl AppConfig {
         }
         let mut indices = self.cache_fs_files.write().unwrap();
         let mut cache = self.cache_fs.write().unwrap();
-        if let Some(((old_path, ..), _)) = cache.remove(&key)
-            && old_path != path
+        if let Some(((old_path, true, _), _)) = cache.get(&key)
+            && *old_path != path
+            && let Err(error) = fs::remove_file(old_path)
+            && error.kind() != std::io::ErrorKind::NotFound
         {
-            let _ = fs::remove_file(old_path);
+            return false;
         }
+        cache.remove(&key);
         let mut used = cache.values().map(|((_, _, size), _)| size).sum::<u64>();
-        while used > self.encoded_filesystem_limit - size {
+        while used > self.encoded_filesystem_limit - size || cache.len() >= MAX_CACHE_ENTRIES {
             let Some(key) = cache
                 .iter()
                 .min_by_key(|(_, (_, time))| time.load(AtomicOrdering::Relaxed))
@@ -216,9 +273,15 @@ impl AppConfig {
             else {
                 return false;
             };
-            let ((old_path, present, old_size), _) = cache.remove(&key).unwrap();
-            if present {
-                let _ = fs::remove_file(old_path);
+            let entry = cache.remove(&key).unwrap();
+            let ((old_path, present, old_size), _) = &entry;
+            if *present
+                && let Err(error) = fs::remove_file(old_path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                cache.insert(key, entry);
+                self.cache_fs_size.store(used, AtomicOrdering::Relaxed);
+                return false;
             }
             used -= old_size;
             indices.retain(|_, hash| *hash != key.0);
@@ -246,7 +309,7 @@ impl AppConfig {
             .values()
             .map(|(data, _)| data.len() as u64)
             .sum::<u64>();
-        while used > self.encoded_generated_limit - size {
+        while used > self.encoded_generated_limit - size || cache.len() >= MAX_CACHE_ENTRIES {
             let Some(key) = cache
                 .iter()
                 .min_by_key(|(_, (_, time))| time.load(AtomicOrdering::Relaxed))
@@ -296,6 +359,7 @@ impl AppConfig {
     }
 
     pub fn prune(&self) {
+        self.expire_negative_at(crate::util::precise_time_ns());
         use std::collections::HashSet;
 
         use crate::util::precise_time_ns;
@@ -544,5 +608,51 @@ mod cache_budget_tests {
         assert!(!invoked.load(AtomicOrdering::SeqCst));
         drop(permits);
         assert_eq!(config.spawn_blocking(|| 7).unwrap().await.unwrap(), 7);
+    }
+
+    #[test]
+    fn negative_entries_and_hash_indices_have_a_count_limit_and_expire() {
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &[]);
+        for number in 0..MAX_CACHE_ENTRIES + 32 {
+            let hash = blake3::hash(&number.to_le_bytes());
+            config.remember_hash(number.to_string(), hash);
+            config.cache_negative((hash, EncodingType::Gzip));
+        }
+        assert!(config.cache_fs_files.read().unwrap().len() <= MAX_CACHE_ENTRIES);
+        assert_eq!(config.cache_fs.read().unwrap().len(), MAX_CACHE_ENTRIES);
+        let latest = config
+            .cache_fs
+            .read()
+            .unwrap()
+            .values()
+            .map(|(_, atime)| atime.load(AtomicOrdering::Relaxed))
+            .max()
+            .unwrap();
+        config.expire_negative_at(latest + NEGATIVE_CACHE_TTL_NS + 1);
+        assert!(config.cache_fs.read().unwrap().is_empty());
+        assert!(config.cache_fs_files.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_eviction_keeps_the_entry_and_its_accounting() {
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &["--encoded-filesystem", "150"]);
+        let unremovable = dir.path().join("directory-cannot-be-unlinked-as-file");
+        fs::create_dir(&unremovable).unwrap();
+        assert!(config.cache_file(
+            (blake3::hash(b"first"), EncodingType::Gzip),
+            unremovable,
+            100
+        ));
+        let candidate = dir.path().join("candidate");
+        fs::write(&candidate, [1; 100]).unwrap();
+        assert!(!config.cache_file(
+            (blake3::hash(b"second"), EncodingType::Gzip),
+            candidate,
+            100
+        ));
+        assert_eq!(config.cache_fs.read().unwrap().len(), 1);
+        assert_eq!(config.cache_fs_size.load(AtomicOrdering::Relaxed), 100);
     }
 }

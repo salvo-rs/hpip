@@ -403,7 +403,7 @@ fn try_encoded_file(
         Some(h) => h,
         None => {
             let h = file_hash(req_p).ok()?;
-            config.cache_fs_files.write().ok()?.insert(index_key, h);
+            config.remember_hash(index_key, h);
             h
         }
     };
@@ -421,8 +421,13 @@ fn try_encoded_file(
                 atime.store(precise_time_ns(), AtomicOrdering::Relaxed);
                 Some(path.clone())
             }
-            Some(((_, false, _), _)) => return None,
-            None => None,
+            Some(((_, false, _), atime))
+                if precise_time_ns().saturating_sub(atime.load(AtomicOrdering::Relaxed))
+                    <= crate::config::NEGATIVE_CACHE_TTL_NS =>
+            {
+                return None;
+            }
+            Some(((_, false, _), _)) | None => None,
         }
     };
     if let Some(path) = cached_path
@@ -462,11 +467,7 @@ fn try_encoded_file(
 
         if gain < MIN_ENCODING_GAIN || resp_len > config.encoded_filesystem_limit {
             // Not worth keeping
-            let mut cache = config.cache_fs.write().ok()?;
-            cache.insert(
-                cache_key,
-                ((PathBuf::new(), false, 0), AtomicU64::new(u64::MAX)),
-            );
+            config.cache_negative(cache_key);
             let _ = std::fs::remove_file(&resp_p);
             return None;
         }
