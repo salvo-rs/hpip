@@ -164,8 +164,8 @@ impl AppConfig {
             cache_fs_files: Default::default(),
             cache_gen_size: Default::default(),
             cache_fs_size: Default::default(),
-            encoded_filesystem_limit: opts.encoded_filesystem_limit.unwrap_or(u64::MAX),
-            encoded_generated_limit: opts.encoded_generated_limit.unwrap_or(u64::MAX),
+            encoded_filesystem_limit: opts.encoded_filesystem_limit.unwrap_or(256 * 1024 * 1024),
+            encoded_generated_limit: opts.encoded_generated_limit.unwrap_or(16 * 1024 * 1024),
             encoded_prune: opts.encoded_prune,
             prune_interval: (opts.encoded_prune.unwrap_or(0) / 6).max(10),
             last_prune: AtomicU64::new(0),
@@ -176,6 +176,78 @@ impl AppConfig {
             request_bandwidth: opts.request_bandwidth,
             allowed_methods,
         }
+    }
+
+    /// Admit one completed cache file while holding the same lock as eviction.
+    pub fn cache_file(&self, key: (blake3::Hash, EncodingType), path: PathBuf, size: u64) -> bool {
+        if size > self.encoded_filesystem_limit {
+            return false;
+        }
+        let mut indices = self.cache_fs_files.write().unwrap();
+        let mut cache = self.cache_fs.write().unwrap();
+        if let Some(((old_path, ..), _)) = cache.remove(&key)
+            && old_path != path
+        {
+            let _ = fs::remove_file(old_path);
+        }
+        let mut used = cache.values().map(|((_, _, size), _)| size).sum::<u64>();
+        while used > self.encoded_filesystem_limit - size {
+            let Some(key) = cache
+                .iter()
+                .min_by_key(|(_, (_, time))| time.load(AtomicOrdering::Relaxed))
+                .map(|(key, _)| *key)
+            else {
+                return false;
+            };
+            let ((old_path, present, old_size), _) = cache.remove(&key).unwrap();
+            if present {
+                let _ = fs::remove_file(old_path);
+            }
+            used -= old_size;
+            indices.retain(|_, hash| *hash != key.0);
+        }
+        cache.insert(
+            key,
+            (
+                (path, true, size),
+                AtomicU64::new(crate::util::precise_time_ns()),
+            ),
+        );
+        self.cache_fs_size
+            .store(used + size, AtomicOrdering::Relaxed);
+        true
+    }
+
+    pub fn cache_generated(&self, key: (blake3::Hash, EncodingType), data: &[u8]) {
+        let size = data.len() as u64;
+        if size > self.encoded_generated_limit {
+            return;
+        }
+        let mut cache = self.cache_gen.write().unwrap();
+        cache.remove(&key);
+        let mut used = cache
+            .values()
+            .map(|(data, _)| data.len() as u64)
+            .sum::<u64>();
+        while used > self.encoded_generated_limit - size {
+            let Some(key) = cache
+                .iter()
+                .min_by_key(|(_, (_, time))| time.load(AtomicOrdering::Relaxed))
+                .map(|(key, _)| *key)
+            else {
+                return;
+            };
+            used -= cache.remove(&key).unwrap().0.len() as u64;
+        }
+        cache.insert(
+            key,
+            (
+                data.to_vec(),
+                AtomicU64::new(crate::util::precise_time_ns()),
+            ),
+        );
+        self.cache_gen_size
+            .store(used + size, AtomicOrdering::Relaxed);
     }
 
     pub fn create_temp_dir(&self, td: &Option<(String, PathBuf)>) {
@@ -392,5 +464,46 @@ pub fn log_msg(log: (bool, bool, bool), msg: &str) {
             }
             println!("{}", msg);
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_budget_tests {
+    use super::*;
+
+    #[test]
+    fn file_admission_enforces_total_without_a_prune_timer() {
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &["--encoded-filesystem", "150"]);
+        for number in 0..4u8 {
+            let path = dir.path().join(format!("cache-{number}"));
+            fs::write(&path, [number; 65]).unwrap();
+            assert!(config.cache_file((blake3::hash(&[number]), EncodingType::Gzip), path, 65));
+            assert!(config.cache_fs_size.load(AtomicOrdering::Relaxed) <= 150);
+            let actual = config
+                .cache_fs
+                .read()
+                .unwrap()
+                .values()
+                .map(|((path, ..), _)| fs::metadata(path).unwrap().len())
+                .sum::<u64>();
+            assert_eq!(actual, config.cache_fs_size.load(AtomicOrdering::Relaxed));
+        }
+        assert_eq!(config.cache_fs.read().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn generated_admission_counts_replacements_once_and_evicts() {
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &["--encoded-generated", "150"]);
+        let key = (blake3::hash(b"same"), EncodingType::Gzip);
+        config.cache_generated(key, &[1; 60]);
+        config.cache_generated(key, &[2; 65]);
+        assert_eq!(config.cache_gen_size.load(AtomicOrdering::Relaxed), 65);
+        for number in 0..4u8 {
+            config.cache_generated((blake3::hash(&[number]), EncodingType::Gzip), &[number; 65]);
+            assert!(config.cache_gen_size.load(AtomicOrdering::Relaxed) <= 150);
+        }
+        assert_eq!(config.cache_gen.read().unwrap().len(), 2);
     }
 }

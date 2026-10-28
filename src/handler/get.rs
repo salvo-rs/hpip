@@ -441,14 +441,10 @@ fn try_encoded_file(
         );
 
         let data = std::fs::read(&resp_p).ok()?;
-        let mut cache = config.cache_fs.write().ok()?;
-        config
-            .cache_fs_size
-            .fetch_add(resp_len, AtomicOrdering::Relaxed);
-        cache.insert(
-            cache_key,
-            ((resp_p, true, resp_len), AtomicU64::new(precise_time_ns())),
-        );
+        if !config.cache_file(cache_key, resp_p.clone(), resp_len) {
+            let _ = std::fs::remove_file(&resp_p);
+            return None;
+        }
 
         return Some(data);
     }
@@ -953,17 +949,7 @@ fn try_encode_generated_response(
     // Encode
     let enc_resp = encode_str(body, encoding)?;
 
-    if enc_resp.len() as u64 <= config.encoded_generated_limit
-        && let Ok(mut cache) = config.cache_gen.write()
-    {
-        config
-            .cache_gen_size
-            .fetch_add(enc_resp.len() as u64, AtomicOrdering::Relaxed);
-        cache.insert(
-            cache_key,
-            (enc_resp.clone(), AtomicU64::new(precise_time_ns())),
-        );
-    }
+    config.cache_generated(cache_key, &enc_resp);
 
     Some((enc_resp, encoding))
 }
