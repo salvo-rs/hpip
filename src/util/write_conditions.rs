@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use salvo::prelude::*;
 
 use super::entity_tag::{EntityTagList, request_tag_field};
+use super::http_date::request_date;
 
 /// Coordinate conditional checks and namespace mutations made by this server.
 /// Filesystem changes by other processes remain outside this process lock.
@@ -20,24 +21,11 @@ pub(crate) struct WriteConditions {
 
 impl WriteConditions {
     pub(crate) fn from_request(req: &Request) -> Result<Self, StatusCode> {
-        let header = |name| {
-            req.headers()
-                .get(name)
-                .map(|value| {
-                    value
-                        .to_str()
-                        .map(str::to_owned)
-                        .map_err(|_| StatusCode::BAD_REQUEST)
-                })
-                .transpose()
-        };
         let conditions = Self {
             if_match: request_tag_field(req, "if-match")?,
             if_none_match: request_tag_field(req, "if-none-match")?,
             // Invalid dates are ignored, as required for this conditional header.
-            if_unmodified_since: header("if-unmodified-since")?
-                .and_then(|date| DateTime::parse_from_rfc2822(&date).ok())
-                .map(|date| date.with_timezone(&Utc)),
+            if_unmodified_since: request_date(req, "if-unmodified-since"),
         };
         for value in [&conditions.if_match, &conditions.if_none_match]
             .into_iter()
