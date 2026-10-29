@@ -50,7 +50,9 @@ pub struct AppConfig {
 
     pub blocking_jobs: std::sync::Arc<tokio::sync::Semaphore>,
     pub archive_jobs: std::sync::Arc<tokio::sync::Semaphore>,
+    pub read_snapshot_jobs: std::sync::Arc<tokio::sync::Semaphore>,
     accepting_blocking_jobs: AtomicBool,
+    stopped_read_snapshots: tokio::sync::Notify,
     pub encoding_gates: [Mutex<()>; 64],
     pub cache_gen: RwLock<CacheT<Vec<u8>>>,
     pub cache_fs_files: RwLock<HashMap<String, blake3::Hash>>,
@@ -161,7 +163,9 @@ impl AppConfig {
             ),
             blocking_jobs: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             archive_jobs: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+            read_snapshot_jobs: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             accepting_blocking_jobs: AtomicBool::new(true),
+            stopped_read_snapshots: tokio::sync::Notify::new(),
             encoding_gates: std::array::from_fn(|_| Mutex::new(())),
             cache_gen: Default::default(),
             cache_fs: Default::default(),
@@ -189,6 +193,47 @@ impl AppConfig {
         R: Send + 'static,
     {
         self.spawn_in_pool(&self.blocking_jobs, work)
+    }
+
+    /// Short namespace snapshots must stay available when encoders or archives are busy.
+    pub async fn spawn_read_snapshot<F, R>(&self, work: F) -> Option<tokio::task::JoinHandle<R>>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.spawn_read_snapshot_with_timeout(work, std::time::Duration::from_secs(30))
+            .await
+    }
+
+    async fn spawn_read_snapshot_with_timeout<F, R>(
+        &self,
+        work: F,
+        timeout: std::time::Duration,
+    ) -> Option<tokio::task::JoinHandle<R>>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        // Wait before spawning, so ordinary bursts queue asynchronously rather
+        // than creating unbounded blocking jobs or immediately failing with 503.
+        let stopped = self.stopped_read_snapshots.notified();
+        tokio::pin!(stopped);
+        stopped.as_mut().enable();
+        if !self.accepting_blocking_jobs.load(AtomicOrdering::SeqCst) {
+            return None;
+        }
+        let permit = tokio::select! {
+            biased;
+            _ = stopped => return None,
+            permit = tokio::time::timeout(timeout, self.read_snapshot_jobs.clone().acquire_owned()) => permit.ok()?.ok()?,
+        };
+        if !self.accepting_blocking_jobs.load(AtomicOrdering::SeqCst) {
+            return None;
+        }
+        Some(tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        }))
     }
 
     /// Long response streams must not consume the short metadata/mutation pool.
@@ -240,8 +285,10 @@ impl AppConfig {
     pub async fn drain_blocking_jobs(&self) {
         self.accepting_blocking_jobs
             .store(false, AtomicOrdering::SeqCst);
+        self.stopped_read_snapshots.notify_waiters();
         let _all_jobs = self.blocking_jobs.clone().acquire_many_owned(4).await;
         let _all_archives = self.archive_jobs.clone().acquire_many_owned(4).await;
+        let _all_snapshots = self.read_snapshot_jobs.clone().acquire_many_owned(4).await;
     }
 
     pub fn remember_hash(&self, key: String, hash: blake3::Hash) {
@@ -757,5 +804,98 @@ mod cache_budget_tests {
         job.await.unwrap();
         drain.await.unwrap();
         assert!(config.spawn_archive(|| ()).is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_read_snapshots_and_closes_their_admission() {
+        let directory = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(directory.path(), &[]);
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let job = config
+            .spawn_read_snapshot(move || {
+                started.send(()).unwrap();
+                wait_release.recv().unwrap();
+            })
+            .await
+            .unwrap();
+        ready.await.unwrap();
+        let drain_config = config.clone();
+        let drain = tokio::spawn(async move { drain_config.drain_blocking_jobs().await });
+        while config.accepting_blocking_jobs.load(AtomicOrdering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        assert!(config.spawn_read_snapshot(|| ()).await.is_none());
+        assert!(!drain.is_finished());
+        release.send(()).unwrap();
+        job.await.unwrap();
+        drain.await.unwrap();
+        assert!(config.spawn_read_snapshot(|| ()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_admission_waits_without_spawning_and_has_a_deadline() {
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &[]);
+        let permits = config
+            .read_snapshot_jobs
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let marker = ran.clone();
+        assert!(
+            config
+                .spawn_read_snapshot_with_timeout(
+                    move || marker.store(true, AtomicOrdering::SeqCst),
+                    std::time::Duration::from_millis(10)
+                )
+                .await
+                .is_none()
+        );
+        assert!(!ran.load(AtomicOrdering::SeqCst));
+        drop(permits);
+        assert_eq!(
+            config
+                .spawn_read_snapshot(|| 7)
+                .await
+                .unwrap()
+                .await
+                .unwrap(),
+            7
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_queued_snapshot_admission_without_waiting_for_a_permit() {
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &[]);
+        let permits = config
+            .read_snapshot_jobs
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let request_config = config.clone();
+        let mut request =
+            tokio::spawn(async move { request_config.spawn_read_snapshot(|| ()).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut request)
+                .await
+                .is_err()
+        );
+        let drain_config = config.clone();
+        let drain = tokio::spawn(async move { drain_config.drain_blocking_jobs().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), request)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        assert!(!drain.is_finished());
+        drop(permits);
+        drain.await.unwrap();
     }
 }
