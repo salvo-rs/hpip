@@ -1,4 +1,7 @@
 use std::borrow::Cow;
+use std::collections::VecDeque;
+use std::io;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use salvo::prelude::*;
@@ -74,8 +77,14 @@ pub fn check_tree_auth(req: &Request, config: &AppConfig, url_path: &str) -> Opt
     }
     let path = decoded_url_path(url_path)?;
     let mut roots = vec![path.clone()];
-    if let Some(actual_path) = canonical_auth_path(config, &path) {
-        roots.push(actual_path);
+    match canonical_auth_path(config, &path) {
+        Ok(Some(actual_path)) => roots.push(actual_path),
+        Ok(None) => {}
+        Err(_) => {
+            return Some(collection_error(
+                "Cannot resolve collection authorization.\n",
+            ));
+        }
     }
     // Include configured future descendants when authorizing a COPY target.
     for rule in config.path_auth_data.keys() {
@@ -141,9 +150,17 @@ pub fn check_decoded_auth(req: &Request, config: &AppConfig, path: &str) -> Opti
     if let Some(auth) = auth_for_path(config, path) {
         required.push(auth);
     }
-    // Resolve existing ancestors as well: a new file under a directory alias
-    // must not bypass the real directory's policy.
-    if let Some(actual_path) = canonical_auth_path(config, path)
+    // Only path rules can differ between a logical name and its real target.
+    // Global credentials do not depend on filesystem existence or resolution.
+    let actual_path = if config.path_auth_data.is_empty() {
+        None
+    } else {
+        match canonical_auth_path(config, path) {
+            Ok(actual_path) => actual_path,
+            Err(_) => return Some(collection_error("Cannot resolve resource authorization.\n")),
+        }
+    };
+    if let Some(actual_path) = actual_path
         && let Some(auth) = auth_for_path(config, &actual_path)
         && !required.contains(&auth)
     {
@@ -254,24 +271,77 @@ fn policy_key(path: &str) -> Cow<'_, str> {
     }
 }
 
-fn canonical_auth_path(config: &AppConfig, path: &str) -> Option<String> {
-    let mut current = config.hosted_directory.1.join(path);
+/// Resolve an already-decoded filesystem name, including dangling aliases.
+/// None means the resolved name is outside the hosted tree, where only the
+/// logical/global rules apply. Resolution failures must never drop a policy.
+fn canonical_auth_path(config: &AppConfig, path: &str) -> io::Result<Option<String>> {
+    let root = config.hosted_directory.1.canonicalize()?;
+    let mut current = root.clone();
+    let mut remaining: VecDeque<_> = Path::new(path)
+        .components()
+        .map(|component| component.as_os_str().to_owned())
+        .collect();
+    let mut links_left = crate::util::MAX_SYMLINKS;
+    while let Some(part) = remaining.pop_front() {
+        match Path::new(&part).components().next() {
+            Some(Component::Prefix(_)) => current = PathBuf::from(part),
+            Some(Component::RootDir) => current.push(std::path::MAIN_SEPARATOR_STR),
+            Some(Component::CurDir) | None => {}
+            Some(Component::ParentDir) => {
+                current.pop();
+            }
+            Some(Component::Normal(_)) => {
+                current.push(part);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        if links_left == 0 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "authorization symlink limit exceeded",
+                            ));
+                        }
+                        links_left -= 1;
+                        let target = std::fs::read_link(&current)?;
+                        current.pop();
+                        // These are filesystem components, never URL components:
+                        // literal percent signs must not be decoded again.
+                        for component in target.components().rev() {
+                            remaining.push_front(component.as_os_str().to_owned());
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    // Canonicalize the existing prefix for platform aliases (including Windows
+    // short names), then retain the normalized, nonexistent suffix.
     let mut suffix = Vec::new();
     let canonical = loop {
         match current.canonicalize() {
             Ok(canonical) => break canonical,
-            Err(_) => {
-                suffix.push(current.file_name()?.to_owned());
-                current = current.parent()?.to_path_buf();
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(name) = current.file_name() else {
+                    return Err(error);
+                };
+                suffix.push(name.to_owned());
+                if !current.pop() {
+                    return Err(error);
+                }
             }
+            Err(error) => return Err(error),
         }
     };
-    let root = config.hosted_directory.1.canonicalize().ok()?;
-    let mut relative = canonical.strip_prefix(root).ok()?.to_path_buf();
+    let Ok(relative) = canonical.strip_prefix(root) else {
+        return Ok(None);
+    };
+    let mut relative = relative.to_path_buf();
     for component in suffix.into_iter().rev() {
         relative.push(component);
     }
-    Some(relative.to_string_lossy().replace('\\', "/"))
+    Ok(Some(relative.to_string_lossy().replace('\\', "/")))
 }
 
 fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
@@ -300,6 +370,250 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
 #[cfg(test)]
 mod tests {
     use salvo::test::{ResponseExt, TestClient};
+
+    #[test]
+    fn global_credentials_do_not_depend_on_target_or_root_resolution() {
+        let fixture = TestDir::new();
+        let root = fixture.path().join("served");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("file"), b"fixture").unwrap();
+        let global = config(&root, &["--auth", "user:pass"]);
+        let per_path = config(&root, &["--path-auth", "private=user:pass"]);
+        // A namespace change makes the configured root unresolvable. This must
+        // not replace the global credential decision with a filesystem error.
+        std::fs::rename(&root, fixture.path().join("retired")).unwrap();
+        for path in ["/missing/nested", "/file/child"] {
+            let request = TestClient::get(format!("http://localhost{path}")).build();
+            assert_eq!(
+                super::check_auth(&request, &global).unwrap().status_code,
+                Some(StatusCode::UNAUTHORIZED)
+            );
+            let request = TestClient::get(format!("http://localhost{path}"))
+                .basic_auth("user", Some("wrong"))
+                .build();
+            assert_eq!(
+                super::check_auth(&request, &global).unwrap().status_code,
+                Some(StatusCode::UNAUTHORIZED)
+            );
+            let request = TestClient::get(format!("http://localhost{path}"))
+                .basic_auth("user", Some("pass"))
+                .build();
+            assert!(super::check_auth(&request, &global).is_none());
+            assert_eq!(
+                super::check_auth(&request, &per_path).unwrap().status_code,
+                Some(StatusCode::FORBIDDEN)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_credentials_remain_independent_of_alias_cycles() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDir::new();
+        symlink("cycle", directory.path().join("cycle")).unwrap();
+        let global = config(directory.path(), &["--auth", "user:pass"]);
+        let request = TestClient::get("http://localhost/cycle").build();
+        assert_eq!(
+            super::check_auth(&request, &global).unwrap().status_code,
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        let request = TestClient::get("http://localhost/cycle")
+            .basic_auth("user", Some("pass"))
+            .build();
+        assert!(super::check_auth(&request, &global).is_none());
+    }
+
+    #[test]
+    fn nonexistent_filesystem_suffixes_keep_literal_percent_names() {
+        let directory = TestDir::new();
+        std::fs::create_dir(directory.path().join("private")).unwrap();
+        let config = config(directory.path(), &["--path-auth", "private=user:pass"]);
+        assert_eq!(
+            super::canonical_auth_path(&config, "private/missing/a%20b")
+                .unwrap()
+                .as_deref(),
+            Some("private/missing/a%20b")
+        );
+        let request = TestClient::put("http://localhost/private/missing/a%2520b").build();
+        assert_eq!(
+            super::check_auth(&request, &config).unwrap().status_code,
+            Some(StatusCode::UNAUTHORIZED)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_leaf_and_ancestor_aliases_require_target_credentials_before_creation() {
+        use std::os::unix::fs::symlink;
+
+        for (method, url, target) in [
+            ("PUT", "/alias", "private/new-file"),
+            ("MKCOL", "/alias", "private/new-directory"),
+            ("PUT", "/alias/new/file", "private/missing-parent"),
+            ("MKCOL", "/alias/new", "private/missing-parent"),
+        ] {
+            let directory = TestDir::new();
+            std::fs::create_dir(directory.path().join("private")).unwrap();
+            symlink(target, directory.path().join("alias")).unwrap();
+            let config = config(
+                directory.path(),
+                &["-w", "-d", "--path-auth", "private=user:pass"],
+            );
+            let relative = crate::util::path::decoded_url_path(url).unwrap();
+            let expected = format!("{}{}", target, relative.strip_prefix("alias").unwrap());
+            assert_eq!(
+                super::canonical_auth_path(&config, &relative)
+                    .unwrap()
+                    .as_deref(),
+                Some(expected.as_str())
+            );
+            let segments: Vec<_> = url.split('/').filter(|part| !part.is_empty()).collect();
+            let (resolved, _, invalid) =
+                crate::util::path::resolve_path(&config.hosted_directory.1, &segments, true);
+            assert!(!invalid);
+            assert_eq!(resolved, config.hosted_directory.1.join(&expected));
+            let service = Service::new(crate::build_router(config));
+            let response = salvo::test::RequestBuilder::new(
+                format!("http://localhost{url}"),
+                method.parse().unwrap(),
+            )
+            .send(&service)
+            .await;
+            assert_eq!(
+                response.status_code,
+                Some(StatusCode::UNAUTHORIZED),
+                "{method} {url}"
+            );
+            assert!(!directory.path().join(target).exists());
+            assert_eq!(
+                std::fs::read_dir(directory.path().join("private"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_alias_creation_preserves_both_rules_and_does_not_decode_link_targets() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDir::new();
+        std::fs::create_dir(directory.path().join("private")).unwrap();
+        symlink("private/a%20b", directory.path().join("alias")).unwrap();
+        let rules = [
+            "-w",
+            "--path-auth",
+            "private=target:pass",
+            "--path-auth",
+            "alias=logical:pass",
+        ];
+        let config = config(directory.path(), &rules);
+        assert_eq!(
+            super::canonical_auth_path(&config, "alias")
+                .unwrap()
+                .as_deref(),
+            Some("private/a%20b")
+        );
+        for user in ["logical", "target"] {
+            let request = TestClient::put("http://localhost/alias")
+                .basic_auth(user, Some("pass"))
+                .build();
+            assert_eq!(
+                super::check_auth(&request, &config).unwrap().status_code,
+                Some(StatusCode::UNAUTHORIZED)
+            );
+        }
+        let config = crate::test_support::config(
+            directory.path(),
+            &["-w", "--path-auth", "private=target:pass"],
+        );
+        let service = Service::new(crate::build_router(config));
+        let response = TestClient::put("http://localhost/alias")
+            .basic_auth("target", Some("pass"))
+            .body("authorized creation")
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::CREATED));
+        assert_eq!(
+            std::fs::read(directory.path().join("private/a%20b")).unwrap(),
+            b"authorized creation"
+        );
+        assert!(!directory.path().join("private/a b").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_relative_ancestor_targets_keep_parent_components_and_literal_names() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDir::new();
+        std::fs::create_dir(directory.path().join("public")).unwrap();
+        std::fs::create_dir(directory.path().join("private")).unwrap();
+        symlink("../private/missing", directory.path().join("public/alias")).unwrap();
+        let config = config(directory.path(), &["--path-auth", "private=user:pass"]);
+        assert_eq!(
+            super::canonical_auth_path(&config, "public/alias/a%20b")
+                .unwrap()
+                .as_deref(),
+            Some("private/missing/a%20b")
+        );
+        let request = TestClient::put("http://localhost/public/alias/a%2520b").build();
+        assert_eq!(
+            super::check_auth(&request, &config).unwrap().status_code,
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        assert!(!directory.path().join("private/missing").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unresolved_alias_cycles_and_excessive_depth_fail_closed() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDir::new();
+        std::fs::create_dir(directory.path().join("private")).unwrap();
+        let maximum = crate::util::MAX_SYMLINKS;
+        for index in 0..=maximum {
+            let target = if index == maximum {
+                "private/missing".to_owned()
+            } else {
+                format!("link-{}", index + 1)
+            };
+            symlink(target, directory.path().join(format!("link-{index}"))).unwrap();
+        }
+        symlink("loop-b", directory.path().join("loop-a")).unwrap();
+        symlink("loop-a", directory.path().join("loop-b")).unwrap();
+        let config = config(directory.path(), &["--path-auth", "private=user:pass"]);
+        assert_eq!(
+            super::canonical_auth_path(&config, "link-1")
+                .unwrap()
+                .as_deref(),
+            Some("private/missing")
+        );
+        for path in ["link-0", "loop-a"] {
+            assert_eq!(
+                super::canonical_auth_path(&config, path)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+            let request = TestClient::put(format!("http://localhost/{path}")).build();
+            assert_eq!(
+                super::check_auth(&request, &config).unwrap().status_code,
+                Some(StatusCode::FORBIDDEN)
+            );
+            assert_eq!(
+                super::check_tree_auth(&request, &config, &format!("/{path}"))
+                    .unwrap()
+                    .status_code,
+                Some(StatusCode::FORBIDDEN)
+            );
+        }
+    }
 
     #[tokio::test]
     async fn basic_credentials_accept_scheme_casing_and_space_separators() {
