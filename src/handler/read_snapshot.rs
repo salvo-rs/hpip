@@ -72,24 +72,18 @@ async fn run_in_pool<R: Send + 'static>(
         let work_config = config.clone();
         // Dropping the request future closes this channel, including while the
         // blocking worker is waiting for an unrelated namespace transaction.
-        let (cancel_on_drop, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let (cancel_on_drop, mut cancelled) = tokio::sync::oneshot::channel::<()>();
         let runtime = tokio::runtime::Handle::current();
         let worker = move || {
-            let guard = runtime.block_on(async {
-                tokio::select! {
-                    biased;
-                    _ = cancelled => None,
-                    _ = work_config.wait_for_shutdown() => None,
-                    _ = tokio::time::sleep_until(deadline) => None,
-                    guard = MUTATION_LOCK.lock() => Some(guard),
-                }
-            });
+            let guard = runtime.block_on(snapshot_guard(
+                &work_config,
+                &mut cancelled,
+                deadline,
+                MUTATION_LOCK.lock(),
+            ));
             let Some(guard) = guard else {
                 return Err(StatusCode::SERVICE_UNAVAILABLE);
             };
-            if work_config.is_shutting_down() || tokio::time::Instant::now() >= deadline {
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
-            }
             Ok(work(&mut req, &work_config, guard))
         };
         let job = match pool {
@@ -103,6 +97,33 @@ async fn run_in_pool<R: Send + 'static>(
     })
     .await
     .unwrap_or(Err(StatusCode::SERVICE_UNAVAILABLE))
+}
+
+async fn snapshot_guard(
+    config: &AppConfig,
+    cancelled: &mut tokio::sync::oneshot::Receiver<()>,
+    deadline: tokio::time::Instant,
+    lock: impl std::future::Future<Output = tokio::sync::MutexGuard<'static, ()>>,
+) -> Option<tokio::sync::MutexGuard<'static, ()>> {
+    let guard = tokio::select! {
+        biased;
+        _ = &mut *cancelled => return None,
+        _ = config.wait_for_shutdown() => return None,
+        _ = tokio::time::sleep_until(deadline) => return None,
+        guard = lock => guard,
+    };
+    // Cancellation can arrive after select polled its first branch but before
+    // the namespace lock was granted. Treat the grant as admission only after
+    // rechecking all stop conditions, before starting synchronous source work.
+    if !matches!(
+        cancelled.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ) || config.is_shutting_down()
+        || tokio::time::Instant::now() >= deadline
+    {
+        return None;
+    }
+    Some(guard)
 }
 
 pub(super) struct OpenedFile {
@@ -154,6 +175,34 @@ mod tests {
     use salvo::test::{RequestBuilder, ResponseExt, TestClient};
 
     use super::*;
+
+    #[tokio::test]
+    async fn cancellation_during_lock_grant_does_not_start_a_snapshot() {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &[]);
+        let (cancel_on_drop, mut cancelled) = tokio::sync::oneshot::channel::<()>();
+        let mut cancellation = Some(cancel_on_drop);
+        let mut granted = Some(LOCK.lock().await);
+        // Model cancellation after the biased select polls its cancellation
+        // branch but before the ready lock future grants the namespace lock.
+        let lock = std::future::poll_fn(move |_| {
+            drop(cancellation.take());
+            std::task::Poll::Ready(granted.take().unwrap())
+        });
+        let guard = snapshot_guard(
+            &config,
+            &mut cancelled,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            lock,
+        )
+        .await;
+        assert!(
+            guard.is_none(),
+            "cancelled snapshot received a namespace guard"
+        );
+        assert!(LOCK.try_lock().is_ok());
+    }
 
     #[tokio::test]
     async fn published_source_and_mime_stay_pinned_without_holding_the_namespace_lock() {
