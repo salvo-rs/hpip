@@ -1257,6 +1257,44 @@ fn write_proppatch_output(
 
 // ─── MKCOL ─────────────────────────────────────────────
 
+fn commit_mkcol(
+    req: &Request,
+    config: &Arc<AppConfig>,
+    conditions: &WriteConditions,
+) -> std::io::Result<Response> {
+    let _guard = MUTATION_LOCK.blocking_lock();
+    if let Some(response) = crate::hoops::auth::check_auth(req, config) {
+        return Ok(response);
+    }
+    let segments: Vec<_> = req
+        .uri()
+        .path()
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let (path, symlink, invalid) = resolve_path(
+        &config.hosted_directory.1,
+        &segments,
+        config.follow_symlinks,
+    );
+    let mut response = Response::new();
+    if invalid {
+        response.status_code(StatusCode::BAD_REQUEST);
+        return Ok(response);
+    }
+    if !path.parent().is_some_and(Path::is_dir) || config.is_symlink_denied(symlink, &path) {
+        response.status_code(StatusCode::CONFLICT);
+        return Ok(response);
+    }
+    if !conditions.allows_path(&path)? {
+        response.status_code(StatusCode::PRECONDITION_FAILED);
+        return Ok(response);
+    }
+    fs::create_dir(path)?;
+    response.status_code(StatusCode::CREATED);
+    Ok(response)
+}
+
 #[handler]
 pub async fn handle_mkcol(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
@@ -1308,6 +1346,11 @@ pub async fn handle_mkcol(req: &mut Request, depot: &mut Depot, res: &mut Respon
     }
 
     // Check for non-empty body
+    let mut snapshot = Request::new();
+    *snapshot.uri_mut() = req.uri().clone();
+    *snapshot.method_mut() = req.method().clone();
+    *snapshot.headers_mut() = req.headers().clone();
+    *snapshot.remote_addr_mut() = req.remote_addr().clone();
     let Some(body) = control_body(req, res).await else {
         return;
     };
@@ -1323,24 +1366,15 @@ pub async fn handle_mkcol(req: &mut Request, depot: &mut Depot, res: &mut Respon
             return;
         }
     };
-    let Some(job) = config.spawn_blocking(move || {
-        let _guard = MUTATION_LOCK.blocking_lock();
-        if !conditions.allows_path(&req_p)? {
-            return Ok(false);
-        }
-        fs::create_dir(&req_p)?;
-        Ok(true)
-    }) else {
+    let work_config = config.clone();
+    let Some(job) =
+        config.spawn_blocking(move || commit_mkcol(&snapshot, &work_config, &conditions))
+    else {
         res.status_code(StatusCode::SERVICE_UNAVAILABLE);
         return;
     };
     match job.await.unwrap_or_else(|error| Err(IoError::other(error))) {
-        Ok(true) => {
-            res.status_code(StatusCode::CREATED);
-        }
-        Ok(false) => {
-            res.status_code(StatusCode::PRECONDITION_FAILED);
-        }
+        Ok(response) => *res = response,
         Err(e) => match e.kind() {
             IoErrorKind::NotFound => {
                 res.status_code(StatusCode::CONFLICT);
@@ -1705,6 +1739,101 @@ mod remaining_mutation_condition_tests {
     use crate::test_support::{TestDir, config};
 
     const UPDATE: &str = r#"<D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:"><D:set><D:prop><Z:Win32LastModifiedTime>2020-09-13T12:26:40Z</Z:Win32LastModifiedTime></D:prop></D:set></D:propertyupdate>"#;
+
+    #[test]
+    fn mkcol_rechecks_current_parent_before_applying_conditions() {
+        let fixture = TestDir::new();
+        let parent = fixture.path().join("active");
+        fs::create_dir(&parent).unwrap();
+        let config = config(fixture.path(), &["-w", "-d"]);
+        let snapshot =
+            RequestBuilder::new("http://localhost/active/child", "MKCOL".parse().unwrap()).build();
+        assert!(crate::hoops::auth::check_auth(&snapshot, &config).is_none());
+        {
+            let _guard = MUTATION_LOCK.blocking_lock();
+            crate::util::namespace::rename_no_replace(&parent, &fixture.path().join("retired"))
+                .unwrap();
+        }
+        let response = commit_mkcol(
+            &snapshot,
+            &config,
+            &WriteConditions {
+                if_match: Some("*".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(response.status_code, Some(StatusCode::CONFLICT));
+        assert!(!fixture.path().join("retired/child").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mkcol_rechecks_current_namespace_authorization_and_symlink_policy() {
+        use std::os::unix::fs::symlink;
+
+        for policy in ["auth", "no-follow", "sandbox"] {
+            let fixture = TestDir::new();
+            let root = fixture.path().join("served");
+            fs::create_dir_all(root.join("active/alias")).unwrap();
+            fs::create_dir(root.join("prepared")).unwrap();
+            let target = if policy == "sandbox" {
+                fixture.path().join("outside")
+            } else {
+                root.join("private")
+            };
+            fs::create_dir(&target).unwrap();
+            symlink(&target, root.join("prepared/alias")).unwrap();
+            let flags = match policy {
+                "auth" => vec!["-w", "-d", "--path-auth", "private=user:pass"],
+                "no-follow" => vec!["-w", "-d", "-s"],
+                _ => vec!["-w", "-d", "-r"],
+            };
+            let config = config(&root, &flags);
+            let snapshot = RequestBuilder::new(
+                "http://localhost/active/alias/child",
+                "MKCOL".parse().unwrap(),
+            )
+            .build();
+            assert!(crate::hoops::auth::check_auth(&snapshot, &config).is_none());
+            let (initial, link, invalid) = resolve_path(
+                &config.hosted_directory.1,
+                &["active", "alias", "child"],
+                config.follow_symlinks,
+            );
+            assert!(
+                !invalid
+                    && initial.parent().unwrap().is_dir()
+                    && !config.is_symlink_denied(link, &initial)
+            );
+            {
+                let _guard = MUTATION_LOCK.blocking_lock();
+                crate::util::namespace::rename_no_replace(
+                    &root.join("active"),
+                    &root.join("retired"),
+                )
+                .unwrap();
+                crate::util::namespace::copy_no_replace(
+                    &root.join("prepared"),
+                    &root.join("active"),
+                    true,
+                )
+                .unwrap();
+            }
+            let response = commit_mkcol(&snapshot, &config, &WriteConditions::default()).unwrap();
+            assert_eq!(
+                response.status_code,
+                Some(if policy == "auth" {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::CONFLICT
+                }),
+                "{policy}"
+            );
+            assert!(!target.join("child").exists(), "{policy}");
+            assert!(!root.join("retired/alias/child").exists(), "{policy}");
+        }
+    }
 
     #[tokio::test]
     async fn mkcol_checks_version_conditions_before_creating_a_collection() {
