@@ -627,11 +627,17 @@ impl ArchiveOutput for Vec<u8> {
 
 impl ArchiveOutput for ArchiveWriter {
     fn member(&self, path: &Path) -> IoResult<ArchiveMember> {
+        let remaining = self.total_timeout.saturating_sub(self.started.elapsed());
+        let deadline = tokio::time::Instant::now() + self.stall_timeout.min(remaining);
+        self.member_until(path, deadline)
+    }
+}
+
+impl ArchiveWriter {
+    fn member_until(&self, path: &Path, deadline: tokio::time::Instant) -> IoResult<ArchiveMember> {
         self.runtime.block_on(async {
             let wait = crate::util::write_conditions::MUTATION_LOCK.lock();
             tokio::pin!(wait);
-            let remaining = self.total_timeout.saturating_sub(self.started.elapsed());
-            let deadline = tokio::time::Instant::now() + self.stall_timeout.min(remaining);
             let guard = loop {
                 if self.sender.is_closed() {
                     return Err(io::Error::new(
@@ -650,6 +656,21 @@ impl ArchiveOutput for ArchiveWriter {
                     _ = tokio::time::sleep(Duration::from_millis(10)) => {}
                 }
             };
+            // Granting the lock may wake this worker before the periodic poll
+            // runs again. Do not start synchronous source work after its waiter
+            // was cancelled or expired while the lock was unavailable.
+            if self.sender.is_closed() {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "archive receiver closed",
+                ));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "archive source lock deadline exceeded",
+                ));
+            }
             let member = match &self.authority {
                 SourceAuthority::Request(authority) => authority.member(path),
                 #[cfg(test)]
@@ -920,6 +941,64 @@ mod streaming_tests {
     use salvo::test::{ResponseExt, TestClient};
 
     use super::*;
+
+    async fn late_namespace_grant(disconnect: bool) -> Option<io::ErrorKind> {
+        let fixture = crate::test_support::TestDir::new();
+        let path = fixture.path().join("file");
+        std::fs::write(&path, b"fixture").unwrap();
+        let guard = crate::util::write_conditions::MUTATION_LOCK.lock().await;
+        let mut response = Response::new();
+        let writer = ArchiveWriter {
+            sender: response.channel(),
+            runtime: tokio::runtime::Handle::current(),
+            started: Instant::now(),
+            stall_timeout: if disconnect {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_millis(10)
+            },
+            total_timeout: Duration::from_secs(10),
+            authority: SourceAuthority::Unchecked,
+        };
+        let (entered, ready) = std::sync::mpsc::channel();
+        // Anchor expiry in the caller so delayed worker scheduling cannot give
+        // this test a fresh stall interval after the namespace was released.
+        let deadline = tokio::time::Instant::now() + writer.stall_timeout;
+        let job = tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            writer
+                .member_until(&path, deadline)
+                .err()
+                .map(|error| error.kind())
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Keep this current-thread timer driver paused while the blocking
+        // producer parks on the namespace, then while the lock is granted.
+        // This makes the lock wake win over the periodic cancellation poll.
+        std::thread::sleep(Duration::from_millis(20));
+        if disconnect {
+            drop(response);
+        }
+        drop(guard);
+        std::thread::sleep(Duration::from_millis(20));
+        job.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_closed_receiver_does_not_open_a_source_when_the_namespace_is_granted() {
+        assert_eq!(
+            late_namespace_grant(true).await,
+            Some(io::ErrorKind::BrokenPipe)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_wait_does_not_open_a_source_when_the_namespace_is_granted() {
+        assert_eq!(
+            late_namespace_grant(false).await,
+            Some(io::ErrorKind::TimedOut)
+        );
+    }
 
     fn authority(root: &Path, url: &str, config: Arc<AppConfig>) -> ArchiveAuthority {
         ArchiveAuthority {
