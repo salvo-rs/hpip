@@ -174,10 +174,7 @@ fn raw_fs_dir(
         ),
     );
 
-    let segment_count = url_path_raw.split('/').filter(|s| !s.is_empty()).count();
-    let is_root = segment_count + !url_path_raw.ends_with('/') as usize == 1
-        || url_path_raw == "/"
-        || url_path_raw.is_empty();
+    let is_root = url_path_raw.split('/').all(str::is_empty);
 
     let entries = match crate::util::metadata::directory_entries(req_p) {
         Ok(entries) => entries,
