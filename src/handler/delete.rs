@@ -6,6 +6,52 @@ use crate::config::AppConfig;
 use crate::util::write_conditions::{MUTATION_LOCK, WriteConditions};
 use crate::util::*;
 
+fn commit_delete(
+    req: &Request,
+    config: &Arc<AppConfig>,
+    conditions: &WriteConditions,
+) -> std::io::Result<Response> {
+    let _guard = MUTATION_LOCK.blocking_lock();
+    if let Some(response) = crate::hoops::auth::check_auth(req, config) {
+        return Ok(response);
+    }
+    let segments: Vec<_> = req
+        .uri()
+        .path()
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    // Resolve the current entry, keeping DELETE's policy of removing links.
+    let (path, symlink, invalid) = resolve_path(&config.hosted_directory.1, &segments, false);
+    let mut response = Response::new();
+    if invalid {
+        response.status_code(StatusCode::BAD_REQUEST);
+        return Ok(response);
+    }
+    if !path.exists() || config.is_symlink_denied(symlink, &path) {
+        response.status_code(StatusCode::NOT_FOUND);
+        return Ok(response);
+    }
+    let metadata = path.metadata()?;
+    let is_file = is_actually_file(&metadata.file_type(), &path);
+    if !is_file
+        && let Some(response) = crate::hoops::auth::check_tree_auth(req, config, req.uri().path())
+    {
+        return Ok(response);
+    }
+    if !conditions.allows_path(&path)? {
+        response.status_code(StatusCode::PRECONDITION_FAILED);
+        return Ok(response);
+    }
+    if is_file {
+        std::fs::remove_file(&path)?;
+    } else {
+        std::fs::remove_dir_all(&path)?;
+    }
+    response.status_code(StatusCode::NO_CONTENT);
+    Ok(response)
+}
+
 #[handler]
 pub async fn handle_delete(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
@@ -64,7 +110,6 @@ pub async fn handle_delete(req: &mut Request, depot: &mut Depot, res: &mut Respo
     }
 
     let remote = req.remote_addr().to_string();
-    let req_p_clone = req_p.clone();
     let is_file = req_p
         .metadata()
         .map(|m| is_actually_file(&m.file_type(), &req_p))
@@ -85,18 +130,15 @@ pub async fn handle_delete(req: &mut Request, depot: &mut Depot, res: &mut Respo
             return;
         }
     };
-    let Some(job) = config.spawn_blocking(move || {
-        let _mutation_lock = MUTATION_LOCK.blocking_lock();
-        if !conditions.allows_path(&req_p_clone)? {
-            return Ok(false);
-        }
-        if is_file {
-            std::fs::remove_file(&req_p_clone)?;
-        } else {
-            std::fs::remove_dir_all(&req_p_clone)?;
-        }
-        Ok::<_, std::io::Error>(true)
-    }) else {
+    let mut snapshot = Request::new();
+    *snapshot.uri_mut() = req.uri().clone();
+    *snapshot.method_mut() = req.method().clone();
+    *snapshot.headers_mut() = req.headers().clone();
+    *snapshot.remote_addr_mut() = req.remote_addr().clone();
+    let work_config = config.clone();
+    let Some(job) =
+        config.spawn_blocking(move || commit_delete(&snapshot, &work_config, &conditions))
+    else {
         res.status_code(StatusCode::SERVICE_UNAVAILABLE);
         return;
     };
@@ -105,28 +147,13 @@ pub async fn handle_delete(req: &mut Request, depot: &mut Depot, res: &mut Respo
         .unwrap_or_else(|error| Err(std::io::Error::other(error)));
 
     match result {
-        Ok(true) => {
-            crate::config::log_msg(
-                config.log,
-                &format!(
-                    "{} deleted {} {}",
-                    remote,
-                    if is_file {
-                        "file"
-                    } else if symlink {
-                        "symlink"
-                    } else {
-                        "directory"
-                    },
-                    req_p.display()
-                ),
-            );
-            res.status_code(StatusCode::NO_CONTENT);
+        Ok(response) => {
+            if response.status_code == Some(StatusCode::NO_CONTENT) {
+                crate::config::log_msg(config.log, &format!("{} deleted {}", remote, url_path_str));
+            }
+            *res = response;
             res.headers_mut()
                 .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-        }
-        Ok(false) => {
-            res.status_code(StatusCode::PRECONDITION_FAILED);
         }
         Err(e) => {
             res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
@@ -160,5 +187,61 @@ mod error_text_tests {
         let html = response.take_string().await.unwrap();
         assert!(html.contains("&lt;img data-review=hpip&gt;"));
         assert!(!html.contains("<img data-review=hpip>"));
+    }
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use salvo::test::RequestBuilder;
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    #[test]
+    fn commit_rechecks_collection_authority_and_current_type_after_publication() {
+        for protected in [true, false] {
+            let fixture = TestDir::new();
+            let active = fixture.path().join("active");
+            std::fs::write(&active, b"initial file").unwrap();
+            let flags = if protected {
+                vec!["-w", "--path-auth", "active/private=user:pass"]
+            } else {
+                vec!["-w"]
+            };
+            let config = config(fixture.path(), &flags);
+            let snapshot =
+                RequestBuilder::new("http://localhost/active", salvo::http::Method::DELETE).build();
+            assert!(crate::hoops::auth::check_auth(&snapshot, &config).is_none());
+            assert!(active.is_file());
+            let prepared = fixture.path().join("prepared");
+            std::fs::create_dir(&prepared).unwrap();
+            std::fs::write(prepared.join("private"), b"collection member").unwrap();
+            {
+                let _guard = MUTATION_LOCK.blocking_lock();
+                crate::util::namespace::rename_no_replace(&active, &fixture.path().join("retired"))
+                    .unwrap();
+                crate::util::namespace::rename_no_replace(&prepared, &active).unwrap();
+            }
+            let response = commit_delete(&snapshot, &config, &WriteConditions::default()).unwrap();
+            assert_eq!(
+                response.status_code,
+                Some(if protected {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::NO_CONTENT
+                })
+            );
+            assert_eq!(active.exists(), protected);
+            assert_eq!(
+                std::fs::read(fixture.path().join("retired")).unwrap(),
+                b"initial file"
+            );
+            if protected {
+                assert_eq!(
+                    std::fs::read(active.join("private")).unwrap(),
+                    b"collection member"
+                );
+            }
+        }
     }
 }
