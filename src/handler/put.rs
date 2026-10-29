@@ -221,8 +221,7 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
         config: config.clone(),
     };
     let prepare_conditions = conditions.clone();
-    let Some(preparation) = config.spawn_blocking(move || {
-        let _guard = MUTATION_LOCK.blocking_lock();
+    let preparation = upload_transaction(&config, move || {
         let prepare_path = authority.current_path()?;
         if !prepare_conditions.allows_path(&prepare_path)? {
             return Err(UploadError::PreconditionFailed);
@@ -237,12 +236,9 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
             file,
             target: UploadTarget::Request(Box::new(authority)),
         })
-    }) else {
-        res.status_code(StatusCode::SERVICE_UNAVAILABLE);
-        return;
-    };
+    });
     let result = match preparation.await {
-        Ok(Ok(prepared)) => {
+        Ok(prepared) => {
             write_prepared_file(
                 &config,
                 prepared,
@@ -253,8 +249,7 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
             )
             .await
         }
-        Ok(Err(error)) => Err(error),
-        Err(error) => Err(UploadError::Io(std::io::Error::other(error))),
+        Err(error) => Err(error),
     };
     match result {
         Err(UploadError::Rejected(response)) => *res = *response,
@@ -508,7 +503,7 @@ async fn write_prepared_file(
     file.sync_all().await?;
     let file = file.into_std().await;
     let conditions = conditions.clone();
-    commit_upload(config, move || {
+    upload_transaction(config, move || {
         let destination = match target {
             UploadTarget::Request(authority) => authority.current_path()?,
             #[cfg(test)]
@@ -540,9 +535,9 @@ async fn write_prepared_file(
     .await
 }
 
-/// A cancelled request may stop waiting for a commit, but cannot drop its lock
-/// while an admitted filesystem transaction is still publishing in the worker.
-async fn commit_upload<R: Send + 'static>(
+/// A cancelled request can discard a preparation or publication still waiting
+/// for the namespace. Started filesystem work owns its lock until completion.
+async fn upload_transaction<R: Send + 'static>(
     config: &Arc<AppConfig>,
     work: impl FnOnce() -> Result<R, UploadError> + Send + 'static,
 ) -> Result<R, UploadError> {
@@ -560,14 +555,14 @@ async fn commit_upload<R: Send + 'static>(
             let Some(_guard) = guard else {
                 return Err(UploadError::BodyRead(std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
-                    "upload cancelled before publication",
+                    "upload cancelled before filesystem transaction",
                 )));
             };
             work()
         })
         .ok_or_else(|| {
             UploadError::Io(std::io::Error::other(
-                "upload publication worker unavailable",
+                "upload transaction worker unavailable",
             ))
         })?;
     let result = job.await.map_err(std::io::Error::other)?;
@@ -590,6 +585,101 @@ mod publication_lifetime_tests {
     }
 
     #[tokio::test]
+    async fn cancelled_preparation_waiters_return_worker_capacity_before_the_writer_finishes() {
+        use salvo::test::TestClient;
+
+        let fixture = TestDir::new();
+        let config = config(fixture.path(), &["-w"]);
+        let writer = MUTATION_LOCK.lock().await;
+        let mut requests = Vec::new();
+        for index in 0..4 {
+            let request_config = config.clone();
+            requests.push(tokio::spawn(async move {
+                let service = Service::new(crate::build_router(request_config));
+                TestClient::put(format!("http://localhost/new-{index}/file.txt"))
+                    .body("never received")
+                    .send(&service)
+                    .await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while config.blocking_jobs.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for request in requests {
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+        }
+        let returned = tokio::time::timeout(
+            Duration::from_millis(100),
+            config.blocking_jobs.clone().acquire_many_owned(4),
+        )
+        .await;
+        let returned_while_locked = returned.is_ok();
+        // Release and join admitted work even when running this regression on
+        // the old preparation path, so the failing case cannot strand workers.
+        drop(writer);
+        if let Ok(permits) = returned {
+            drop(permits.unwrap());
+        } else {
+            let all = tokio::time::timeout(
+                Duration::from_secs(2),
+                config.blocking_jobs.clone().acquire_many_owned(4),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            drop(all);
+        }
+        assert!(
+            returned_while_locked,
+            "cancelled preparations kept general workers behind an unrelated writer"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_create_only_uploads_publish_one_complete_winner_and_clean_staging() {
+        use salvo::test::TestClient;
+
+        let fixture = TestDir::new();
+        let config = config(fixture.path(), &["-w"]);
+        let service = Arc::new(Service::new(crate::build_router(config)));
+        let mut requests = tokio::task::JoinSet::new();
+        let bodies: Vec<_> = (0..4)
+            .map(|index| format!("writer-{index}\n").repeat(1024))
+            .collect();
+        for body in &bodies {
+            let service = service.clone();
+            let body = body.clone();
+            requests.spawn(async move {
+                TestClient::put("http://localhost/winner.txt")
+                    .add_header("If-None-Match", "*", true)
+                    .body(body)
+                    .send(&*service)
+                    .await
+                    .status_code
+                    .unwrap()
+            });
+        }
+        let mut created = 0;
+        let mut rejected = 0;
+        while let Some(response) = requests.join_next().await {
+            match response.unwrap() {
+                StatusCode::CREATED => created += 1,
+                StatusCode::PRECONDITION_FAILED => rejected += 1,
+                status => panic!("unexpected concurrent upload status: {status}"),
+            }
+        }
+        assert_eq!((created, rejected), (1, 3));
+        let winner = std::fs::read_to_string(fixture.path().join("winner.txt")).unwrap();
+        assert!(bodies.contains(&winner));
+        assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
     async fn cancelled_publication_keeps_its_lock_and_drain_permit_until_the_worker_finishes() {
         let fixture = TestDir::new();
         let path = fixture.path().join("file");
@@ -601,7 +691,7 @@ mod publication_lifetime_tests {
         let request_config = config.clone();
         let destination = path.clone();
         let request = tokio::spawn(async move {
-            commit_upload(&request_config, move || {
+            upload_transaction(&request_config, move || {
                 entered.send(()).unwrap();
                 wait.recv_timeout(Duration::from_secs(5)).unwrap();
                 drop(file);
@@ -652,7 +742,7 @@ mod publication_lifetime_tests {
         let request_config = config.clone();
         let destination = path.clone();
         let request = tokio::spawn(async move {
-            commit_upload(&request_config, move || {
+            upload_transaction(&request_config, move || {
                 drop(file);
                 pending.commit(&destination, false)?;
                 Ok(())
@@ -697,7 +787,7 @@ mod publication_lifetime_tests {
                 .unwrap();
             let (pending, file) = staged(&path).await;
             let destination = path.clone();
-            let result = commit_upload(&config, move || {
+            let result = upload_transaction(&config, move || {
                 drop(file);
                 pending.commit(&destination, false)?;
                 Ok(())
