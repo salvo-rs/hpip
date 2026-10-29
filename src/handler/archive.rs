@@ -61,6 +61,29 @@ impl std::fmt::Display for ArchiveType {
     }
 }
 
+const ARCHIVE_FORM_LIMIT: usize = 64 * 1024;
+
+async fn archive_form_body(
+    req: &mut Request,
+    res: &mut Response,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let status =
+        match tokio::time::timeout(timeout, req.payload_with_max_size(ARCHIVE_FORM_LIMIT)).await {
+            Ok(Ok(body)) if body.len() <= ARCHIVE_FORM_LIMIT => return Some(body.to_vec()),
+            // Salvo can return a payload cached by middleware without applying the
+            // new limit, so check its length even after a successful read.
+            Ok(Ok(_)) | Ok(Err(salvo::http::ParseError::PayloadTooLarge)) => {
+                StatusCode::PAYLOAD_TOO_LARGE
+            }
+            Ok(Err(_)) => StatusCode::BAD_REQUEST,
+            Err(_) => StatusCode::REQUEST_TIMEOUT,
+        };
+    res.status_code(status);
+    res.render(Text::Plain("Unable to read the archive request body.\n"));
+    None
+}
+
 /// Handle POST requests for archive downloads (form-based)
 #[handler]
 pub async fn handle_post_archive(req: &mut Request, depot: &mut Depot, res: &mut Response) {
@@ -90,12 +113,9 @@ pub async fn handle_post_archive(req: &mut Request, depot: &mut Depot, res: &mut
         return;
     }
 
-    let body_bytes = req
-        .payload()
-        .await
-        .ok()
-        .map(|b| b.to_vec())
-        .unwrap_or_default();
+    let Some(body_bytes) = archive_form_body(req, res, Duration::from_secs(30)).await else {
+        return;
+    };
     let body_str = str::from_utf8(&body_bytes).unwrap_or("");
 
     let mut archive_type: Option<ArchiveType> = None;
@@ -130,11 +150,132 @@ pub async fn handle_post_archive(req: &mut Request, depot: &mut Depot, res: &mut
 #[cfg(test)]
 mod post_content_type_tests {
     use std::io::Read;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
 
+    use salvo::hyper::body::{Body, Bytes, Frame};
     use salvo::test::{ResponseExt, TestClient};
+    use tokio::sync::oneshot;
 
     use super::*;
     use crate::test_support::{TestDir, config};
+
+    struct FormBody {
+        entered: Option<oneshot::Sender<()>>,
+        dropped: Arc<AtomicBool>,
+        fail: bool,
+    }
+
+    impl Body for FormBody {
+        type Data = Bytes;
+        type Error = salvo::BoxedError;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            if self.fail {
+                Poll::Ready(Some(Err(
+                    io::Error::other("fixture body read failure").into()
+                )))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    impl Drop for FormBody {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn form_request(fail: bool) -> (Request, oneshot::Receiver<()>, Arc<AtomicBool>) {
+        let (entered, ready) = oneshot::channel();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut request = TestClient::post("http://localhost/")
+            .add_header("Content-Type", "text/plain", true)
+            .build();
+        *request.body_mut() = salvo::http::ReqBody::Boxed {
+            inner: Box::pin(FormBody {
+                entered: Some(entered),
+                dropped: dropped.clone(),
+                fail,
+            }),
+            fuse_config: None,
+        };
+        (request, ready, dropped)
+    }
+
+    #[tokio::test]
+    async fn archive_form_failures_preserve_transport_and_size_statuses() {
+        let directory = TestDir::new();
+        let config = config(directory.path(), &["-A"]);
+        let service = Service::new(crate::build_router(config.clone()));
+        let response = TestClient::post("http://localhost/")
+            .add_header("Content-Type", "text/plain", true)
+            .body(vec![b'x'; ARCHIVE_FORM_LIMIT + 1])
+            .send(&service)
+            .await;
+        assert_eq!(response.status_code, Some(StatusCode::PAYLOAD_TOO_LARGE));
+        assert_eq!(config.archive_jobs.available_permits(), 4);
+        let (request, _, dropped) = form_request(true);
+        let response = service.handle(request).await;
+        assert_eq!(response.status_code, Some(StatusCode::BAD_REQUEST));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(config.archive_jobs.available_permits(), 4);
+
+        // A caller may have cached a payload with a larger middleware limit.
+        let mut cached = TestClient::post("http://localhost/")
+            .body(vec![b'x'; ARCHIVE_FORM_LIMIT + 1])
+            .build();
+        cached
+            .payload_with_max_size(ARCHIVE_FORM_LIMIT + 1)
+            .await
+            .unwrap();
+        let mut response = Response::new();
+        assert!(
+            archive_form_body(&mut cached, &mut response, Duration::from_secs(1))
+                .await
+                .is_none()
+        );
+        assert_eq!(response.status_code, Some(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+
+    #[tokio::test]
+    async fn unfinished_archive_forms_time_out_and_release_their_body() {
+        let (mut request, _, dropped) = form_request(false);
+        let mut response = Response::new();
+        assert!(
+            archive_form_body(&mut request, &mut response, Duration::from_millis(10))
+                .await
+                .is_none()
+        );
+        assert_eq!(response.status_code, Some(StatusCode::REQUEST_TIMEOUT));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_archive_form_never_starts_a_producer() {
+        let directory = TestDir::new();
+        let config = config(directory.path(), &["-A"]);
+        let service = Service::new(crate::build_router(config.clone()));
+        let (request, ready, dropped) = form_request(false);
+        let job = tokio::spawn(async move { service.handle(request).await });
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.archive_jobs.available_permits(), 4);
+        job.abort();
+        assert!(job.await.unwrap_err().is_cancelled());
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(config.archive_jobs.available_permits(), 4);
+    }
 
     #[tokio::test]
     async fn archive_forms_accept_equivalent_plain_text_media_types() {
