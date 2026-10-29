@@ -182,14 +182,23 @@ pub async fn handle_propfind(req: &mut Request, depot: &mut Depot, res: &mut Res
         .map(str::to_owned);
 
     let work_config = config.clone();
+    let mut snapshot = Request::new();
+    *snapshot.uri_mut() = req.uri().clone();
+    *snapshot.method_mut() = req.method().clone();
+    *snapshot.headers_mut() = req.headers().clone();
+    *snapshot.remote_addr_mut() = req.remote_addr().clone();
     let Some(job) = config.spawn_blocking(move || {
-        write_propfind_output(&work_config, &url, &req_p, &props, ua.as_deref(), depth)
+        propfind_snapshot(&snapshot, &work_config, &url, &props, ua.as_deref(), depth)
     }) else {
         res.status_code(StatusCode::SERVICE_UNAVAILABLE);
         return;
     };
     let result = match job.await {
-        Ok(result) => result,
+        Ok(Ok(result)) => result,
+        Ok(Err(response)) => {
+            *res = *response;
+            return;
+        }
         Err(_) => {
             res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
             return;
@@ -224,6 +233,53 @@ pub async fn handle_propfind(req: &mut Request, depot: &mut Depot, res: &mut Res
             );
         }
     }
+}
+
+/// Body reception and worker scheduling can both outlive the initial namespace
+/// selection. Authorize and resolve again while constructing the bounded XML
+/// snapshot, then release the namespace before sending any response bytes.
+fn propfind_snapshot(
+    req: &Request,
+    config: &AppConfig,
+    url: &str,
+    props: &PropfindVariant,
+    ua: Option<&str>,
+    depth: Depth,
+) -> Result<Result<Vec<u8>, xml::writer::Error>, Box<Response>> {
+    let _guard = MUTATION_LOCK.blocking_lock();
+    let authority = if depth == Depth::Zero {
+        crate::hoops::auth::check_auth_path(req, config, url)
+    } else {
+        crate::hoops::auth::check_tree_auth(req, config, url)
+    };
+    if let Some(response) = authority {
+        return Err(Box::new(response));
+    }
+    let segments: Vec<_> = url
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let (path, symlink, invalid) = resolve_path(
+        &config.hosted_directory.1,
+        &segments,
+        config.follow_symlinks,
+    );
+    if invalid || !path.exists() || config.is_symlink_denied(symlink, &path) {
+        let mut response = Response::new();
+        let status = if invalid {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::NOT_FOUND
+        };
+        set_error(
+            &mut response,
+            status,
+            status.as_str(),
+            "Resource is unavailable.",
+        );
+        return Err(Box::new(response));
+    }
+    Ok(write_propfind_output(config, url, &path, props, ua, depth))
 }
 
 fn write_propfind_output(
@@ -1732,6 +1788,89 @@ fn set_error(res: &mut Response, status: StatusCode, title: &str, msg: &str) {
     res.headers_mut()
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
     res.render(Text::Html(body));
+}
+
+#[cfg(test)]
+mod propfind_snapshot_tests {
+    use salvo::http::Method;
+    use salvo::test::RequestBuilder;
+
+    use super::*;
+
+    #[test]
+    fn snapshots_recheck_current_collection_rules_and_release_the_namespace() {
+        let fixture = crate::test_support::TestDir::new();
+        let current = fixture.path().join("current");
+        fs::write(&current, b"initial file").unwrap();
+        let config = crate::test_support::config(
+            fixture.path(),
+            &["-d", "--path-auth", "current/member=user:pass"],
+        );
+        let request = RequestBuilder::new(
+            "http://localhost/current",
+            Method::from_bytes(b"PROPFIND").unwrap(),
+        )
+        .build();
+        assert!(crate::hoops::auth::check_auth(&request, &config).is_none());
+        {
+            let _guard = MUTATION_LOCK.blocking_lock();
+            fs::rename(&current, fixture.path().join("retired")).unwrap();
+            fs::create_dir(&current).unwrap();
+            fs::write(current.join("member"), b"current member").unwrap();
+        }
+        let response = propfind_snapshot(
+            &request,
+            &config,
+            "/current",
+            &PropfindVariant::AllProp,
+            None,
+            Depth::One,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+        let authorized = RequestBuilder::new(
+            "http://localhost/current",
+            Method::from_bytes(b"PROPFIND").unwrap(),
+        )
+        .basic_auth("user", Some("pass"))
+        .build();
+        let bytes = propfind_snapshot(
+            &authorized,
+            &config,
+            "/current",
+            &PropfindVariant::AllProp,
+            None,
+            Depth::One,
+        )
+        .ok()
+        .unwrap()
+        .unwrap();
+        assert!(String::from_utf8(bytes).unwrap().contains("member"));
+        let _guard = MUTATION_LOCK.blocking_lock();
+    }
+
+    #[test]
+    fn disappeared_resources_return_not_found_before_xml_generation() {
+        let fixture = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(fixture.path(), &["-d"]);
+        let request = RequestBuilder::new(
+            "http://localhost/missing",
+            Method::from_bytes(b"PROPFIND").unwrap(),
+        )
+        .build();
+        let response = propfind_snapshot(
+            &request,
+            &config,
+            "/missing",
+            &PropfindVariant::AllProp,
+            None,
+            Depth::Zero,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(response.status_code, Some(StatusCode::NOT_FOUND));
+    }
 }
 
 #[cfg(test)]
