@@ -1414,6 +1414,7 @@ async fn handle_copy_move(req: &mut Request, depot: &mut Depot, res: &mut Respon
     *snapshot.uri_mut() = req.uri().clone();
     *snapshot.headers_mut() = req.headers().clone();
     *snapshot.method_mut() = req.method().clone();
+    *snapshot.remote_addr_mut() = req.remote_addr().clone();
     let work_config = config.clone();
     let Some(job) = config.spawn_blocking(move || {
         let mut response = Response::new();
@@ -1432,6 +1433,9 @@ async fn handle_copy_move(req: &mut Request, depot: &mut Depot, res: &mut Respon
 }
 
 fn copy_move_work(req: &mut Request, config: &Arc<AppConfig>, res: &mut Response, is_move: bool) {
+    // Authorization, type/depth checks, and path resolution describe the same
+    // namespace that will be changed, including every collection member.
+    let _mutation_lock = MUTATION_LOCK.blocking_lock();
     if let Some(resp) = crate::hoops::auth::check_auth(req, config) {
         *res = resp;
         return;
@@ -1595,7 +1599,6 @@ fn copy_move_work(req: &mut Request, config: &Arc<AppConfig>, res: &mut Response
             return;
         }
     };
-    let _mutation_lock = MUTATION_LOCK.blocking_lock();
     match conditions.allows_path(&req_p) {
         Ok(true) => {}
         Ok(false) => {
@@ -1729,6 +1732,110 @@ fn set_error(res: &mut Response, status: StatusCode, title: &str, msg: &str) {
     res.headers_mut()
         .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
     res.render(Text::Html(body));
+}
+
+#[cfg(test)]
+mod copy_move_commit_tests {
+    use salvo::test::RequestBuilder;
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    #[test]
+    fn current_source_collection_requires_every_descendant_credential() {
+        for method in ["COPY", "MOVE"] {
+            let fixture = TestDir::new();
+            let source = fixture.path().join("source");
+            fs::write(&source, b"initial file").unwrap();
+            let config = config(
+                fixture.path(),
+                &["-w", "-d", "--path-auth", "source/private=user:pass"],
+            );
+            let mut snapshot =
+                RequestBuilder::new("http://localhost/source", method.parse().unwrap())
+                    .add_header("Destination", "/target", true)
+                    .build();
+            assert!(crate::hoops::auth::check_auth(&snapshot, &config).is_none());
+            let prepared = fixture.path().join("prepared");
+            fs::create_dir(&prepared).unwrap();
+            fs::write(prepared.join("private"), b"protected member").unwrap();
+            {
+                let _guard = MUTATION_LOCK.blocking_lock();
+                crate::util::namespace::rename_no_replace(&source, &fixture.path().join("retired"))
+                    .unwrap();
+                crate::util::namespace::rename_no_replace(&prepared, &source).unwrap();
+            }
+            let mut response = Response::new();
+            copy_move_work(&mut snapshot, &config, &mut response, method == "MOVE");
+            assert_eq!(
+                response.status_code,
+                Some(StatusCode::UNAUTHORIZED),
+                "{method}"
+            );
+            assert_eq!(
+                fs::read(source.join("private")).unwrap(),
+                b"protected member"
+            );
+            assert!(!fixture.path().join("target").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_destination_alias_requires_its_canonical_credentials() {
+        use std::os::unix::fs::symlink;
+
+        for method in ["COPY", "MOVE"] {
+            let fixture = TestDir::new();
+            fs::create_dir_all(fixture.path().join("active/alias")).unwrap();
+            fs::create_dir(fixture.path().join("prepared")).unwrap();
+            fs::create_dir(fixture.path().join("private")).unwrap();
+            fs::write(fixture.path().join("source"), b"preserved source").unwrap();
+            symlink(
+                fixture.path().join("private"),
+                fixture.path().join("prepared/alias"),
+            )
+            .unwrap();
+            let config = config(
+                fixture.path(),
+                &["-w", "-d", "--path-auth", "private=user:pass"],
+            );
+            let mut snapshot =
+                RequestBuilder::new("http://localhost/source", method.parse().unwrap())
+                    .add_header("Destination", "/active/alias/target", true)
+                    .build();
+            assert!(
+                crate::hoops::auth::check_auth_path(&snapshot, &config, "/active/alias/target")
+                    .is_none()
+            );
+            {
+                let _guard = MUTATION_LOCK.blocking_lock();
+                crate::util::namespace::rename_no_replace(
+                    &fixture.path().join("active"),
+                    &fixture.path().join("retired"),
+                )
+                .unwrap();
+                crate::util::namespace::copy_no_replace(
+                    &fixture.path().join("prepared"),
+                    &fixture.path().join("active"),
+                    true,
+                )
+                .unwrap();
+            }
+            let mut response = Response::new();
+            copy_move_work(&mut snapshot, &config, &mut response, method == "MOVE");
+            assert_eq!(
+                response.status_code,
+                Some(StatusCode::UNAUTHORIZED),
+                "{method}"
+            );
+            assert!(!fixture.path().join("private/target").exists());
+            assert_eq!(
+                fs::read(fixture.path().join("source")).unwrap(),
+                b"preserved source"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
