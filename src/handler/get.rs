@@ -51,21 +51,20 @@ pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response
             .await;
         }
         GetSnapshot::Directory => {
-            let mut work_request = super::read_snapshot::request(req);
-            let work_config = config.clone();
-            match config.spawn_blocking(move || {
-                let mut response = Response::new();
-                handle_get_dir(&mut work_request, &mut response, &work_config);
-                response
-            }) {
-                Some(job) => match job.await {
-                    Ok(response) => *res = response,
-                    Err(_) => {
-                        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-                    }
+            match super::read_snapshot::run_metadata(
+                req,
+                &config,
+                move |work_request, work_config, guard| {
+                    let mut response = Response::new();
+                    handle_get_dir(work_request, &mut response, work_config, guard);
+                    response
                 },
-                None => {
-                    res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+            )
+            .await
+            {
+                Ok(response) => *res = response,
+                Err(status) => {
+                    res.status_code(status);
                 }
             }
             crate::http_cache::unversioned_preconditions(req, res);
@@ -785,8 +784,12 @@ fn stream_file(res: &mut Response, mut file: tokio::fs::File, mut remaining: u64
     });
 }
 
-fn handle_get_dir(req: &mut Request, res: &mut Response, config: &AppConfig) {
-    let guard = crate::util::write_conditions::MUTATION_LOCK.blocking_lock();
+fn handle_get_dir(
+    req: &mut Request,
+    res: &mut Response,
+    config: &AppConfig,
+    guard: tokio::sync::MutexGuard<'static, ()>,
+) {
     if let Some(response) = crate::hoops::auth::check_auth_path(req, config, req.uri().path()) {
         *res = response;
         return;
@@ -1544,7 +1547,8 @@ mod snapshot_tests {
         }
         let response = tokio::task::spawn_blocking(move || {
             let mut response = Response::new();
-            handle_get_dir(&mut request, &mut response, &config);
+            let guard = crate::util::write_conditions::MUTATION_LOCK.blocking_lock();
+            handle_get_dir(&mut request, &mut response, &config, guard);
             response
         })
         .await

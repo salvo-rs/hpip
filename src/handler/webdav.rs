@@ -181,26 +181,30 @@ pub async fn handle_propfind(req: &mut Request, depot: &mut Depot, res: &mut Res
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
-    let work_config = config.clone();
-    let mut snapshot = Request::new();
-    *snapshot.uri_mut() = req.uri().clone();
-    *snapshot.method_mut() = req.method().clone();
-    *snapshot.headers_mut() = req.headers().clone();
-    *snapshot.remote_addr_mut() = req.remote_addr().clone();
-    let Some(job) = config.spawn_blocking(move || {
-        propfind_snapshot(&snapshot, &work_config, &url, &props, ua.as_deref(), depth)
-    }) else {
-        res.status_code(StatusCode::SERVICE_UNAVAILABLE);
-        return;
-    };
-    let result = match job.await {
+    let result = match super::read_snapshot::run_metadata(
+        req,
+        &config,
+        move |snapshot, work_config, guard| {
+            propfind_snapshot_with_guard(
+                snapshot,
+                work_config,
+                &url,
+                &props,
+                ua.as_deref(),
+                depth,
+                guard,
+            )
+        },
+    )
+    .await
+    {
         Ok(Ok(result)) => result,
         Ok(Err(response)) => {
             *res = *response;
             return;
         }
-        Err(_) => {
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        Err(status) => {
+            res.status_code(status);
             return;
         }
     };
@@ -238,6 +242,7 @@ pub async fn handle_propfind(req: &mut Request, depot: &mut Depot, res: &mut Res
 /// Body reception and worker scheduling can both outlive the initial namespace
 /// selection. Authorize and resolve again while constructing the bounded XML
 /// snapshot, then release the namespace before sending any response bytes.
+#[cfg(test)]
 fn propfind_snapshot(
     req: &Request,
     config: &AppConfig,
@@ -246,7 +251,26 @@ fn propfind_snapshot(
     ua: Option<&str>,
     depth: Depth,
 ) -> Result<Result<Vec<u8>, xml::writer::Error>, Box<Response>> {
-    let _guard = MUTATION_LOCK.blocking_lock();
+    propfind_snapshot_with_guard(
+        req,
+        config,
+        url,
+        props,
+        ua,
+        depth,
+        MUTATION_LOCK.blocking_lock(),
+    )
+}
+
+fn propfind_snapshot_with_guard(
+    req: &Request,
+    config: &AppConfig,
+    url: &str,
+    props: &PropfindVariant,
+    ua: Option<&str>,
+    depth: Depth,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+) -> Result<Result<Vec<u8>, xml::writer::Error>, Box<Response>> {
     let authority = if depth == Depth::Zero {
         crate::hoops::auth::check_auth_path(req, config, url)
     } else {

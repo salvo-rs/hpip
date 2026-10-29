@@ -23,31 +23,86 @@ pub(super) async fn run<R: Send + 'static>(
     config: &Arc<AppConfig>,
     work: impl FnOnce(&mut Request, &Arc<AppConfig>) -> R + Send + 'static,
 ) -> Result<R, StatusCode> {
-    let mut req = request(req);
-    let work_config = config.clone();
-    // Dropping the request future closes this channel, including while the
-    // blocking worker is waiting for an unrelated namespace transaction.
-    let (cancel_on_drop, cancelled) = tokio::sync::oneshot::channel::<()>();
-    let runtime = tokio::runtime::Handle::current();
-    let job = config
-        .spawn_read_snapshot(move || {
+    run_in_pool(
+        req,
+        config,
+        move |req, config, _guard| work(req, config),
+        std::time::Duration::from_secs(30),
+        SnapshotPool::Read,
+    )
+    .await
+}
+
+/// Metadata keeps its existing general-worker admission. The collector owns the
+/// namespace guard so it can release it before rendering or compression.
+pub(super) async fn run_metadata<R: Send + 'static>(
+    req: &Request,
+    config: &Arc<AppConfig>,
+    work: impl FnOnce(&mut Request, &Arc<AppConfig>, tokio::sync::MutexGuard<'static, ()>) -> R
+    + Send
+    + 'static,
+) -> Result<R, StatusCode> {
+    run_in_pool(
+        req,
+        config,
+        work,
+        std::time::Duration::from_secs(30),
+        SnapshotPool::Metadata,
+    )
+    .await
+}
+
+enum SnapshotPool {
+    Read,
+    Metadata,
+}
+
+async fn run_in_pool<R: Send + 'static>(
+    req: &Request,
+    config: &Arc<AppConfig>,
+    work: impl FnOnce(&mut Request, &Arc<AppConfig>, tokio::sync::MutexGuard<'static, ()>) -> R
+    + Send
+    + 'static,
+    timeout: std::time::Duration,
+    pool: SnapshotPool,
+) -> Result<R, StatusCode> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    tokio::time::timeout_at(deadline, async {
+        let mut req = request(req);
+        let work_config = config.clone();
+        // Dropping the request future closes this channel, including while the
+        // blocking worker is waiting for an unrelated namespace transaction.
+        let (cancel_on_drop, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let runtime = tokio::runtime::Handle::current();
+        let worker = move || {
             let guard = runtime.block_on(async {
                 tokio::select! {
                     biased;
                     _ = cancelled => None,
+                    _ = work_config.wait_for_shutdown() => None,
+                    _ = tokio::time::sleep_until(deadline) => None,
                     guard = MUTATION_LOCK.lock() => Some(guard),
                 }
             });
-            let Some(_guard) = guard else {
+            let Some(guard) = guard else {
                 return Err(StatusCode::SERVICE_UNAVAILABLE);
             };
-            Ok(work(&mut req, &work_config))
-        })
-        .await
+            if work_config.is_shutting_down() || tokio::time::Instant::now() >= deadline {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            Ok(work(&mut req, &work_config, guard))
+        };
+        let job = match pool {
+            SnapshotPool::Read => config.spawn_read_snapshot(worker).await,
+            SnapshotPool::Metadata => config.spawn_blocking(worker),
+        }
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let result = job.await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    drop(cancel_on_drop);
-    result
+        let result = job.await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        drop(cancel_on_drop);
+        result
+    })
+    .await
+    .unwrap_or(Err(StatusCode::SERVICE_UNAVAILABLE))
 }
 
 pub(super) struct OpenedFile {
@@ -96,7 +151,7 @@ impl OpenedFile {
 
 #[cfg(test)]
 mod tests {
-    use salvo::test::{ResponseExt, TestClient};
+    use salvo::test::{RequestBuilder, ResponseExt, TestClient};
 
     use super::*;
 
@@ -266,5 +321,203 @@ mod tests {
         let _guard = tokio::time::timeout(std::time::Duration::from_secs(2), MUTATION_LOCK.lock())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_an_admitted_snapshot_waiting_for_the_namespace() {
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &[]);
+        let guard = MUTATION_LOCK.lock().await;
+        let request_config = config.clone();
+        let mut request = tokio::spawn(async move {
+            let req = Request::new();
+            run(&req, &request_config, |_, _| ()).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while config.read_snapshot_jobs.available_permits() == 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let drain_config = config.clone();
+        let drain = tokio::spawn(async move { drain_config.drain_blocking_jobs().await });
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut request).await;
+        let stopped_without_namespace = result.is_ok();
+        if let Ok(result) = result {
+            assert_eq!(result.unwrap(), Err(StatusCode::SERVICE_UNAVAILABLE));
+        }
+        // Always release the writer and join admitted work, including when this
+        // regression is run against a version without shutdown cancellation.
+        drop(guard);
+        if !stopped_without_namespace {
+            request.await.unwrap().unwrap();
+        }
+        drain.await.unwrap();
+        assert!(
+            stopped_without_namespace,
+            "shutdown waited for an unrelated namespace writer"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_deadline_covers_the_admitted_namespace_wait() {
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &[]);
+        let _guard = MUTATION_LOCK.lock().await;
+        let request = Request::new();
+        for pool in [SnapshotPool::Read, SnapshotPool::Metadata] {
+            let semaphore = match pool {
+                SnapshotPool::Read => config.read_snapshot_jobs.clone(),
+                SnapshotPool::Metadata => config.blocking_jobs.clone(),
+            };
+            let result = run_in_pool(
+                &request,
+                &config,
+                |_, _, _| panic!("expired snapshot must not start"),
+                std::time::Duration::from_millis(20),
+                pool,
+            )
+            .await;
+            assert_eq!(result, Err(StatusCode::SERVICE_UNAVAILABLE));
+            let _permits = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                semaphore.acquire_many_owned(4),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_running_snapshots_remain_owned_until_the_worker_exits() {
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &[]);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, waiting) = std::sync::mpsc::channel();
+        let request_config = config.clone();
+        let request = tokio::spawn(async move {
+            let request = Request::new();
+            run(&request, &request_config, move |_, _| {
+                started.send(()).unwrap();
+                waiting.recv().unwrap();
+            })
+            .await
+        });
+        ready.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(config.read_snapshot_jobs.available_permits(), 3);
+        let drain_config = config.clone();
+        let drain = tokio::spawn(async move { drain_config.drain_blocking_jobs().await });
+        while !config.is_shutting_down() {
+            tokio::task::yield_now().await;
+        }
+        assert!(!drain.is_finished());
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delayed_json_and_propfind_waiters_release_capacity_on_cancel_or_shutdown() {
+        for propfind in [false, true] {
+            for shutdown in [false, true] {
+                let dir = crate::test_support::TestDir::new();
+                std::fs::write(dir.path().join("file.txt"), "fixture").unwrap();
+                let config = crate::test_support::config(dir.path(), &["-d"]);
+                let guard = MUTATION_LOCK.lock().await;
+                let request_config = config.clone();
+                let mut request = tokio::spawn(async move {
+                    if propfind {
+                        let service = Service::new(crate::build_router(request_config));
+                        RequestBuilder::new(
+                            "http://localhost/file.txt",
+                            "PROPFIND".parse().unwrap(),
+                        )
+                        .add_header("Depth", "0", true)
+                        .send(&service)
+                        .await
+                    } else {
+                        let mut request = TestClient::get("http://localhost/file.txt").build();
+                        let mut response = Response::new();
+                        crate::handler::rfsapi::handle_rfsapi_inner(
+                            &mut request,
+                            &mut response,
+                            &request_config,
+                        )
+                        .await;
+                        response
+                    }
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while config.blocking_jobs.available_permits() == 4 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                if shutdown {
+                    config.close_admission();
+                    let response =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), &mut request)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(response.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+                } else {
+                    request.abort();
+                    assert!(request.await.unwrap_err().is_cancelled());
+                }
+                let _permits = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    config.blocking_jobs.clone().acquire_many_owned(4),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                drop(guard);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn already_expired_snapshots_never_start_namespace_work() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &[]);
+        for pool in [SnapshotPool::Read, SnapshotPool::Metadata] {
+            let started = Arc::new(AtomicBool::new(false));
+            let marker = started.clone();
+            let request = Request::new();
+            let result = run_in_pool(
+                &request,
+                &config,
+                move |_, _, _| marker.store(true, Ordering::SeqCst),
+                std::time::Duration::ZERO,
+                pool,
+            )
+            .await;
+            assert_eq!(result, Err(StatusCode::SERVICE_UNAVAILABLE));
+            // Join all admitted work even if the response deadline fired first.
+            let _reads = config
+                .read_snapshot_jobs
+                .clone()
+                .acquire_many_owned(4)
+                .await
+                .unwrap();
+            let _metadata = config
+                .blocking_jobs
+                .clone()
+                .acquire_many_owned(4)
+                .await
+                .unwrap();
+            assert!(!started.load(Ordering::SeqCst));
+        }
     }
 }
