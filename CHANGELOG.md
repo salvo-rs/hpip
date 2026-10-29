@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.2
+
+### Reliability and HTTP behavior
+
+- Recheck request cancellation when a read or metadata snapshot receives the
+  namespace lock, before synchronous source work begins.
+- Use one cancellation-aware transaction runner for PUT preparation and
+  publication, DELETE, MKCOL, PROPPATCH, COPY, and MOVE. Queued transactions
+  stop on cancellation or shutdown and release their worker capacity without
+  applying delayed filesystem changes.
+- Preserve namespace ownership and worker capacity until an already started
+  synchronous transaction finishes, including when its request is cancelled.
+- Return 403 instead of 507 for directly retained InvalidInput and
+  PermissionDenied COPY/MOVE failures. Existing 412 precondition responses and
+  the fallback for other filesystem errors remain unchanged.
+
+### Build and distribution
+
+- Support recovery of an existing release tag from the current workflow while
+  pinning every validation, build, package, and release to the tagged source.
+- Verify published versions against the official Cargo sparse index, rejecting
+  malformed responses and network failures before attempting publication.
+- Keep Rust 1.99 as the minimum supported version; dependencies are unchanged.
+
+### Compatibility notes
+
+- Cancelling an already started synchronous transaction does not promise
+  rollback or interruption of OS filesystem calls.
+- Recursive copy errors aggregated into a generic error retain the existing
+  507 fallback; the new 403 classification covers directly retained error kinds.
+
+Previous release: [0.2.1](https://github.com/salvo-rs/hpip/releases/tag/v0.2.1).
+
 ## 0.2.1
 
 ### Reliability and security
