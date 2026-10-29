@@ -12,146 +12,22 @@ pub(crate) struct UnresolvedFileEncoding;
 #[handler]
 pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
-    if let Some(response) = crate::hoops::auth::check_auth(req, &config) {
-        *res = response;
-        res.body(salvo::http::ResBody::None);
-        return;
-    }
-    let segments: Vec<_> = req
-        .uri()
-        .path()
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
-    let (mut path, mut symlink, invalid) = resolve_path(
-        &config.hosted_directory.1,
-        &segments,
-        config.follow_symlinks,
-    );
-    if invalid {
-        res.status_code(StatusCode::BAD_REQUEST);
-        return;
-    }
-
-    // These GET representations inspect the original resource; extension and
-    // default-index selection applies only to ordinary file responses.
-    let representation = super::representation::select(req, &config, &path);
-    if representation == super::representation::Representation::NotAcceptable {
-        res.status_code(StatusCode::NOT_ACCEPTABLE);
-        return;
-    }
-    if representation == super::representation::Representation::Json {
-        res.status_code(
-            if !path.exists() || config.is_symlink_denied(symlink, &path) {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::OK
-            },
-        );
-        res.headers_mut()
-            .insert("content-type", "application/json".parse().unwrap());
-        crate::http_cache::unversioned_preconditions(req, res);
-        return;
-    }
-    if let super::representation::Representation::Archive(kind) = representation {
-        if let Some(response) =
-            crate::hoops::auth::check_tree_auth_async(req, &config, req.uri().path()).await
-        {
-            *res = response;
-            res.body(salvo::http::ResBody::None);
+    let opened = match super::read_snapshot::run(req, &config, select_head_snapshot).await {
+        Ok(Ok(opened)) => opened,
+        Ok(Err(mut response)) => {
+            response.body(salvo::http::ResBody::None);
+            *res = *response;
             return;
         }
-        if !path.exists() || config.is_symlink_denied(symlink, &path) {
-            res.status_code(StatusCode::NOT_FOUND);
+        Err(status) => {
+            res.status_code(status);
             return;
         }
-        res.status_code(StatusCode::OK);
-        res.headers_mut()
-            .insert("content-type", kind.default_mime().parse().unwrap());
-        crate::http_cache::unversioned_preconditions(req, res);
-        return;
-    }
-
-    if !path.exists()
-        && config.strip_extensions
-        && path.extension().is_none()
-        && let Some(candidate) = INDEX_EXTENSIONS
-            .iter()
-            .map(|ext| path.with_extension(ext))
-            .find(|p| p.is_file())
-    {
-        symlink |= is_symlink(&candidate);
-        let logical = crate::util::path::decoded_url_path(req.uri().path()).unwrap();
-        let logical = std::path::Path::new(&logical)
-            .with_extension(candidate.extension().unwrap_or_default());
-        if let Some(response) = crate::hoops::auth::check_decoded_auth(
-            req,
-            &config,
-            &logical.to_string_lossy().replace('\\', "/"),
-        ) {
-            *res = response;
-            res.body(salvo::http::ResBody::None);
-            return;
-        }
-        path = candidate;
-    }
-    if config.is_symlink_denied(symlink, &path) || !path.exists() {
-        res.status_code(StatusCode::NOT_FOUND);
-        return;
-    }
-    if path.is_dir() {
-        let index = super::get::index_file(&config, &path);
-        if let Some(index) = index {
-            let index_url = format!(
-                "{}/index.{}",
-                req.uri().path().trim_end_matches('/'),
-                index.extension().and_then(|ext| ext.to_str()).unwrap_or("")
-            );
-            if let Some(response) = crate::hoops::auth::check_auth_path(req, &config, &index_url) {
-                *res = response;
-                res.body(salvo::http::ResBody::None);
-                return;
-            }
-            if !req.uri().path().ends_with('/') {
-                res.status_code(StatusCode::SEE_OTHER);
-                res.headers_mut().insert(
-                    "location",
-                    format!("{}/", req.uri().path()).parse().unwrap(),
-                );
-                return;
-            }
-            path = index;
-        } else {
-            res.status_code(if config.generate_listings {
-                StatusCode::OK
-            } else {
-                StatusCode::NOT_FOUND
-            });
-            res.headers_mut()
-                .insert("content-type", "text/html; charset=utf-8".parse().unwrap());
-            if config.generate_listings
-                && let Some(encoding) = crate::encoding::request_accept_encoding(req)
-                    .and_then(|accept| crate::encoding::response_encoding(&accept))
-            {
-                // Generated GET listings always use the selected coding; no
-                // directory traversal or compression work is needed for HEAD.
-                res.headers_mut().insert(
-                    "content-encoding",
-                    crate::encoding::encoding_name(encoding).parse().unwrap(),
-                );
-            }
-            crate::http_cache::unversioned_preconditions(req, res);
-            return;
-        }
-    }
-    let Ok(source) = tokio::fs::File::open(&path).await else {
-        res.status_code(StatusCode::NOT_FOUND);
-        return;
     };
-    let Ok(metadata) = source.metadata().await else {
-        res.status_code(StatusCode::NOT_FOUND);
-        return;
-    };
+    let path = opened.path;
+    let mime_type = opened.mime;
+    let metadata = opened.metadata;
+    let source = tokio::fs::File::from_std(opened.source);
     let etag = match file_etag(&metadata, &source) {
         Ok(etag) => etag,
         Err(_) => {
@@ -232,12 +108,8 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
         return;
     }
     res.status_code(StatusCode::OK);
-    res.headers_mut().insert(
-        "content-type",
-        guess_mime_type(&path, &config.mime_type_overrides)
-            .parse()
-            .unwrap(),
-    );
+    res.headers_mut()
+        .insert("content-type", mime_type.parse().unwrap());
     if let Some(length) = length {
         res.headers_mut()
             .insert("content-length", length.to_string().parse().unwrap());
@@ -257,6 +129,161 @@ pub async fn handle_head(req: &mut Request, depot: &mut Depot, res: &mut Respons
         .insert("accept-ranges", "bytes".parse().unwrap());
     res.headers_mut()
         .insert("server", USER_AGENT.parse().unwrap());
+}
+
+/// Called while the namespace lock protects authorization, selection and open.
+fn select_head_snapshot(
+    req: &mut Request,
+    config: &Arc<AppConfig>,
+) -> Result<super::read_snapshot::OpenedFile, Box<Response>> {
+    let mut res = Response::new();
+    if let Some(response) = crate::hoops::auth::check_auth(req, config) {
+        res = response;
+        res.body(salvo::http::ResBody::None);
+        return Err(Box::new(res));
+    }
+    let segments: Vec<_> = req
+        .uri()
+        .path()
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let (mut path, mut symlink, invalid) = resolve_path(
+        &config.hosted_directory.1,
+        &segments,
+        config.follow_symlinks,
+    );
+    if invalid {
+        res.status_code(StatusCode::BAD_REQUEST);
+        return Err(Box::new(res));
+    }
+
+    // These GET representations inspect the original resource; extension and
+    // default-index selection applies only to ordinary file responses.
+    let representation = super::representation::select(req, config, &path);
+    if representation == super::representation::Representation::NotAcceptable {
+        res.status_code(StatusCode::NOT_ACCEPTABLE);
+        return Err(Box::new(res));
+    }
+    if representation == super::representation::Representation::Json {
+        res.status_code(
+            if !path.exists() || config.is_symlink_denied(symlink, &path) {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::OK
+            },
+        );
+        res.headers_mut()
+            .insert("content-type", "application/json".parse().unwrap());
+        crate::http_cache::unversioned_preconditions(req, &mut res);
+        return Err(Box::new(res));
+    }
+    if let super::representation::Representation::Archive(kind) = representation {
+        // Descendant-policy walks keep their existing general-worker admission,
+        // but run inline in this snapshot instead of nesting a blocking job.
+        let _authorization = if config.path_auth_data.is_empty() {
+            None
+        } else {
+            match config.blocking_jobs.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+                    return Err(Box::new(res));
+                }
+            }
+        };
+        if let Some(response) = crate::hoops::auth::check_tree_auth(req, config, req.uri().path()) {
+            res = response;
+            res.body(salvo::http::ResBody::None);
+            return Err(Box::new(res));
+        }
+        if !path.exists() || config.is_symlink_denied(symlink, &path) {
+            res.status_code(StatusCode::NOT_FOUND);
+            return Err(Box::new(res));
+        }
+        res.status_code(StatusCode::OK);
+        res.headers_mut()
+            .insert("content-type", kind.default_mime().parse().unwrap());
+        crate::http_cache::unversioned_preconditions(req, &mut res);
+        return Err(Box::new(res));
+    }
+
+    if !path.exists()
+        && config.strip_extensions
+        && path.extension().is_none()
+        && let Some(candidate) = INDEX_EXTENSIONS
+            .iter()
+            .map(|ext| path.with_extension(ext))
+            .find(|p| p.is_file())
+    {
+        symlink |= is_symlink(&candidate);
+        let logical = crate::util::path::decoded_url_path(req.uri().path()).unwrap();
+        let logical = std::path::Path::new(&logical)
+            .with_extension(candidate.extension().unwrap_or_default());
+        if let Some(response) = crate::hoops::auth::check_decoded_auth(
+            req,
+            config,
+            &logical.to_string_lossy().replace('\\', "/"),
+        ) {
+            res = response;
+            res.body(salvo::http::ResBody::None);
+            return Err(Box::new(res));
+        }
+        path = candidate;
+    }
+    if config.is_symlink_denied(symlink, &path) || !path.exists() {
+        res.status_code(StatusCode::NOT_FOUND);
+        return Err(Box::new(res));
+    }
+    if path.is_dir() {
+        let index = super::get::index_file(config, &path);
+        if let Some(index) = index {
+            let index_url = format!(
+                "{}/index.{}",
+                req.uri().path().trim_end_matches('/'),
+                index.extension().and_then(|ext| ext.to_str()).unwrap_or("")
+            );
+            if let Some(response) = crate::hoops::auth::check_auth_path(req, config, &index_url) {
+                res = response;
+                res.body(salvo::http::ResBody::None);
+                return Err(Box::new(res));
+            }
+            if !req.uri().path().ends_with('/') {
+                res.status_code(StatusCode::SEE_OTHER);
+                res.headers_mut().insert(
+                    "location",
+                    format!("{}/", req.uri().path()).parse().unwrap(),
+                );
+                return Err(Box::new(res));
+            }
+            path = index;
+        } else {
+            res.status_code(if config.generate_listings {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            });
+            res.headers_mut()
+                .insert("content-type", "text/html; charset=utf-8".parse().unwrap());
+            if config.generate_listings
+                && let Some(encoding) = crate::encoding::request_accept_encoding(req)
+                    .and_then(|accept| crate::encoding::response_encoding(&accept))
+            {
+                // Generated GET listings always use the selected coding; no
+                // directory traversal or compression work is needed for HEAD.
+                res.headers_mut().insert(
+                    "content-encoding",
+                    crate::encoding::encoding_name(encoding).parse().unwrap(),
+                );
+            }
+            crate::http_cache::unversioned_preconditions(req, &mut res);
+            return Err(Box::new(res));
+        }
+    }
+    super::read_snapshot::OpenedFile::open(config, &path).map_err(|_| {
+        res.status_code(StatusCode::NOT_FOUND);
+        Box::new(res)
+    })
 }
 
 #[cfg(test)]

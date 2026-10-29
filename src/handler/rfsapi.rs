@@ -63,12 +63,14 @@ pub async fn handle_rfsapi(req: &mut Request, depot: &mut Depot, res: &mut Respo
 
 /// Inner implementation that can be called directly with a config reference.
 pub async fn handle_rfsapi_inner(req: &mut Request, res: &mut Response, config: &Arc<AppConfig>) {
-    let uri = req.uri().clone();
+    let mut request = Request::new();
+    *request.uri_mut() = req.uri().clone();
+    *request.method_mut() = req.method().clone();
+    *request.headers_mut() = req.headers().clone();
+    *request.remote_addr_mut() = req.remote_addr().clone();
     let remote = req.remote_addr().to_string();
     let work_config = config.clone();
     let Some(job) = config.spawn_blocking(move || {
-        let mut request = Request::new();
-        *request.uri_mut() = uri;
         let mut response = Response::new();
         handle_rfsapi_snapshot(&mut request, &mut response, &work_config, &remote);
         response
@@ -85,6 +87,11 @@ pub async fn handle_rfsapi_inner(req: &mut Request, res: &mut Response, config: 
 }
 
 fn handle_rfsapi_snapshot(req: &mut Request, res: &mut Response, config: &AppConfig, remote: &str) {
+    let guard = crate::util::write_conditions::MUTATION_LOCK.blocking_lock();
+    if let Some(response) = crate::hoops::auth::check_auth_path(req, config, req.uri().path()) {
+        *res = response;
+        return;
+    }
     let url_path_raw = req.uri().path().to_string();
     let segments: Vec<&str> = url_path_raw.split('/').filter(|s| !s.is_empty()).collect();
     let (req_p, symlink, url_err) = resolve_path(
@@ -119,36 +126,13 @@ fn handle_rfsapi_snapshot(req: &mut Request, res: &mut Response, config: &AppCon
 
     let is_file = is_actually_file(&metadata.file_type(), &req_p);
 
-    if is_file {
-        handle_get_raw_fs_file(req, res, config, &req_p, remote);
+    let data = if is_file {
+        Some(raw_fs_file(config, &req_p, remote))
     } else {
-        handle_get_raw_fs_dir(req, res, config, &req_p, remote, &url_path_raw);
-    }
-}
-
-fn handle_get_raw_fs_file(
-    _req: &Request,
-    res: &mut Response,
-    config: &AppConfig,
-    req_p: &Path,
-    remote: &str,
-) {
-    log_msg(
-        config.log,
-        &format!(
-            "{} was served metadata for file {}",
-            remote,
-            req_p.display()
-        ),
-    );
-
-    let data = FilesetData {
-        writes_supported: config.writes_temp_dir.is_some(),
-        is_root: false,
-        is_file: true,
-        files: vec![get_raw_fs_metadata(req_p)],
+        raw_fs_dir(res, config, &req_p, remote, &url_path_raw)
     };
-
+    drop(guard);
+    let Some(data) = data else { return };
     res.status_code(StatusCode::OK);
     res.headers_mut().insert(
         salvo::http::header::CONTENT_TYPE,
@@ -159,14 +143,31 @@ fn handle_get_raw_fs_file(
     render_snapshot(res, &data);
 }
 
-fn handle_get_raw_fs_dir(
-    _req: &Request,
+fn raw_fs_file(config: &AppConfig, req_p: &Path, remote: &str) -> FilesetData {
+    log_msg(
+        config.log,
+        &format!(
+            "{} was served metadata for file {}",
+            remote,
+            req_p.display()
+        ),
+    );
+
+    FilesetData {
+        writes_supported: config.writes_temp_dir.is_some(),
+        is_root: false,
+        is_file: true,
+        files: vec![get_raw_fs_metadata(req_p)],
+    }
+}
+
+fn raw_fs_dir(
     res: &mut Response,
     config: &AppConfig,
     req_p: &Path,
     remote: &str,
     url_path_raw: &str,
-) {
+) -> Option<FilesetData> {
     log_msg(
         config.log,
         &format!(
@@ -189,7 +190,7 @@ fn handle_get_raw_fs_dir(
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             });
-            return;
+            return None;
         }
     };
     let files: Vec<RawFileData> = entries
@@ -220,21 +221,12 @@ fn handle_get_raw_fs_dir(
         })
         .collect();
 
-    let data = FilesetData {
+    Some(FilesetData {
         writes_supported: config.writes_temp_dir.is_some(),
         is_root,
         is_file: false,
         files,
-    };
-
-    res.status_code(StatusCode::OK);
-    res.headers_mut().insert(
-        salvo::http::header::CONTENT_TYPE,
-        "application/json".parse().unwrap(),
-    );
-    res.headers_mut()
-        .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-    render_snapshot(res, &data);
+    })
 }
 
 fn render_snapshot(res: &mut Response, data: &FilesetData) {
@@ -253,9 +245,61 @@ fn render_snapshot(res: &mut Response, data: &FilesetData) {
 }
 #[cfg(test)]
 mod snapshot_tests {
-    use salvo::test::{RequestBuilder, TestClient};
+    use salvo::test::{RequestBuilder, ResponseExt, TestClient};
 
     use super::*;
+
+    #[tokio::test]
+    async fn snapshot_worker_rechecks_authority_and_preserves_supplied_credentials() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::write(dir.path().join("protected.txt"), "fixture").unwrap();
+        let config =
+            crate::test_support::config(dir.path(), &["--path-auth", "protected.txt=user:pass"]);
+        for authorized in [false, true] {
+            let mut request = TestClient::get("http://localhost/protected.txt").build();
+            if authorized {
+                request
+                    .headers_mut()
+                    .insert("authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
+            }
+            let mut response = Response::new();
+            handle_rfsapi_inner(&mut request, &mut response, &config).await;
+            assert_eq!(
+                response.status_code,
+                Some(if authorized {
+                    StatusCode::OK
+                } else {
+                    StatusCode::UNAUTHORIZED
+                })
+            );
+            let body = response.take_string().await.unwrap();
+            assert_eq!(body.contains("protected.txt"), authorized);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delayed_metadata_snapshot_uses_current_namespace_authority() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::create_dir(dir.path().join("public")).unwrap();
+        std::fs::create_dir(dir.path().join("private")).unwrap();
+        std::fs::write(dir.path().join("private/member.txt"), "fixture").unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink("public", &alias).unwrap();
+        let config =
+            crate::test_support::config(dir.path(), &["-l", "--path-auth", "private=user:pass"]);
+        let mut request = TestClient::get("http://localhost/alias/").build();
+        assert!(crate::hoops::auth::check_auth(&request, &config).is_none());
+        {
+            let _guard = crate::util::write_conditions::MUTATION_LOCK.lock().await;
+            std::fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink("private", &alias).unwrap();
+        }
+        let mut response = Response::new();
+        handle_rfsapi_inner(&mut request, &mut response, &config).await;
+        assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+        assert!(!response.take_string().await.unwrap().contains("member.txt"));
+    }
 
     #[tokio::test]
     async fn metadata_routes_share_bounded_admission_and_resume_when_capacity_returns() {

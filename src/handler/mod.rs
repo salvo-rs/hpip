@@ -4,6 +4,7 @@ pub mod get;
 pub mod head;
 pub mod options_handler;
 pub mod put;
+mod read_snapshot;
 mod representation;
 pub mod rfsapi;
 pub mod trace;

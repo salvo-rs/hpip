@@ -11,143 +11,164 @@ use crate::encoding::*;
 use crate::options::WebDavLevel;
 use crate::util::*;
 
+enum GetSnapshot {
+    Response(Response),
+    Json,
+    Archive(super::archive::ArchiveType),
+    File(super::read_snapshot::OpenedFile),
+    Directory,
+}
+
 #[handler]
 pub async fn handle_get(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let config = depot.get_typed::<Arc<AppConfig>>().unwrap().clone();
-
-    if let Some(resp) = crate::hoops::auth::check_auth(req, &config) {
-        *res = resp;
-        return;
-    }
-
-    let url_path_raw = req.uri().path().to_string();
-    let decoded_path = percent_encoding::percent_decode_str(&url_path_raw)
-        .decode_utf8()
-        .map(|s| s.to_string());
-    let Ok(url_path_str) = decoded_path else {
-        handle_invalid_url(req, res, &config);
-        return;
+    let snapshot = match super::read_snapshot::run(req, &config, select_get_snapshot).await {
+        Ok(snapshot) => snapshot,
+        Err(status) => {
+            res.status_code(status);
+            return;
+        }
     };
+    match snapshot {
+        GetSnapshot::Response(response) => *res = response,
+        GetSnapshot::Json => {
+            super::rfsapi::handle_rfsapi_inner(req, res, &config).await;
+            crate::http_cache::unversioned_preconditions(req, res);
+        }
+        GetSnapshot::Archive(kind) => {
+            super::archive::serve_archive_from_get(req, res, &config, kind).await;
+        }
+        GetSnapshot::File(opened) => {
+            serve_open_file(
+                req,
+                res,
+                &config,
+                &opened.path,
+                tokio::fs::File::from_std(opened.source),
+                opened.mime,
+                false,
+            )
+            .await;
+        }
+        GetSnapshot::Directory => {
+            let mut work_request = super::read_snapshot::request(req);
+            let work_config = config.clone();
+            match config.spawn_blocking(move || {
+                let mut response = Response::new();
+                handle_get_dir(&mut work_request, &mut response, &work_config);
+                response
+            }) {
+                Some(job) => match job.await {
+                    Ok(response) => *res = response,
+                    Err(_) => {
+                        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                    }
+                },
+                None => {
+                    res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+                }
+            }
+            crate::http_cache::unversioned_preconditions(req, res);
+        }
+    }
+}
 
-    let segments: Vec<&str> = url_path_raw.split('/').filter(|s| !s.is_empty()).collect();
-
-    let (mut req_p, mut symlink, url_err) = resolve_path(
+/// Called within the namespace transaction, before any owned source escapes.
+fn select_get_snapshot(req: &mut Request, config: &Arc<AppConfig>) -> GetSnapshot {
+    let mut res = Response::new();
+    if let Some(response) = crate::hoops::auth::check_auth(req, config) {
+        return GetSnapshot::Response(response);
+    }
+    let url = req.uri().path().to_owned();
+    let Ok(decoded) = percent_encoding::percent_decode_str(&url).decode_utf8() else {
+        handle_invalid_url(req, &mut res, config);
+        return GetSnapshot::Response(res);
+    };
+    let segments: Vec<_> = url.split('/').filter(|s| !s.is_empty()).collect();
+    let (mut path, mut symlink, invalid) = resolve_path(
         &config.hosted_directory.1,
         &segments,
         config.follow_symlinks,
     );
-
-    if url_err {
-        handle_invalid_url(req, res, &config);
-        return;
+    if invalid {
+        handle_invalid_url(req, &mut res, config);
+        return GetSnapshot::Response(res);
     }
-
-    match super::representation::select(req, &config, &req_p) {
-        super::representation::Representation::Json => {
-            super::rfsapi::handle_rfsapi_inner(req, res, &config).await;
-            crate::http_cache::unversioned_preconditions(req, res);
-            return;
-        }
-        super::representation::Representation::Archive(kind) => {
-            super::archive::serve_archive_from_get(req, res, &config, kind).await;
-            return;
-        }
+    match super::representation::select(req, config, &path) {
+        super::representation::Representation::Json => return GetSnapshot::Json,
+        super::representation::Representation::Archive(kind) => return GetSnapshot::Archive(kind),
         super::representation::Representation::NotAcceptable => {
             res.status_code(StatusCode::NOT_ACCEPTABLE);
-            return;
+            return GetSnapshot::Response(res);
         }
         super::representation::Representation::File => {}
     }
-
-    // Strip extensions: if file doesn't exist and has no extension, try with index extensions
-    if !req_p.exists()
-        && req_p.extension().is_none()
+    if !path.exists()
+        && path.extension().is_none()
         && config.strip_extensions
-        && let Some(rp) = INDEX_EXTENSIONS
+        && let Some(candidate) = INDEX_EXTENSIONS
             .iter()
-            .map(|ext| req_p.with_extension(ext))
-            .find(|rp| rp.is_file())
+            .map(|extension| path.with_extension(extension))
+            .find(|p| p.is_file())
     {
-        symlink |= is_symlink(&rp);
-        let logical = crate::util::path::decoded_url_path(&url_path_raw).unwrap();
-        let logical = Path::new(&logical).with_extension(rp.extension().unwrap_or_default());
+        symlink |= is_symlink(&candidate);
+        let logical = crate::util::path::decoded_url_path(&url).unwrap();
+        let logical = Path::new(&logical).with_extension(candidate.extension().unwrap_or_default());
         if let Some(response) = crate::hoops::auth::check_decoded_auth(
             req,
-            &config,
+            config,
             &logical.to_string_lossy().replace('\\', "/"),
         ) {
-            *res = response;
-            return;
+            return GetSnapshot::Response(response);
         }
-        req_p = rp;
+        path = candidate;
     }
-
-    if !req_p.exists() || config.is_symlink_denied(symlink, &req_p) {
-        handle_nonexistent_get(req, res, &config, &req_p, &url_path_str);
-        return;
+    if !path.exists() || config.is_symlink_denied(symlink, &path) {
+        handle_nonexistent_get(req, &mut res, config, &path, &decoded);
+        return GetSnapshot::Response(res);
     }
-
-    let metadata = match req_p.metadata() {
-        Ok(m) => m,
-        Err(_) => {
-            handle_nonexistent_get(req, res, &config, &req_p, &url_path_str);
-            return;
-        }
+    let Ok(metadata) = path.metadata() else {
+        handle_nonexistent_get(req, &mut res, config, &path, &decoded);
+        return GetSnapshot::Response(res);
     };
-
-    let is_file = is_actually_file(&metadata.file_type(), &req_p);
-
-    if is_file {
-        handle_get_file(req, res, &config, &req_p, false).await;
-    } else {
-        if let Some(index) = index_file(&config, &req_p) {
-            let index_url = format!(
-                "{}/index.{}",
-                url_path_raw.trim_end_matches('/'),
-                index
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .unwrap_or("")
-            );
-            if let Some(response) = crate::hoops::auth::check_auth_path(req, &config, &index_url) {
-                *res = response;
-                return;
-            }
-            if !url_path_raw.ends_with('/') {
-                res.status_code(StatusCode::SEE_OTHER);
-                res.headers_mut()
-                    .insert("location", format!("{url_path_raw}/").parse().unwrap());
-                return;
-            }
-            handle_get_file(req, res, &config, &index, false).await;
-            return;
+    if !is_actually_file(&metadata.file_type(), &path) {
+        let Some(index) = index_file(config, &path) else {
+            return GetSnapshot::Directory;
+        };
+        let index_url = format!(
+            "{}/index.{}",
+            url.trim_end_matches('/'),
+            index
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("")
+        );
+        if let Some(response) = crate::hoops::auth::check_auth_path(req, config, &index_url) {
+            return GetSnapshot::Response(response);
         }
-        let mut work_request = Request::new();
-        *work_request.uri_mut() = req.uri().clone();
-        *work_request.headers_mut() = req.headers().clone();
-        let work_config = config.clone();
-        match config.spawn_blocking(move || {
-            let mut response = Response::new();
-            handle_get_dir(
-                &mut work_request,
-                &mut response,
-                &work_config,
-                &req_p,
-                &url_path_str,
-            );
-            response
-        }) {
-            Some(job) => match job.await {
-                Ok(response) => *res = response,
-                Err(_) => {
-                    res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-                }
-            },
-            None => {
-                res.status_code(StatusCode::SERVICE_UNAVAILABLE);
-            }
+        if !url.ends_with('/') {
+            res.status_code(StatusCode::SEE_OTHER);
+            res.headers_mut()
+                .insert("location", format!("{url}/").parse().unwrap());
+            return GetSnapshot::Response(res);
         }
-        crate::http_cache::unversioned_preconditions(req, res);
+        path = index;
+    }
+    match super::read_snapshot::OpenedFile::open(config, &path) {
+        Ok(opened) => GetSnapshot::File(opened),
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                res.status_code(StatusCode::FORBIDDEN);
+                res.render(Text::Html(error_html_text(
+                    "403 Forbidden",
+                    format!("Can't access {}.", path.display()),
+                    "",
+                )));
+            } else {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            GetSnapshot::Response(res)
+        }
     }
 }
 
@@ -206,26 +227,22 @@ fn handle_nonexistent_get(
     // Try 404 fallback file
     if let Some(ref try_404) = config.try_404
         && try_404.metadata().map(|m| !m.is_dir()).unwrap_or(false)
+        && let Ok(opened) = super::read_snapshot::OpenedFile::open(config, try_404)
     {
-        let mime_type = guess_mime_type(try_404, &config.mime_type_overrides);
-        if let Ok(file) = std::fs::File::open(try_404)
-            && let Ok(metadata) = file.metadata()
-        {
-            res.status_code(StatusCode::NOT_FOUND);
-            res.headers_mut().insert(
-                salvo::http::header::CONTENT_TYPE,
-                mime_type.parse().unwrap(),
-            );
-            res.headers_mut()
-                .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
-            let length = metadata.len();
-            res.headers_mut().insert(
-                salvo::http::header::CONTENT_LENGTH,
-                length.to_string().parse().unwrap(),
-            );
-            stream_file(res, tokio::fs::File::from_std(file), length);
-            return;
-        }
+        res.status_code(StatusCode::NOT_FOUND);
+        res.headers_mut().insert(
+            salvo::http::header::CONTENT_TYPE,
+            opened.mime.parse().unwrap(),
+        );
+        res.headers_mut()
+            .insert(salvo::http::header::SERVER, USER_AGENT.parse().unwrap());
+        let length = opened.metadata.len();
+        res.headers_mut().insert(
+            salvo::http::header::CONTENT_LENGTH,
+            length.to_string().parse().unwrap(),
+        );
+        stream_file(res, tokio::fs::File::from_std(opened.source), length);
+        return;
     }
 
     let body = error_html(
@@ -246,42 +263,15 @@ fn handle_nonexistent_get(
     res.render(Text::Html(body));
 }
 
-async fn handle_get_file(
-    req: &mut Request,
-    res: &mut Response,
-    config: &Arc<AppConfig>,
-    req_p: &Path,
-    is_404: bool,
-) {
-    let file = match tokio::fs::File::open(req_p).await {
-        Ok(file) => file,
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                res.status_code(StatusCode::FORBIDDEN);
-                res.render(Text::Html(error_html_text(
-                    "403 Forbidden",
-                    format!("Can't access {}.", req_p.display()),
-                    "",
-                )));
-            } else {
-                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-            return;
-        }
-    };
-
-    serve_open_file(req, res, config, req_p, file, is_404).await;
-}
-
 async fn serve_open_file(
     req: &mut Request,
     res: &mut Response,
     config: &Arc<AppConfig>,
     req_p: &Path,
     mut file: tokio::fs::File,
+    mime_type: String,
     is_404: bool,
 ) {
-    let mime_type = guess_mime_type(req_p, &config.mime_type_overrides);
     let remote = req.remote_addr().to_string();
 
     let metadata = match file.metadata().await {
@@ -336,7 +326,16 @@ async fn serve_open_file(
             if crate::http_cache::preconditions(req, res, Some(&tag), modified) {
                 return;
             }
-            handle_get_file_range(req, res, config, req_p, file, metadata, &range).await;
+            handle_get_file_range(
+                req,
+                res,
+                config,
+                req_p,
+                file,
+                (metadata, &mime_type),
+                &range,
+            )
+            .await;
             return;
         }
     }
@@ -661,11 +660,11 @@ async fn handle_get_file_range(
     config: &AppConfig,
     req_p: &Path,
     mut file: tokio::fs::File,
-    metadata: std::fs::Metadata,
+    representation: (std::fs::Metadata, &str),
     range_str: &str,
 ) {
+    let (metadata, mime_type) = representation;
     let remote = req.remote_addr().to_string();
-    let mime_type = guess_mime_type(req_p, &config.mime_type_overrides);
     let flen = file_length(&metadata, req_p);
     let etag = match file_etag(&metadata, &file) {
         Ok(etag) => etag,
@@ -786,19 +785,32 @@ fn stream_file(res: &mut Response, mut file: tokio::fs::File, mut remaining: u64
     });
 }
 
-fn handle_get_dir(
-    req: &mut Request,
-    res: &mut Response,
-    config: &AppConfig,
-    req_p: &Path,
-    url_path: &str,
-) {
-    if !config.generate_listings {
-        handle_nonexistent_get(req, res, config, req_p, url_path);
+fn handle_get_dir(req: &mut Request, res: &mut Response, config: &AppConfig) {
+    let guard = crate::util::write_conditions::MUTATION_LOCK.blocking_lock();
+    if let Some(response) = crate::hoops::auth::check_auth_path(req, config, req.uri().path()) {
+        *res = response;
         return;
     }
-
-    handle_dir_listing(req, res, config, req_p, url_path);
+    let url = req.uri().path().to_owned();
+    let Ok(decoded) = percent_encoding::percent_decode_str(&url).decode_utf8() else {
+        handle_invalid_url(req, res, config);
+        return;
+    };
+    let segments: Vec<_> = url.split('/').filter(|s| !s.is_empty()).collect();
+    let (path, symlink, invalid) = resolve_path(
+        &config.hosted_directory.1,
+        &segments,
+        config.follow_symlinks,
+    );
+    if invalid {
+        handle_invalid_url(req, res, config);
+        return;
+    }
+    if !path.is_dir() || config.is_symlink_denied(symlink, &path) || !config.generate_listings {
+        handle_nonexistent_get(req, res, config, &path, &decoded);
+        return;
+    }
+    handle_dir_listing(req, res, config, &path, &decoded, guard);
 }
 
 fn handle_dir_listing(
@@ -807,6 +819,7 @@ fn handle_dir_listing(
     config: &AppConfig,
     req_p: &Path,
     url_path: &str,
+    guard: tokio::sync::MutexGuard<'_, ()>,
 ) {
     let remote = req.remote_addr().to_string();
     let is_root = url_path == "/";
@@ -825,6 +838,7 @@ fn handle_dir_listing(
         ),
     );
 
+    let parent_modified = (!is_root).then(|| file_time_modified_p(req_p.parent().unwrap_or(req_p)));
     let parent_f = |out: &mut Vec<u8>| {
         if !is_root {
             let mut parentpath = relpath_escaped.as_bytes();
@@ -834,7 +848,7 @@ fn handle_dir_listing(
             while parentpath.last() != Some(&b'/') {
                 parentpath = &parentpath[0..parentpath.len() - 1];
             }
-            let modified = file_time_modified_p(req_p.parent().unwrap_or(req_p));
+            let modified = parent_modified.unwrap();
             let _ = write!(
                 out,
                 "<tr id=\"..\"><td><a href=\"{}\" tabindex=\"-1\" class=\"back_arrow_icon\"></a></td> <td><a \
@@ -875,6 +889,8 @@ fn handle_dir_listing(
             return;
         }
     };
+    // All path-based reads are complete; rendering and compression need no namespace lock.
+    drop(guard);
     let list_f = |out: &mut Vec<u8>| out.extend_from_slice(&rows);
 
     let body = directory_listing_html(
@@ -1504,6 +1520,38 @@ mod snapshot_tests {
 
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delayed_listing_snapshot_rechecks_the_current_directory_authority() {
+        let dir = crate::test_support::TestDir::new();
+        for name in ["public", "private"] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+        }
+        std::fs::write(dir.path().join("private/member.txt"), "fixture").unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink("public", &alias).unwrap();
+        let config =
+            crate::test_support::config(dir.path(), &["-l", "--path-auth", "private=user:pass"]);
+        let mut request = TestClient::get("http://localhost/alias/").build();
+        {
+            let _guard = crate::util::write_conditions::MUTATION_LOCK.lock().await;
+            assert!(matches!(
+                select_get_snapshot(&mut request, &config),
+                GetSnapshot::Directory
+            ));
+            std::fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink("private", &alias).unwrap();
+        }
+        let response = tokio::task::spawn_blocking(move || {
+            let mut response = Response::new();
+            handle_get_dir(&mut request, &mut response, &config);
+            response
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+    }
+
     #[tokio::test]
     async fn full_and_range_headers_and_bytes_use_the_opened_version() {
         let dir = crate::test_support::TestDir::new();
@@ -1533,7 +1581,16 @@ mod snapshot_tests {
                     .insert("if-range", tag.parse().unwrap());
             }
             let mut response = Response::new();
-            serve_open_file(&mut request, &mut response, &config, &path, opened, false).await;
+            serve_open_file(
+                &mut request,
+                &mut response,
+                &config,
+                &path,
+                opened,
+                "text/plain".into(),
+                false,
+            )
+            .await;
             assert_eq!(response.headers()["etag"], tag);
             let expected: &[u8] = if range.is_some() {
                 b"rigi"
