@@ -1,6 +1,4 @@
-use std::path::Path;
-#[cfg(any(not(unix), test))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,10 +13,65 @@ use crate::util::*;
 
 #[derive(Debug)]
 enum UploadError {
+    Rejected(Box<Response>),
     PreconditionFailed,
     TooLarge,
     BodyRead(std::io::Error),
     Io(std::io::Error),
+}
+
+struct UploadAuthority {
+    request: Request,
+    config: Arc<AppConfig>,
+}
+
+struct PreparedUpload {
+    pending: PendingUpload,
+    file: tokio::fs::File,
+    target: UploadTarget,
+}
+
+enum UploadTarget {
+    Request(Box<UploadAuthority>),
+    #[cfg(test)]
+    Filesystem(PathBuf),
+}
+
+impl UploadAuthority {
+    /// Call while holding MUTATION_LOCK, both before preparing parents and
+    /// immediately before publishing. A previously resolved path is not authority.
+    fn current_path(&self) -> Result<PathBuf, UploadError> {
+        if let Some(response) = crate::hoops::auth::check_auth(&self.request, &self.config) {
+            return Err(UploadError::Rejected(Box::new(response)));
+        }
+        let segments: Vec<_> = self
+            .request
+            .uri()
+            .path()
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        let (path, symlink, invalid) = resolve_path(
+            &self.config.hosted_directory.1,
+            &segments,
+            self.config.follow_symlinks,
+        );
+        let status = if invalid || detect_file_as_dir(&path) {
+            Some(StatusCode::BAD_REQUEST)
+        } else if self.config.is_symlink_denied_nonexistent(symlink, &path) {
+            Some(StatusCode::NOT_FOUND)
+        } else if path.is_dir() {
+            Some(StatusCode::METHOD_NOT_ALLOWED)
+        } else {
+            None
+        };
+        if let Some(status) = status {
+            let mut response = Response::new();
+            response.status_code(status);
+            return Err(UploadError::Rejected(Box::new(response)));
+        }
+        Ok(path)
+    }
 }
 
 impl From<std::io::Error> for UploadError {
@@ -158,25 +211,40 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
 
     // Reject failed conditions before creating any parent directory. Publication
     // still rechecks them after the request body has been staged completely.
-    let prepare_path = req_p.clone();
+    let mut snapshot = Request::new();
+    *snapshot.uri_mut() = req.uri().clone();
+    *snapshot.method_mut() = req.method().clone();
+    *snapshot.headers_mut() = req.headers().clone();
+    *snapshot.remote_addr_mut() = req.remote_addr().clone();
+    let authority = UploadAuthority {
+        request: snapshot,
+        config: config.clone(),
+    };
     let prepare_conditions = conditions.clone();
     let Some(preparation) = config.spawn_blocking(move || {
         let _guard = MUTATION_LOCK.blocking_lock();
+        let prepare_path = authority.current_path()?;
         if !prepare_conditions.allows_path(&prepare_path)? {
             return Err(UploadError::PreconditionFailed);
         }
         if let Some(parent) = prepare_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        Ok(())
+        // Create staging under the same namespace lock as its authorization.
+        let (pending, file) = PendingUpload::create(&prepare_path)?;
+        Ok(PreparedUpload {
+            pending,
+            file,
+            target: UploadTarget::Request(Box::new(authority)),
+        })
     }) else {
         res.status_code(StatusCode::SERVICE_UNAVAILABLE);
         return;
     };
     let result = match preparation.await {
-        Ok(Ok(())) => {
-            write_request_file(
-                &req_p,
+        Ok(Ok(prepared)) => {
+            write_prepared_file(
+                prepared,
                 req.take_body(),
                 &conditions,
                 config.upload_limit,
@@ -188,6 +256,7 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
         Err(error) => Err(UploadError::Io(std::io::Error::other(error))),
     };
     match result {
+        Err(UploadError::Rejected(response)) => *res = *response,
         Ok((existent, uploaded_bytes)) => {
             crate::config::log_msg(
                 config.log,
@@ -388,14 +457,18 @@ impl Drop for PendingUpload {
     }
 }
 
-async fn write_request_file(
-    destination: &Path,
+async fn write_prepared_file(
+    prepared: PreparedUpload,
     mut body: salvo::http::ReqBody,
     conditions: &WriteConditions,
     limit: u64,
     mtime: Option<u64>,
 ) -> Result<(bool, u64), UploadError> {
-    let (pending, mut file) = PendingUpload::create(destination)?;
+    let PreparedUpload {
+        pending,
+        mut file,
+        target,
+    } = prepared;
     let mut length = 0_u64;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
     loop {
@@ -435,16 +508,21 @@ async fn write_request_file(
     }
     file.sync_all().await?;
     let _commit_lock = MUTATION_LOCK.lock().await;
-    let destination_path = destination.to_path_buf();
-    let metadata =
-        match tokio::task::spawn_blocking(move || path_metadata_and_etag(&destination_path))
-            .await
-            .map_err(std::io::Error::other)?
-        {
+    let (destination, metadata) = tokio::task::spawn_blocking(move || {
+        let destination = match target {
+            UploadTarget::Request(authority) => authority.current_path()?,
+            #[cfg(test)]
+            UploadTarget::Filesystem(destination) => destination,
+        };
+        let metadata = match path_metadata_and_etag(&destination) {
             Ok(snapshot) => Some(snapshot),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(UploadError::Io(error)),
         };
+        Ok((destination, metadata))
+    })
+    .await
+    .map_err(std::io::Error::other)??;
     if !conditions.allows_snapshot(metadata.as_ref())? {
         return Err(UploadError::PreconditionFailed);
     }
@@ -453,7 +531,7 @@ async fn write_request_file(
     }
     drop(file);
     pending
-        .commit(destination, conditions.create_only())
+        .commit(&destination, conditions.create_only())
         .await
         .map_err(|error| {
             if conditions.create_only() && error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -463,6 +541,29 @@ async fn write_request_file(
             }
         })?;
     Ok((metadata.is_some(), length))
+}
+
+#[cfg(test)]
+async fn write_request_file(
+    destination: &Path,
+    body: salvo::http::ReqBody,
+    conditions: &WriteConditions,
+    limit: u64,
+    mtime: Option<u64>,
+) -> Result<(bool, u64), UploadError> {
+    let (pending, file) = PendingUpload::create(destination)?;
+    write_prepared_file(
+        PreparedUpload {
+            pending,
+            file,
+            target: UploadTarget::Filesystem(destination.to_path_buf()),
+        },
+        body,
+        conditions,
+        limit,
+        mtime,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -483,11 +584,264 @@ async fn write_file_conditional(
 }
 
 #[cfg(test)]
+mod namespace_upload_tests {
+    use std::task::{Context, Poll};
+
+    use salvo::hyper::body::{Bytes, Frame};
+    use salvo::test::TestClient;
+    use tokio::sync::oneshot;
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    struct PausedBody {
+        entered: Option<oneshot::Sender<()>>,
+        release: oneshot::Receiver<()>,
+        sent: bool,
+    }
+
+    impl Body for PausedBody {
+        type Data = Bytes;
+        type Error = salvo::BoxedError;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            if self.sent {
+                return Poll::Ready(None);
+            }
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).unwrap();
+            }
+            match std::future::Future::poll(Pin::new(&mut self.release), cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(_) => {
+                    self.sent = true;
+                    Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(
+                        b"complete upload",
+                    )))))
+                }
+            }
+        }
+    }
+
+    fn paused_request(path: &str) -> (Request, oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered, ready) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        let mut request = TestClient::put(format!("http://localhost{path}")).build();
+        *request.body_mut() = salvo::http::ReqBody::Boxed {
+            inner: Box::pin(PausedBody {
+                entered: Some(entered),
+                release: wait,
+                sent: false,
+            }),
+            fuse_config: None,
+        };
+        (request, ready, release)
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_a_current_collection_and_cleans_staging() {
+        let fixture = TestDir::new();
+        let target = fixture.path().join("file");
+        std::fs::write(&target, b"initial file").unwrap();
+        let prepared = fixture.path().join("prepared");
+        std::fs::create_dir(&prepared).unwrap();
+        std::fs::write(prepared.join("member"), b"preserved collection").unwrap();
+        let service = Service::new(crate::build_router(config(fixture.path(), &["-w"])));
+        let (request, entered, release) = paused_request("/file");
+        let job = tokio::spawn(async move { service.handle(request).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            let _guard = MUTATION_LOCK.lock().await;
+            crate::util::namespace::rename_no_replace(&target, &fixture.path().join("retired"))
+                .unwrap();
+            crate::util::namespace::rename_no_replace(&prepared, &target).unwrap();
+        }
+        release.send(()).unwrap();
+        assert_eq!(
+            job.await.unwrap().status_code,
+            Some(StatusCode::METHOD_NOT_ALLOWED)
+        );
+        assert_eq!(
+            std::fs::read(target.join("member")).unwrap(),
+            b"preserved collection"
+        );
+        assert_eq!(
+            std::fs::read(fixture.path().join("retired")).unwrap(),
+            b"initial file"
+        );
+        assert!(std::fs::read_dir(fixture.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".hpip-upload-")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streamed_upload_revalidates_current_alias_authority_and_policy() {
+        use std::os::unix::fs::symlink;
+
+        for policy in ["auth", "no-follow", "sandbox"] {
+            let fixture = TestDir::new();
+            let root = fixture.path().join("served");
+            std::fs::create_dir_all(root.join("active/alias")).unwrap();
+            std::fs::create_dir(root.join("prepared")).unwrap();
+            let target = if policy == "sandbox" {
+                fixture.path().join("outside")
+            } else {
+                root.join("private")
+            };
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("file"), b"protected resource").unwrap();
+            std::fs::write(root.join("active/alias/file"), b"initial resource").unwrap();
+            symlink(&target, root.join("prepared/alias")).unwrap();
+            let flags = match policy {
+                "auth" => vec!["-w", "--path-auth", "private=user:pass"],
+                "no-follow" => vec!["-w", "-s"],
+                _ => vec!["-w", "-r"],
+            };
+            let service = Service::new(crate::build_router(config(&root, &flags)));
+            let (request, entered, release) = paused_request("/active/alias/file");
+            let job = tokio::spawn(async move { service.handle(request).await });
+            tokio::time::timeout(std::time::Duration::from_secs(2), entered)
+                .await
+                .unwrap()
+                .unwrap();
+            {
+                let _guard = MUTATION_LOCK.lock().await;
+                crate::util::namespace::rename_no_replace(
+                    &root.join("active"),
+                    &root.join("retired"),
+                )
+                .unwrap();
+                crate::util::namespace::copy_no_replace(
+                    &root.join("prepared"),
+                    &root.join("active"),
+                    true,
+                )
+                .unwrap();
+            }
+            release.send(()).unwrap();
+            assert_eq!(
+                job.await.unwrap().status_code,
+                Some(if policy == "auth" {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::NOT_FOUND
+                }),
+                "{policy}"
+            );
+            assert_eq!(
+                std::fs::read(target.join("file")).unwrap(),
+                b"protected resource",
+                "{policy}"
+            );
+            assert_eq!(
+                std::fs::read(root.join("retired/alias/file")).unwrap(),
+                b"initial resource",
+                "{policy}"
+            );
+            assert_eq!(
+                std::fs::read_dir(root.join("retired/alias"))
+                    .unwrap()
+                    .count(),
+                1,
+                "{policy}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streamed_upload_publishes_to_the_current_authorized_alias_target() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TestDir::new();
+        for name in ["active", "prepared", "original", "replacement"] {
+            std::fs::create_dir(fixture.path().join(name)).unwrap();
+        }
+        std::fs::write(fixture.path().join("original/file"), b"original").unwrap();
+        std::fs::write(fixture.path().join("replacement/file"), b"replacement").unwrap();
+        symlink(
+            fixture.path().join("original"),
+            fixture.path().join("active/alias"),
+        )
+        .unwrap();
+        symlink(
+            fixture.path().join("replacement"),
+            fixture.path().join("prepared/alias"),
+        )
+        .unwrap();
+        let service = Service::new(crate::build_router(config(fixture.path(), &["-w"])));
+        let (request, entered, release) = paused_request("/active/alias/file");
+        let job = tokio::spawn(async move { service.handle(request).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            let _guard = MUTATION_LOCK.lock().await;
+            crate::util::namespace::rename_no_replace(
+                &fixture.path().join("active"),
+                &fixture.path().join("retired"),
+            )
+            .unwrap();
+            crate::util::namespace::copy_no_replace(
+                &fixture.path().join("prepared"),
+                &fixture.path().join("active"),
+                true,
+            )
+            .unwrap();
+        }
+        release.send(()).unwrap();
+        assert_eq!(job.await.unwrap().status_code, Some(StatusCode::NO_CONTENT));
+        assert_eq!(
+            std::fs::read(fixture.path().join("original/file")).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            std::fs::read(fixture.path().join("replacement/file")).unwrap(),
+            b"complete upload"
+        );
+        assert_eq!(
+            std::fs::read_dir(fixture.path().join("original"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+}
+
+#[cfg(test)]
 mod upload_tests {
     use super::*;
 
     async fn write_file(destination: &Path, data: &[u8]) -> Result<bool, UploadError> {
         write_file_conditional(destination, data, &WriteConditions::default()).await
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dropping_an_unconsumed_prepared_upload_removes_staging() {
+        let directory = crate::test_support::TestDir::new();
+        let destination = directory.path().join("file");
+        let (pending, file) = PendingUpload::create(&destination).unwrap();
+        let prepared = PreparedUpload {
+            pending,
+            file,
+            target: UploadTarget::Filesystem(destination),
+        };
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        drop(prepared);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     fn fixture() -> PathBuf {
