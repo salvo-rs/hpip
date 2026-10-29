@@ -8,7 +8,9 @@ use salvo::prelude::*;
 use tokio::io::AsyncWriteExt;
 
 use crate::config::AppConfig;
-use crate::util::write_conditions::{MUTATION_LOCK, WriteConditions};
+#[cfg(test)]
+use crate::util::write_conditions::MUTATION_LOCK;
+use crate::util::write_conditions::{WriteConditions, mutation_transaction};
 use crate::util::*;
 
 #[derive(Debug)]
@@ -541,33 +543,14 @@ async fn upload_transaction<R: Send + 'static>(
     config: &Arc<AppConfig>,
     work: impl FnOnce() -> Result<R, UploadError> + Send + 'static,
 ) -> Result<R, UploadError> {
-    let (cancel_on_drop, cancelled) = tokio::sync::oneshot::channel::<()>();
-    let runtime = tokio::runtime::Handle::current();
-    let job = config
-        .spawn_blocking(move || {
-            let guard = runtime.block_on(async {
-                tokio::select! {
-                    biased;
-                    _ = cancelled => None,
-                    guard = MUTATION_LOCK.lock() => Some(guard),
-                }
-            });
-            let Some(_guard) = guard else {
-                return Err(UploadError::BodyRead(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "upload cancelled before filesystem transaction",
-                )));
-            };
-            work()
-        })
+    mutation_transaction(config, move |_guard| work())
+        .await
         .ok_or_else(|| {
             UploadError::Io(std::io::Error::other(
                 "upload transaction worker unavailable",
             ))
-        })?;
-    let result = job.await.map_err(std::io::Error::other)?;
-    drop(cancel_on_drop);
-    result
+        })?
+        .map_err(std::io::Error::other)?
 }
 
 #[cfg(test)]

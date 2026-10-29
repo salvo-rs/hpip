@@ -3,15 +3,26 @@ use std::sync::Arc;
 use salvo::prelude::*;
 
 use crate::config::AppConfig;
-use crate::util::write_conditions::{MUTATION_LOCK, WriteConditions};
+#[cfg(test)]
+use crate::util::write_conditions::MUTATION_LOCK;
+use crate::util::write_conditions::{WriteConditions, mutation_transaction};
 use crate::util::*;
 
+#[cfg(test)]
 fn commit_delete(
     req: &Request,
     config: &Arc<AppConfig>,
     conditions: &WriteConditions,
 ) -> std::io::Result<Response> {
-    let _guard = MUTATION_LOCK.blocking_lock();
+    commit_delete_with_guard(req, config, conditions, MUTATION_LOCK.blocking_lock())
+}
+
+fn commit_delete_with_guard(
+    req: &Request,
+    config: &Arc<AppConfig>,
+    conditions: &WriteConditions,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+) -> std::io::Result<Response> {
     if let Some(response) = crate::hoops::auth::check_auth(req, config) {
         return Ok(response);
     }
@@ -136,15 +147,15 @@ pub async fn handle_delete(req: &mut Request, depot: &mut Depot, res: &mut Respo
     *snapshot.headers_mut() = req.headers().clone();
     *snapshot.remote_addr_mut() = req.remote_addr().clone();
     let work_config = config.clone();
-    let Some(job) =
-        config.spawn_blocking(move || commit_delete(&snapshot, &work_config, &conditions))
+    let Some(result) = mutation_transaction(&config, move |guard| {
+        commit_delete_with_guard(&snapshot, &work_config, &conditions, guard)
+    })
+    .await
     else {
         res.status_code(StatusCode::SERVICE_UNAVAILABLE);
         return;
     };
-    let result = job
-        .await
-        .unwrap_or_else(|error| Err(std::io::Error::other(error)));
+    let result = result.unwrap_or_else(|error| Err(std::io::Error::other(error)));
 
     match result {
         Ok(response) => {
