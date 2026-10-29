@@ -244,6 +244,7 @@ pub async fn handle_put(req: &mut Request, depot: &mut Depot, res: &mut Response
     let result = match preparation.await {
         Ok(Ok(prepared)) => {
             write_prepared_file(
+                &config,
                 prepared,
                 req.take_body(),
                 &conditions,
@@ -384,7 +385,7 @@ impl PendingUpload {
         }
     }
 
-    async fn commit(self, destination: &Path, create_only: bool) -> std::io::Result<()> {
+    fn commit(self, destination: &Path, create_only: bool) -> std::io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -396,36 +397,33 @@ impl PendingUpload {
                         "upload destination contains NUL",
                     )
                 })?;
-            tokio::task::spawn_blocking(move || {
-                // Anchor the source entry even if MOVE renamed its parent while the
-                // body was arriving. The destination still names the requested URL.
-                // Both C strings and the owned source directory descriptor remain live.
-                let result = unsafe {
-                    if create_only {
-                        libc::linkat(
-                            self.parent.as_raw_fd(),
-                            self.name.as_ptr(),
-                            libc::AT_FDCWD,
-                            destination.as_ptr(),
-                            0,
-                        )
-                    } else {
-                        libc::renameat(
-                            self.parent.as_raw_fd(),
-                            self.name.as_ptr(),
-                            libc::AT_FDCWD,
-                            destination.as_ptr(),
-                        )
-                    }
-                };
-                if result == 0 {
-                    Ok(())
+            // The caller owns the mutation lock on this blocking worker for the
+            // entire transaction, including this filesystem publication.
+            // The owned source descriptor anchors staging if its parent moved;
+            // both NUL-terminated names remain valid throughout the syscall.
+            let result = unsafe {
+                if create_only {
+                    libc::linkat(
+                        self.parent.as_raw_fd(),
+                        self.name.as_ptr(),
+                        libc::AT_FDCWD,
+                        destination.as_ptr(),
+                        0,
+                    )
                 } else {
-                    Err(std::io::Error::last_os_error())
+                    libc::renameat(
+                        self.parent.as_raw_fd(),
+                        self.name.as_ptr(),
+                        libc::AT_FDCWD,
+                        destination.as_ptr(),
+                    )
                 }
-            })
-            .await
-            .map_err(std::io::Error::other)?
+            };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
         }
         #[cfg(not(unix))]
         {
@@ -434,9 +432,9 @@ impl PendingUpload {
             if create_only {
                 // Publishing a new directory entry is atomic even against another
                 // process creating the same target. Never replace an existing file.
-                tokio::fs::hard_link(&self.path, destination).await
+                std::fs::hard_link(&self.path, destination)
             } else {
-                tokio::fs::rename(&self.path, destination).await
+                std::fs::rename(&self.path, destination)
             }
         }
     }
@@ -458,6 +456,7 @@ impl Drop for PendingUpload {
 }
 
 async fn write_prepared_file(
+    config: &Arc<AppConfig>,
     prepared: PreparedUpload,
     mut body: salvo::http::ReqBody,
     conditions: &WriteConditions,
@@ -507,8 +506,9 @@ async fn write_prepared_file(
             .map_err(std::io::Error::other)??;
     }
     file.sync_all().await?;
-    let _commit_lock = MUTATION_LOCK.lock().await;
-    let (destination, metadata) = tokio::task::spawn_blocking(move || {
+    let file = file.into_std().await;
+    let conditions = conditions.clone();
+    commit_upload(config, move || {
         let destination = match target {
             UploadTarget::Request(authority) => authority.current_path()?,
             #[cfg(test)]
@@ -519,28 +519,195 @@ async fn write_prepared_file(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(UploadError::Io(error)),
         };
-        Ok((destination, metadata))
+        if !conditions.allows_snapshot(metadata.as_ref())? {
+            return Err(UploadError::PreconditionFailed);
+        }
+        if let Some((metadata, _)) = metadata.as_ref() {
+            file.set_permissions(metadata.permissions())?;
+        }
+        drop(file);
+        pending
+            .commit(&destination, conditions.create_only())
+            .map_err(|error| {
+                if conditions.create_only() && error.kind() == std::io::ErrorKind::AlreadyExists {
+                    UploadError::PreconditionFailed
+                } else {
+                    UploadError::Io(error)
+                }
+            })?;
+        Ok((metadata.is_some(), length))
     })
     .await
-    .map_err(std::io::Error::other)??;
-    if !conditions.allows_snapshot(metadata.as_ref())? {
-        return Err(UploadError::PreconditionFailed);
-    }
-    if let Some((metadata, _)) = metadata.as_ref() {
-        file.set_permissions(metadata.permissions()).await?;
-    }
-    drop(file);
-    pending
-        .commit(&destination, conditions.create_only())
-        .await
-        .map_err(|error| {
-            if conditions.create_only() && error.kind() == std::io::ErrorKind::AlreadyExists {
-                UploadError::PreconditionFailed
-            } else {
-                UploadError::Io(error)
-            }
+}
+
+/// A cancelled request may stop waiting for a commit, but cannot drop its lock
+/// while an admitted filesystem transaction is still publishing in the worker.
+async fn commit_upload<R: Send + 'static>(
+    config: &Arc<AppConfig>,
+    work: impl FnOnce() -> Result<R, UploadError> + Send + 'static,
+) -> Result<R, UploadError> {
+    let (cancel_on_drop, cancelled) = tokio::sync::oneshot::channel::<()>();
+    let runtime = tokio::runtime::Handle::current();
+    let job = config
+        .spawn_blocking(move || {
+            let guard = runtime.block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = cancelled => None,
+                    guard = MUTATION_LOCK.lock() => Some(guard),
+                }
+            });
+            let Some(_guard) = guard else {
+                return Err(UploadError::BodyRead(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "upload cancelled before publication",
+                )));
+            };
+            work()
+        })
+        .ok_or_else(|| {
+            UploadError::Io(std::io::Error::other(
+                "upload publication worker unavailable",
+            ))
         })?;
-    Ok((metadata.is_some(), length))
+    let result = job.await.map_err(std::io::Error::other)?;
+    drop(cancel_on_drop);
+    result
+}
+
+#[cfg(test)]
+mod publication_lifetime_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::test_support::{TestDir, config};
+
+    async fn staged(destination: &Path) -> (PendingUpload, std::fs::File) {
+        let (pending, mut file) = PendingUpload::create(destination).unwrap();
+        file.write_all(b"complete replacement").await.unwrap();
+        file.flush().await.unwrap();
+        (pending, file.into_std().await)
+    }
+
+    #[tokio::test]
+    async fn cancelled_publication_keeps_its_lock_and_drain_permit_until_the_worker_finishes() {
+        let fixture = TestDir::new();
+        let path = fixture.path().join("file");
+        std::fs::write(&path, b"original").unwrap();
+        let config = config(fixture.path(), &["-w"]);
+        let (pending, file) = staged(&path).await;
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let request_config = config.clone();
+        let destination = path.clone();
+        let request = tokio::spawn(async move {
+            commit_upload(&request_config, move || {
+                entered.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                drop(file);
+                pending.commit(&destination, false)?;
+                Ok(())
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), MUTATION_LOCK.lock())
+                .await
+                .is_err()
+        );
+        let drain_config = config.clone();
+        let mut drain = tokio::spawn(async move { drain_config.drain_blocking_jobs().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut drain)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), drain)
+            .await
+            .unwrap()
+            .unwrap();
+        let _guard = tokio::time::timeout(Duration::from_secs(2), MUTATION_LOCK.lock())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete replacement");
+        assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_the_commit_lock_discards_staging_without_waiting_for_the_lock() {
+        let fixture = TestDir::new();
+        let path = fixture.path().join("file");
+        std::fs::write(&path, b"original").unwrap();
+        let config = config(fixture.path(), &["-w"]);
+        let (pending, file) = staged(&path).await;
+        let _guard = MUTATION_LOCK.lock().await;
+        let request_config = config.clone();
+        let destination = path.clone();
+        let request = tokio::spawn(async move {
+            commit_upload(&request_config, move || {
+                drop(file);
+                pending.commit(&destination, false)?;
+                Ok(())
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while config.blocking_jobs.available_permits() == 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        let _all = tokio::time::timeout(
+            Duration::from_secs(2),
+            config.blocking_jobs.clone().acquire_many_owned(4),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn unavailable_publication_workers_leave_the_original_and_remove_staging() {
+        for stopped in [false, true] {
+            let fixture = TestDir::new();
+            let path = fixture.path().join("file");
+            std::fs::write(&path, b"original").unwrap();
+            let config = config(fixture.path(), &["-w"]);
+            if stopped {
+                config.drain_blocking_jobs().await;
+            }
+            let _all = config
+                .blocking_jobs
+                .clone()
+                .acquire_many_owned(4)
+                .await
+                .unwrap();
+            let (pending, file) = staged(&path).await;
+            let destination = path.clone();
+            let result = commit_upload(&config, move || {
+                drop(file);
+                pending.commit(&destination, false)?;
+                Ok(())
+            })
+            .await;
+            assert!(matches!(result, Err(UploadError::Io(_))));
+            assert_eq!(std::fs::read(&path).unwrap(), b"original");
+            assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 1);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -552,7 +719,9 @@ async fn write_request_file(
     mtime: Option<u64>,
 ) -> Result<(bool, u64), UploadError> {
     let (pending, file) = PendingUpload::create(destination)?;
+    let config = crate::test_support::config(destination.parent().unwrap(), &["-w"]);
     write_prepared_file(
+        &config,
         PreparedUpload {
             pending,
             file,
@@ -937,7 +1106,7 @@ mod upload_tests {
         file.write_all(b"complete but unpublished").await.unwrap();
         drop(file);
         std::fs::rename(&parent, &moved).unwrap();
-        assert!(pending.commit(&destination, false).await.is_err());
+        assert!(pending.commit(&destination, false).is_err());
         assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
