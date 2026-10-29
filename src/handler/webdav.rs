@@ -12,7 +12,9 @@ use xml::{EmitterConfig as XmlEmitterConfig, ParserConfig as XmlParserConfig};
 
 use crate::config::{AppConfig, log_msg};
 use crate::util::webdav::*;
-use crate::util::write_conditions::{MUTATION_LOCK, WriteConditions};
+#[cfg(test)]
+use crate::util::write_conditions::MUTATION_LOCK;
+use crate::util::write_conditions::{WriteConditions, mutation_transaction};
 use crate::util::*;
 
 fn default_xml_parser_config() -> XmlParserConfig {
@@ -1009,6 +1011,7 @@ fn apply_proppatch(path: &Path, actionables: &ProppatchActionables) -> std::io::
 
 /// Revalidate the current namespace while excluding this server's other mutations.
 /// A path resolved before receiving the body is only a name, not a pinned object.
+#[cfg(test)]
 fn commit_proppatch(
     req: &Request,
     config: &Arc<AppConfig>,
@@ -1016,7 +1019,24 @@ fn commit_proppatch(
     actionables: &ProppatchActionables,
     apply: bool,
 ) -> std::io::Result<Option<Response>> {
-    let _guard = MUTATION_LOCK.blocking_lock();
+    commit_proppatch_with_guard(
+        req,
+        config,
+        conditions,
+        actionables,
+        apply,
+        MUTATION_LOCK.blocking_lock(),
+    )
+}
+
+fn commit_proppatch_with_guard(
+    req: &Request,
+    config: &Arc<AppConfig>,
+    conditions: &WriteConditions,
+    actionables: &ProppatchActionables,
+    apply: bool,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+) -> std::io::Result<Option<Response>> {
     if let Some(response) = crate::hoops::auth::check_auth(req, config) {
         return Ok(Some(response));
     }
@@ -1153,13 +1173,22 @@ pub async fn handle_proppatch(req: &mut Request, depot: &mut Depot, res: &mut Re
     let (actionables, mut statuses) = prepare_proppatch(&props);
     let apply = statuses.iter().all(|status| *status == StatusCode::OK);
     let work_config = config.clone();
-    let Some(job) = config.spawn_blocking(move || {
-        commit_proppatch(&snapshot, &work_config, &conditions, &actionables, apply)
-    }) else {
+    let Some(result) = mutation_transaction(&config, move |guard| {
+        commit_proppatch_with_guard(
+            &snapshot,
+            &work_config,
+            &conditions,
+            &actionables,
+            apply,
+            guard,
+        )
+    })
+    .await
+    else {
         res.status_code(StatusCode::SERVICE_UNAVAILABLE);
         return;
     };
-    match job.await.unwrap_or_else(|error| Err(IoError::other(error))) {
+    match result.unwrap_or_else(|error| Err(IoError::other(error))) {
         Ok(Some(response)) => {
             *res = response;
             return;
@@ -1337,12 +1366,21 @@ fn write_proppatch_output(
 
 // ─── MKCOL ─────────────────────────────────────────────
 
+#[cfg(test)]
 fn commit_mkcol(
     req: &Request,
     config: &Arc<AppConfig>,
     conditions: &WriteConditions,
 ) -> std::io::Result<Response> {
-    let _guard = MUTATION_LOCK.blocking_lock();
+    commit_mkcol_with_guard(req, config, conditions, MUTATION_LOCK.blocking_lock())
+}
+
+fn commit_mkcol_with_guard(
+    req: &Request,
+    config: &Arc<AppConfig>,
+    conditions: &WriteConditions,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+) -> std::io::Result<Response> {
     if let Some(response) = crate::hoops::auth::check_auth(req, config) {
         return Ok(response);
     }
@@ -1447,13 +1485,15 @@ pub async fn handle_mkcol(req: &mut Request, depot: &mut Depot, res: &mut Respon
         }
     };
     let work_config = config.clone();
-    let Some(job) =
-        config.spawn_blocking(move || commit_mkcol(&snapshot, &work_config, &conditions))
+    let Some(result) = mutation_transaction(&config, move |guard| {
+        commit_mkcol_with_guard(&snapshot, &work_config, &conditions, guard)
+    })
+    .await
     else {
         res.status_code(StatusCode::SERVICE_UNAVAILABLE);
         return;
     };
-    match job.await.unwrap_or_else(|error| Err(IoError::other(error))) {
+    match result.unwrap_or_else(|error| Err(IoError::other(error))) {
         Ok(response) => *res = response,
         Err(e) => match e.kind() {
             IoErrorKind::NotFound => {
@@ -1496,15 +1536,17 @@ async fn handle_copy_move(req: &mut Request, depot: &mut Depot, res: &mut Respon
     *snapshot.method_mut() = req.method().clone();
     *snapshot.remote_addr_mut() = req.remote_addr().clone();
     let work_config = config.clone();
-    let Some(job) = config.spawn_blocking(move || {
+    let Some(result) = mutation_transaction(&config, move |guard| {
         let mut response = Response::new();
-        copy_move_work(&mut snapshot, &work_config, &mut response, is_move);
+        copy_move_work_with_guard(&mut snapshot, &work_config, &mut response, is_move, guard);
         response
-    }) else {
+    })
+    .await
+    else {
         res.status_code(StatusCode::SERVICE_UNAVAILABLE);
         return;
     };
-    match job.await {
+    match result {
         Ok(response) => *res = response,
         Err(_) => {
             res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1512,10 +1554,20 @@ async fn handle_copy_move(req: &mut Request, depot: &mut Depot, res: &mut Respon
     }
 }
 
+#[cfg(test)]
 fn copy_move_work(req: &mut Request, config: &Arc<AppConfig>, res: &mut Response, is_move: bool) {
+    copy_move_work_with_guard(req, config, res, is_move, MUTATION_LOCK.blocking_lock());
+}
+
+fn copy_move_work_with_guard(
+    req: &mut Request,
+    config: &Arc<AppConfig>,
+    res: &mut Response,
+    is_move: bool,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+) {
     // Authorization, type/depth checks, and path resolution describe the same
     // namespace that will be changed, including every collection member.
-    let _mutation_lock = MUTATION_LOCK.blocking_lock();
     if let Some(resp) = crate::hoops::auth::check_auth(req, config) {
         *res = resp;
         return;
@@ -2009,6 +2061,105 @@ mod remaining_mutation_condition_tests {
     use crate::test_support::{TestDir, config};
 
     const UPDATE: &str = r#"<D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:"><D:set><D:prop><Z:Win32LastModifiedTime>2020-09-13T12:26:40Z</Z:Win32LastModifiedTime></D:prop></D:set></D:propertyupdate>"#;
+
+    #[tokio::test]
+    async fn cancelled_control_mutations_release_queued_workers_without_touching_the_namespace() {
+        discard_queued_control_mutations(false).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_discards_queued_control_mutations_without_waiting_for_the_writer() {
+        discard_queued_control_mutations(true).await;
+    }
+
+    async fn discard_queued_control_mutations(shutdown: bool) {
+        for method in ["DELETE", "MKCOL", "PROPPATCH", "COPY", "MOVE"] {
+            let fixture = TestDir::new();
+            let source = fixture.path().join("source");
+            fs::write(&source, b"original").unwrap();
+            let modified = fs::metadata(&source).unwrap().modified().unwrap();
+            let config = config(fixture.path(), &["-w", "-d"]);
+            let service = Arc::new(Service::new(crate::build_router(config.clone())));
+            let guard = MUTATION_LOCK.lock().await;
+            let mut requests = Vec::new();
+            for index in 0..4 {
+                let service = service.clone();
+                requests.push(tokio::spawn(async move {
+                    let path = if method == "MKCOL" {
+                        format!("http://localhost/new-{index}")
+                    } else {
+                        "http://localhost/source".to_owned()
+                    };
+                    let mut request = RequestBuilder::new(&path, method.parse().unwrap())
+                        .add_header(
+                            "Destination",
+                            format!("http://localhost/copy-{index}"),
+                            true,
+                        );
+                    if method == "PROPPATCH" {
+                        request = request.body(UPDATE);
+                    }
+                    request.send(&*service).await
+                }));
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while config.blocking_jobs.available_permits() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if shutdown {
+                config.close_admission();
+            }
+            for mut request in requests {
+                if shutdown {
+                    let response =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), &mut request).await;
+                    if response.is_err() {
+                        request.abort();
+                        drop(guard);
+                        panic!("{method} remained queued after shutdown");
+                    }
+                    assert_eq!(
+                        response.unwrap().unwrap().status_code,
+                        Some(StatusCode::SERVICE_UNAVAILABLE),
+                        "{method}"
+                    );
+                } else {
+                    request.abort();
+                    assert!(request.await.unwrap_err().is_cancelled());
+                }
+            }
+            let returned = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                config.blocking_jobs.clone().acquire_many_owned(4),
+            )
+            .await;
+            // Release the lock even on the unfixed implementation so workers
+            // can finish and the test runtime itself cannot remain stuck.
+            drop(guard);
+            let recovered_while_locked = returned.is_ok();
+            drop(returned);
+            let _all = config
+                .blocking_jobs
+                .clone()
+                .acquire_many_owned(4)
+                .await
+                .unwrap();
+            assert!(
+                recovered_while_locked,
+                "cancelled {method} retained queued workers"
+            );
+            assert_eq!(fs::read(&source).unwrap(), b"original", "{method}");
+            assert_eq!(
+                fs::metadata(&source).unwrap().modified().unwrap(),
+                modified,
+                "{method}"
+            );
+            assert_eq!(fs::read_dir(fixture.path()).unwrap().count(), 1, "{method}");
+        }
+    }
 
     #[test]
     fn mkcol_rechecks_current_parent_before_applying_conditions() {
