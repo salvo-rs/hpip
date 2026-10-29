@@ -51,6 +51,7 @@ pub struct AppConfig {
     pub blocking_jobs: std::sync::Arc<tokio::sync::Semaphore>,
     pub archive_jobs: std::sync::Arc<tokio::sync::Semaphore>,
     pub read_snapshot_jobs: std::sync::Arc<tokio::sync::Semaphore>,
+    pub requests: std::sync::Arc<crate::request_lifecycle::RequestTracker>,
     accepting_blocking_jobs: AtomicBool,
     stopped_read_snapshots: tokio::sync::Notify,
     pub encoding_gates: [Mutex<()>; 64],
@@ -164,6 +165,7 @@ impl AppConfig {
             blocking_jobs: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             archive_jobs: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             read_snapshot_jobs: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+            requests: Default::default(),
             accepting_blocking_jobs: AtomicBool::new(true),
             stopped_read_snapshots: tokio::sync::Notify::new(),
             encoding_gates: std::array::from_fn(|_| Mutex::new(())),
@@ -283,9 +285,13 @@ impl AppConfig {
 
     /// Stop admission and wait for already admitted work before deleting its files.
     pub async fn drain_blocking_jobs(&self) {
+        self.requests.close();
         self.accepting_blocking_jobs
             .store(false, AtomicOrdering::SeqCst);
         self.stopped_read_snapshots.notify_waiters();
+        // Force-stopped connection tasks may still be dropping their request
+        // futures after try_serve returned. They must not outlive temp cleanup.
+        self.requests.wait_idle().await;
         let _all_jobs = self.blocking_jobs.clone().acquire_many_owned(4).await;
         let _all_archives = self.archive_jobs.clone().acquire_many_owned(4).await;
         let _all_snapshots = self.read_snapshot_jobs.clone().acquire_many_owned(4).await;
