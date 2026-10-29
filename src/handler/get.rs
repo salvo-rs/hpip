@@ -825,8 +825,18 @@ fn handle_dir_listing(
     guard: tokio::sync::MutexGuard<'_, ()>,
 ) {
     let remote = req.remote_addr().to_string();
-    let is_root = url_path == "/";
-    let mut relpath_escaped = escape_specials(url_path);
+    // Empty URL segments are ignored during filesystem resolution. Use that
+    // same hierarchy for navigation, without decoding filesystem names again.
+    let normalized = format!(
+        "/{}",
+        url_path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("/")
+    );
+    let is_root = normalized == "/";
+    let mut relpath_escaped = escape_specials(&normalized);
     if relpath_escaped.as_bytes().last() != Some(&b'/') {
         relpath_escaped.to_mut().push('/');
     }
@@ -1522,6 +1532,52 @@ mod snapshot_tests {
     use salvo::test::{ResponseExt, TestClient};
 
     use super::*;
+
+    #[tokio::test]
+    async fn root_and_nested_listing_navigation_use_resolved_components() {
+        let dir = crate::test_support::TestDir::new();
+        std::fs::write(dir.path().join("root.txt"), "root fixture").unwrap();
+        std::fs::create_dir(dir.path().join("folder")).unwrap();
+        std::fs::write(dir.path().join("folder/member.txt"), "member fixture").unwrap();
+        std::fs::create_dir(dir.path().join("a%20b")).unwrap();
+        std::fs::write(dir.path().join("a%20b/member.txt"), "literal percent").unwrap();
+        let service = Service::new(crate::build_router(crate::test_support::config(
+            dir.path(),
+            &["-e"],
+        )));
+        for (path, root, member_href) in [
+            ("/folder/", false, Some("/folder/member.txt")),
+            ("/", true, None),
+            ("//", true, None),
+            ("////", true, None),
+            ("/folder", false, Some("/folder/member.txt")),
+            ("//folder///", false, Some("/folder/member.txt")),
+            ("/a%2520b///", false, Some("/a%2520b/member.txt")),
+        ] {
+            let mut request = TestClient::get("http://localhost/").build();
+            *request.uri_mut() = path.parse().unwrap();
+            let mut response = service.handle(request).await;
+            assert_eq!(response.status_code, Some(StatusCode::OK), "HTML {path}");
+            let html = response.take_string().await.unwrap();
+            assert_eq!(html.contains("Parent directory"), !root, "HTML {path}");
+            if let Some(href) = member_href {
+                assert!(html.contains(&format!("href=\"{href}\"")), "{path}");
+            }
+            let mut request = TestClient::head("http://localhost/").build();
+            *request.uri_mut() = path.parse().unwrap();
+            let response = service.handle(request).await;
+            assert_eq!(response.status_code, Some(StatusCode::OK), "HEAD {path}");
+            let mut request = TestClient::get("http://localhost/")
+                .add_header("Accept", "application/json", true)
+                .build();
+            *request.uri_mut() = path.parse().unwrap();
+            let mut response = service.handle(request).await;
+            assert_eq!(response.status_code, Some(StatusCode::OK), "JSON {path}");
+            let json: serde_json::Value =
+                serde_json::from_slice(&response.take_bytes(None).await.unwrap()).unwrap();
+            assert_eq!(json["is_root"], root, "JSON {path}");
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]
