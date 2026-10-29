@@ -5,6 +5,11 @@ permissions:
 
 on:
   workflow_call:
+    inputs:
+      checkout_ref:
+        description: Immutable source revision supplied by a release workflow
+        required: false
+        type: string
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
@@ -42,6 +47,8 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
       - uses: ./.github/actions/build-environment
       - uses: dtolnay/rust-toolchain@stable
         with:
