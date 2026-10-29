@@ -283,12 +283,32 @@ impl AppConfig {
         Some(permit)
     }
 
-    /// Stop admission and wait for already admitted work before deleting its files.
-    pub async fn drain_blocking_jobs(&self) {
+    /// Close admission and wake queued requests and cancellable lock waiters.
+    pub fn close_admission(&self) {
         self.requests.close();
         self.accepting_blocking_jobs
             .store(false, AtomicOrdering::SeqCst);
         self.stopped_read_snapshots.notify_waiters();
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        !self.accepting_blocking_jobs.load(AtomicOrdering::SeqCst)
+    }
+
+    /// Subscribe before inspecting the monotonic flag, including when shutdown
+    /// started before this future was created. All waiters observe closure.
+    pub async fn wait_for_shutdown(&self) {
+        let stopped = self.stopped_read_snapshots.notified();
+        tokio::pin!(stopped);
+        stopped.as_mut().enable();
+        if !self.is_shutting_down() {
+            stopped.await;
+        }
+    }
+
+    /// Stop admission and wait for already admitted work before deleting its files.
+    pub async fn drain_blocking_jobs(&self) {
+        self.close_admission();
         // Force-stopped connection tasks may still be dropping their request
         // futures after try_serve returned. They must not outlive temp cleanup.
         self.requests.wait_idle().await;
@@ -903,5 +923,26 @@ mod cache_budget_tests {
         assert!(!drain.is_finished());
         drop(permits);
         drain.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_notification_reaches_every_waiter_and_late_subscribers() {
+        let dir = crate::test_support::TestDir::new();
+        let config = crate::test_support::config(dir.path(), &[]);
+        let mut waiters = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let config = config.clone();
+            waiters.spawn(async move { config.wait_for_shutdown().await });
+        }
+        tokio::task::yield_now().await;
+        config.close_admission();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(waiter) = waiters.join_next().await {
+                waiter.unwrap();
+            }
+            config.wait_for_shutdown().await;
+        })
+        .await
+        .unwrap();
     }
 }

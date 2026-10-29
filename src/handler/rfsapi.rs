@@ -63,31 +63,28 @@ pub async fn handle_rfsapi(req: &mut Request, depot: &mut Depot, res: &mut Respo
 
 /// Inner implementation that can be called directly with a config reference.
 pub async fn handle_rfsapi_inner(req: &mut Request, res: &mut Response, config: &Arc<AppConfig>) {
-    let mut request = Request::new();
-    *request.uri_mut() = req.uri().clone();
-    *request.method_mut() = req.method().clone();
-    *request.headers_mut() = req.headers().clone();
-    *request.remote_addr_mut() = req.remote_addr().clone();
     let remote = req.remote_addr().to_string();
-    let work_config = config.clone();
-    let Some(job) = config.spawn_blocking(move || {
+    match super::read_snapshot::run_metadata(req, config, move |request, work_config, guard| {
         let mut response = Response::new();
-        handle_rfsapi_snapshot(&mut request, &mut response, &work_config, &remote);
+        handle_rfsapi_snapshot(request, &mut response, work_config, &remote, guard);
         response
-    }) else {
-        res.status_code(StatusCode::SERVICE_UNAVAILABLE);
-        return;
-    };
-    match job.await {
+    })
+    .await
+    {
         Ok(response) => *res = response,
-        Err(_) => {
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        Err(status) => {
+            res.status_code(status);
         }
     }
 }
 
-fn handle_rfsapi_snapshot(req: &mut Request, res: &mut Response, config: &AppConfig, remote: &str) {
-    let guard = crate::util::write_conditions::MUTATION_LOCK.blocking_lock();
+fn handle_rfsapi_snapshot(
+    req: &mut Request,
+    res: &mut Response,
+    config: &AppConfig,
+    remote: &str,
+    guard: tokio::sync::MutexGuard<'static, ()>,
+) {
     if let Some(response) = crate::hoops::auth::check_auth_path(req, config, req.uri().path()) {
         *res = response;
         return;
