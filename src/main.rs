@@ -6,6 +6,7 @@ mod hoops;
 mod http_cache;
 mod options;
 mod port;
+mod request_lifecycle;
 mod tls;
 pub mod util;
 
@@ -263,6 +264,11 @@ impl InjectConfig {
         res: &mut Response,
         ctrl: &mut FlowCtrl,
     ) {
+        let Some(_request) = self.config.requests.enter() else {
+            res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+            ctrl.skip_rest();
+            return;
+        };
         depot.insert_typed(self.config.clone());
         ctrl.call_next(req, depot, res).await;
     }
