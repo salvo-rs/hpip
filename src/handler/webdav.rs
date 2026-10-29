@@ -1846,6 +1846,14 @@ fn copy_response(res: &mut Response, op_result: std::io::Result<()>, overwritten
         Err(error) if error.kind() == IoErrorKind::AlreadyExists => {
             res.status_code(StatusCode::PRECONDITION_FAILED);
         }
+        Err(error)
+            if matches!(
+                error.kind(),
+                IoErrorKind::InvalidInput | IoErrorKind::PermissionDenied
+            ) =>
+        {
+            res.status_code(StatusCode::FORBIDDEN);
+        }
         Err(_) => {
             res.status_code(StatusCode::INSUFFICIENT_STORAGE);
         }
@@ -2371,12 +2379,15 @@ mod overwrite_copy_tests {
         fs::create_dir(fixture.path().join("source/child")).unwrap();
         fs::create_dir(fixture.path().join("target")).unwrap();
         let service = Service::new(crate::build_router(config(fixture.path(), &["-w", "-d"])));
-        let response = RequestBuilder::new("http://localhost/source", "COPY".parse().unwrap())
-            .add_header("Destination", "/source/child", true)
-            .add_header("Overwrite", "T", true)
-            .send(&service)
-            .await;
-        assert!(!response.status_code.unwrap().is_success());
+        for (destination, overwrite) in [("/source/new", "F"), ("/source/child", "T")] {
+            let response = RequestBuilder::new("http://localhost/source", "COPY".parse().unwrap())
+                .add_header("Destination", destination, true)
+                .add_header("Overwrite", overwrite, true)
+                .send(&service)
+                .await;
+            assert_eq!(response.status_code, Some(StatusCode::FORBIDDEN));
+            assert!(!fixture.path().join("source/new").exists());
+        }
         assert!(fixture.path().join("source/child").is_dir());
         assert_eq!(
             fs::read(fixture.path().join("source/payload")).unwrap(),
