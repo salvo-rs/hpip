@@ -26,6 +26,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.checkout_ref || github.sha }}
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - run: cargo install cargo-audit --locked
       - run: python3 .github/scripts/audit_dependencies.py
